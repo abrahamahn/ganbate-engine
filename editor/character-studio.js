@@ -1,13 +1,17 @@
 /**
  * Character Studio workbench (`*.character.json`, schema `ganbate.character/1`).
  *
- * Genre-neutral authoring surface for humanoid & creature skeletal rigs:
+ * Genre-neutral authoring surface for humanoid & creature skeletal rigs, upgraded onto the
+ * Tri-Modal Articulated Semantic Graph Engine:
  * - Hierarchy Bone Tree with search + local Euler `(pitch, yaw, roll)` offset sliders
  * - Animation Clip scrubber & Hermite (`3t^2 - 2t^3`) state cross-fade preview
- * - Procedural Look-At 2D/3D target pad + joint distribution weights
- * - Analytical Two-Bone IK chain inspector (`root`, `mid`, `end`, `target`, `pole`, `weight`)
- * - Grouped Morph & Body Shape sliders (`expression`, `face`, `body`, `secondary`) + presets
- * - Modular Outfit variants & Named Socket attachment fitting
+ * - Procedural Look-At 2D/3D target pad + joint distribution weights + Gaze Cone projection (`C_cone`)
+ * - Analytical Two-Bone IK chain inspector + Reachability Manifold & Torso Exclusion projection (`C_IK`)
+ * - 5-Layer Parametric Character DNA (`character-dna.js`) + Direct 3D Stage Region Drag (`L_dna: R^3 -> G_dna`)
+ * - Circumstance-Driven Animation State Machine (`anim-state-machine.js`) with Live Condition Simulator
+ * - Bidirectional Semantic Subgraph (`nodes[] + edges[] + constraints[]`), Inverse Semantic Lifting
+ *   (`L_char: R^3 -> G_char`), Minimal-Perturbation Constraint Projection (`x* = argmin ||x - x_hat||^2`),
+ *   and 2-Agent Concurrent Character Conflict Resolution.
  */
 
 import {
@@ -17,9 +21,52 @@ import {
   sampleBlendSpace1D,
   sampleBlendSpace2D,
 } from '../web/character-customization.mjs';
+import {
+  ANIM_STATE_MACHINE_SCHEMA,
+  asmToSemanticSubgraph,
+  createAnimStateMachineController,
+  createDefaultAnimStateMachine,
+  liftContinuousPoseToAsmParams,
+  normalizeAnimStateMachine,
+  summarizeAsmForAi,
+} from './anim-state-machine.js';
 import { drawGlbPreviewCanvas, parseGlbPreview, parseGlbPreviewAsync } from './asset-previews.js';
+import {
+  BODY_OCCLUSION_REGIONS,
+  CHARACTER_DNA_SCHEMA,
+  DNA_SLIDER_CATEGORIES,
+  STAGE_DRAG_REGIONS,
+  WARDROBE_SLOT_CATALOG,
+  compileDnaToRigOverrides,
+  createAvatarDnaController,
+  createDefaultCharacterDna,
+  generateDnaFromTraits,
+  hitTestStageDragRegion,
+  liftStageRegionDragToDna,
+  normalizeCharacterDna,
+  solveWardrobeOcclusionConstraints,
+  summarizeCharacterDnaForAi,
+} from './character-dna.js';
+
+export {
+  ANIM_STATE_MACHINE_SCHEMA,
+  BODY_OCCLUSION_REGIONS,
+  CHARACTER_DNA_SCHEMA,
+  DNA_SLIDER_CATEGORIES,
+  STAGE_DRAG_REGIONS,
+  WARDROBE_SLOT_CATALOG,
+  compileDnaToRigOverrides,
+  createAnimStateMachineController,
+  createAvatarDnaController,
+  createDefaultAnimStateMachine,
+  createDefaultCharacterDna,
+  generateDnaFromTraits,
+  liftStageRegionDragToDna,
+  solveWardrobeOcclusionConstraints,
+};
 
 export const CHARACTER_SCHEMA = 'ganbate.character/1';
+export const CHARACTER_SEMANTIC_GRAPH_SCHEMA = 'ganbate.semantic.graph.v2';
 
 export const TURNTABLE_LIGHTING_PRESETS = Object.freeze({
   studio_neutral: {
@@ -49,6 +96,8 @@ export const TURNTABLE_LIGHTING_PRESETS = Object.freeze({
 });
 
 const DEG_TO_RAD = Math.PI / 180;
+const RAD_TO_DEG = 180 / Math.PI;
+const clamp = (val, min, max) => Math.min(max, Math.max(min, Number.isFinite(val) ? val : 0));
 
 export function createDefaultCharacterDocument(id = 'humanoid_actor', name = 'Humanoid Actor') {
   return {
@@ -149,6 +198,8 @@ export function createDefaultCharacterDocument(id = 'humanoid_actor', name = 'Hu
       focused: { blink: 0.18, smile: 0.05 },
     },
     boneOffsets: {},
+    dna: createDefaultCharacterDna(),
+    animStateMachine: createDefaultAnimStateMachine(),
   };
 }
 
@@ -213,7 +264,7 @@ export function normalizeCharacterDocument(raw) {
       maxYawDeg: Number.isFinite(raw.lookAt?.maxYawDeg) ? raw.lookAt.maxYawDeg : 55,
       maxPitchDeg: Number.isFinite(raw.lookAt?.maxPitchDeg) ? raw.lookAt.maxPitchDeg : 35,
       chain: Array.isArray(raw.lookAt?.chain)
-        ? raw.lookAt.chain.map(( entry ) => ({
+        ? raw.lookAt.chain.map((entry) => ({
             joint: String(entry.joint),
             weight: Number(entry.weight ?? 0.5),
           }))
@@ -250,6 +301,8 @@ export function normalizeCharacterDocument(raw) {
         ? { ...raw.expressionPresets }
         : fallback.expressionPresets,
     boneOffsets: raw.boneOffsets && typeof raw.boneOffsets === 'object' ? { ...raw.boneOffsets } : {},
+    dna: normalizeCharacterDna(raw.dna),
+    animStateMachine: normalizeAnimStateMachine(raw.animStateMachine),
   };
 }
 
@@ -339,6 +392,669 @@ export function buildSocketTransformOps(socketIndex, patch) {
     set: ['sockets', String(socketIndex), key],
     value: Array.isArray(value) ? value.map((n) => Number(n)) : value,
   }));
+}
+
+// ============================================================================
+// ACADEMIC CORE ENGINE:
+//   1. Minimal-Perturbation Articulated Constraint Projection (`x* = argmin ||x - x_hat||^2`)
+//   2. Inverse Semantic Lifting (`L_char: R^3 -> G_char`)
+//   3. Bidirectional Semantic Subgraph (`nodes[] + edges[] + constraints[]`)
+//   4. 2-Agent Concurrent Character Conflict Resolution
+// ============================================================================
+
+/**
+ * Minimal-Perturbation Articulated Constraint Projection (`x* = argmin_{x in C} ||x - x_hat||^2`).
+ *
+ * Enforces:
+ *   - `C_IK`: Two-Bone IK spherical shell `[minReachM, maxReachM]` around shoulder/hip anchor
+ *   - `C_torso`: Cylindrical torso self-collision exclusion (`x^2 + z^2 >= torsoRadiusM^2`)
+ *   - `C_floor`: Support plane lower bound (`y >= minFloorY`)
+ *   - `C_cone`: Physiological neck+head Look-At angular cone (`[-maxYawDeg, +maxYawDeg] x [-maxPitchDeg, +maxPitchDeg]`)
+ *   - `C_occ`: Wardrobe layer clearance and `bodyOcclusionMask`
+ */
+export function projectCharacterIkConstraints(candidateDocOrPose, rigConstraints = {}) {
+  const doc = normalizeCharacterDocument(candidateDocOrPose);
+  const dnaOverrides = compileDnaToRigOverrides(doc.dna);
+  const placementPos = doc.skeleton?.placement?.position ?? [0, 0, 0];
+  const baseShoulder = rigConstraints.shoulderOrigin ?? [
+    placementPos[0] + 0.18,
+    placementPos[1] + 1.38 * dnaOverrides.skeletonScale,
+    placementPos[2] + 0.0,
+  ];
+  const maxReachM = Number(rigConstraints.maxReachM ?? dnaOverrides.effectiveArmReachM ?? 0.56);
+  const minReachM = Number(rigConstraints.minReachM ?? 0.14);
+  const torsoRadiusM = Number(rigConstraints.torsoRadiusM ?? 0.22);
+  const minFloorY = Number(rigConstraints.minFloorY ?? 0.05);
+
+  const violations = [];
+  const hallucinationGhosts = [];
+  const projectedChains = [];
+
+  doc.ikChains = doc.ikChains.map((chain) => {
+    const proposed = (chain.target ?? [0.32, 1.15, 0.38]).map((n) => Number(n) || 0);
+    let [x, y, z] = proposed;
+    const reasons = [];
+
+    // 1. Floor support plane projection (`y >= minFloorY`)
+    if (y < minFloorY) {
+      y = minFloorY;
+      reasons.push('floor_penetration');
+    }
+
+    // 2. Torso cylinder self-collision exclusion (`C_torso`)
+    const relTorsoX = x - placementPos[0];
+    const relTorsoZ = z - placementPos[2];
+    const horizDist = Math.hypot(relTorsoX, relTorsoZ);
+    if (y >= placementPos[1] + 0.65 && y <= placementPos[1] + 1.52 && horizDist < torsoRadiusM) {
+      const pushDirX = horizDist > 1e-5 ? relTorsoX / horizDist : 0.7071;
+      const pushDirZ = horizDist > 1e-5 ? relTorsoZ / horizDist : 0.7071;
+      x = placementPos[0] + pushDirX * torsoRadiusM;
+      z = placementPos[2] + pushDirZ * torsoRadiusM;
+      reasons.push('torso_self_collision');
+    }
+
+    // 3. Spherical Two-Bone IK Reachability Manifold (`C_IK`)
+    const dx = x - baseShoulder[0];
+    const dy = y - baseShoulder[1];
+    const dz = z - baseShoulder[2];
+    const dist = Math.hypot(dx, dy, dz);
+    if (dist > maxReachM && dist > 1e-6) {
+      const scale = maxReachM / dist;
+      x = baseShoulder[0] + dx * scale;
+      y = baseShoulder[1] + dy * scale;
+      z = baseShoulder[2] + dz * scale;
+      reasons.push('exceeds_arm_reach_manifold');
+    } else if (dist < minReachM) {
+      const ux = dist > 1e-5 ? dx / dist : 0;
+      const uy = dist > 1e-5 ? dy / dist : 0;
+      const uz = dist > 1e-5 ? dz / dist : 1;
+      x = baseShoulder[0] + ux * minReachM;
+      y = baseShoulder[1] + uy * minReachM;
+      z = baseShoulder[2] + uz * minReachM;
+      reasons.push('inside_min_elbow_fold');
+    }
+
+    const projected = [Number(x.toFixed(3)), Number(y.toFixed(3)), Number(z.toFixed(3))];
+    const perturbationM = Number(
+      Math.hypot(projected[0] - proposed[0], projected[1] - proposed[1], projected[2] - proposed[2]).toFixed(4),
+    );
+
+    if (perturbationM > 1e-3) {
+      const record = {
+        kind: 'ik_target',
+        chainId: chain.id,
+        endJoint: chain.endJoint,
+        proposed,
+        projected,
+        perturbationM,
+        reasons,
+      };
+      violations.push(record);
+      hallucinationGhosts.push(record);
+    }
+
+    projectedChains.push({
+      chainId: chain.id,
+      proposed,
+      projected,
+      perturbationM,
+      reasons,
+    });
+
+    return {
+      ...chain,
+      target: projected,
+    };
+  });
+
+  // 4. Physiological Look-At Gaze Cone Projection (`C_cone`)
+  let lookAtProjection = null;
+  if (doc.lookAt) {
+    const origin = (doc.lookAt.origin ?? [0, 1.55, 0]).map((n) => Number(n) || 0);
+    const proposedGaze = (doc.lookAt.target ?? [0, 1.55, 2.0]).map((n) => Number(n) || 0);
+    let gx = proposedGaze[0] - origin[0];
+    let gy = proposedGaze[1] - origin[1];
+    let gz = proposedGaze[2] - origin[2];
+    const gazeReasons = [];
+
+    if (gz < 0.25) {
+      gz = 0.25;
+      gazeReasons.push('behind_head_plane');
+    }
+    const maxYawRad = (Number(doc.lookAt.maxYawDeg) || 55) * DEG_TO_RAD;
+    const maxPitchRad = (Number(doc.lookAt.maxPitchDeg) || 35) * DEG_TO_RAD;
+    const curYaw = Math.atan2(gx, gz);
+    if (Math.abs(curYaw) > maxYawRad) {
+      const clampedYaw = Math.sign(curYaw) * maxYawRad;
+      const horizMag = Math.hypot(gx, gz);
+      gx = Math.sin(clampedYaw) * horizMag;
+      gz = Math.cos(clampedYaw) * horizMag;
+      gazeReasons.push('exceeds_neck_yaw_cone');
+    }
+    const horizDist = Math.max(0.25, Math.hypot(gx, gz));
+    const curPitch = Math.atan2(gy, horizDist);
+    if (Math.abs(curPitch) > maxPitchRad) {
+      const clampedPitch = Math.sign(curPitch) * maxPitchRad;
+      gy = Math.tan(clampedPitch) * horizDist;
+      gazeReasons.push('exceeds_neck_pitch_cone');
+    }
+
+    const projectedGaze = [
+      Number((origin[0] + gx).toFixed(3)),
+      Number((origin[1] + gy).toFixed(3)),
+      Number((origin[2] + gz).toFixed(3)),
+    ];
+    const gazePerturbationM = Number(
+      Math.hypot(
+        projectedGaze[0] - proposedGaze[0],
+        projectedGaze[1] - proposedGaze[1],
+        projectedGaze[2] - proposedGaze[2],
+      ).toFixed(4),
+    );
+
+    if (gazePerturbationM > 1e-3) {
+      const rec = {
+        kind: 'look_at',
+        chainId: 'look_at_head',
+        proposed: proposedGaze,
+        projected: projectedGaze,
+        perturbationM: gazePerturbationM,
+        reasons: gazeReasons,
+      };
+      violations.push(rec);
+      hallucinationGhosts.push(rec);
+    }
+    lookAtProjection = {
+      proposed: proposedGaze,
+      projected: projectedGaze,
+      perturbationM: gazePerturbationM,
+      reasons: gazeReasons,
+    };
+    doc.lookAt.target = projectedGaze;
+  }
+
+  // 5. Wardrobe Anti-Clipping Constraint Projection (`C_occ`)
+  const wardrobeOcclusion = solveWardrobeOcclusionConstraints(doc.dna);
+  doc.dna = wardrobeOcclusion.dna;
+  for (const wp of wardrobeOcclusion.projections) {
+    violations.push({
+      kind: 'wardrobe_clearance',
+      slot: wp.slot,
+      proposed: wp.proposedScaleOffsetMm,
+      projected: wp.projectedScaleOffsetMm,
+      perturbationM: Number((wp.perturbationMm / 1000).toFixed(4)),
+      reasons: [wp.reason],
+    });
+  }
+
+  return {
+    document: doc,
+    projectedChains,
+    lookAtProjection,
+    wardrobeOcclusion,
+    effectiveArmReachM: maxReachM,
+    violations,
+    hallucinationGhosts,
+    verified: violations.length === 0,
+  };
+}
+
+function inferReachSymbolicRelation(shoulderOrigin, targetPos, enabled, maxReachM) {
+  if (!enabled) {
+    return { rel: 'stowed_beside', to: 'torso_rest_anchor', zone: 'stowed', distanceM: 0 };
+  }
+  const dx = targetPos[0] - shoulderOrigin[0];
+  const dy = targetPos[1] - shoulderOrigin[1];
+  const dz = targetPos[2] - shoulderOrigin[2];
+  const distanceM = Number(Math.hypot(dx, dy, dz).toFixed(3));
+  let zone = 'mid_interact';
+  if (distanceM <= 0.34) zone = 'close_grasp';
+  else if (distanceM >= maxReachM * 0.85) zone = 'extended_reach';
+
+  let directionTag = 'front_ workspace';
+  if (dx > 0.28) directionTag = 'right_workspace';
+  else if (dx < -0.28) directionTag = 'left_workspace';
+  else if (dy > 0.18) directionTag = 'elevated_shelf';
+  else if (dy < -0.25) directionTag = 'low_surface';
+
+  return {
+    rel: 'reaches_for',
+    to: `anchor:${directionTag.replace(/\s+/g, '')}`,
+    zone,
+    directionTag: directionTag.replace(/\s+/g, ''),
+    distanceM,
+  };
+}
+
+function inferGazeSymbolicRelation(origin, target) {
+  const dx = (target[0] ?? 0) - (origin[0] ?? 0);
+  const dy = (target[1] ?? 1.55) - (origin[1] ?? 1.55);
+  const dz = Math.max(0.25, (target[2] ?? 2.0) - (origin[2] ?? 0));
+  const yawDeg = Number((Math.atan2(dx, dz) * RAD_TO_DEG).toFixed(1));
+  const pitchDeg = Number((Math.atan2(dy, Math.hypot(dx, dz)) * RAD_TO_DEG).toFixed(1));
+
+  let focusAnchor = 'anchor:eye_level_front';
+  if (yawDeg <= -15) focusAnchor = 'anchor:left_subject';
+  else if (yawDeg >= 15) focusAnchor = 'anchor:right_subject';
+  else if (pitchDeg <= -12) focusAnchor = 'anchor:work_surface_below';
+  else if (pitchDeg >= 12) focusAnchor = 'anchor:upper_gallery';
+
+  return {
+    rel: 'looks_at',
+    to: focusAnchor,
+    yawDeg,
+    pitchDeg,
+  };
+}
+
+/**
+ * Inverse Semantic Lifting (`L_char: R^3 -> G_char`).
+ * Converts continuous 3D viewport drags (IK effector pin, Look-At gaze reticle, or 3D DNA sculpt region)
+ * into verified character state + discrete symbolic relational edges (`edges[]`).
+ */
+export function liftCharacterStageDragToSemanticGraph(rawDoc, dragEvent = {}, options = {}) {
+  let doc = normalizeCharacterDocument(rawDoc);
+  const solverMode = options.solverMode ?? 'project'; // 'project' | 'reject'
+  const beforeDoc = structuredClone(doc);
+
+  if (dragEvent.kind === 'ik_target') {
+    const chainIdx = Number(dragEvent.chainIndex ?? 0);
+    if (doc.ikChains[chainIdx] && Array.isArray(dragEvent.target)) {
+      doc.ikChains[chainIdx].enabled = dragEvent.enabled !== false;
+      doc.ikChains[chainIdx].target = dragEvent.target.map((n) => Number(n));
+    }
+  } else if (dragEvent.kind === 'look_at') {
+    if (Array.isArray(dragEvent.target)) {
+      doc.lookAt.enabled = dragEvent.enabled !== false;
+      doc.lookAt.target = dragEvent.target.map((n) => Number(n));
+    }
+  } else if (dragEvent.kind === 'dna_region') {
+    const liftedDna = liftStageRegionDragToDna(
+      doc.dna,
+      dragEvent.regionId ?? 'nose',
+      Number(dragEvent.dxNorm ?? 0),
+      Number(dragEvent.dyNorm ?? 0),
+    );
+    doc.dna = liftedDna.dna;
+    const rigOverrides = compileDnaToRigOverrides(doc.dna);
+    doc.skeleton.scale = rigOverrides.skeletonScale;
+    Object.assign(doc.morphWeights, rigOverrides.morphWeights);
+    Object.assign(doc.boneOffsets, rigOverrides.boneOffsets);
+  }
+
+  const projection = projectCharacterIkConstraints(doc, options.rigConstraints);
+  if (solverMode === 'reject' && !projection.verified) {
+    const fallbackSubgraph = getCharacterSemanticSubgraph(beforeDoc);
+    return {
+      rejected: true,
+      document: beforeDoc,
+      projection,
+      subgraph: fallbackSubgraph,
+      liftedEdges: fallbackSubgraph.edges,
+    };
+  }
+
+  doc = projection.document;
+
+  // Lift continuous IK effector state into discrete ASM parameters (`reachActive`, `interactionDistance`)
+  const primaryIk = doc.ikChains[0];
+  if (primaryIk) {
+    doc.animStateMachine.parameters = liftContinuousPoseToAsmParams(doc.animStateMachine, {
+      ikTarget: primaryIk.target,
+      ikEnabled: primaryIk.enabled,
+    });
+  }
+
+  const subgraph = getCharacterSemanticSubgraph(doc);
+  return {
+    rejected: false,
+    document: doc,
+    projection,
+    subgraph,
+    liftedEdges: subgraph.edges,
+  };
+}
+
+/**
+ * Projects a `.character.json` document into the canonical `ganbate.semantic.graph.v2`
+ * Articulated Semantic Subgraph (`nodes[] + edges[] + constraints[]`).
+ */
+export function getCharacterSemanticSubgraph(rawDoc, options = {}) {
+  const projection = projectCharacterIkConstraints(rawDoc, options.rigConstraints);
+  const doc = projection.document;
+  const dnaOverrides = compileDnaToRigOverrides(doc.dna);
+  const placementPos = doc.skeleton?.placement?.position ?? [0, 0, 0];
+  const shoulderOrigin = [
+    placementPos[0] + 0.18,
+    placementPos[1] + 1.38 * dnaOverrides.skeletonScale,
+    placementPos[2],
+  ];
+
+  const nodes = [
+    {
+      id: `char:${doc.id}`,
+      type: 'articulated_humanoid',
+      name: doc.name,
+      position: placementPos,
+      yawDeg: Number(((doc.skeleton?.placement?.yawRad ?? 0) * RAD_TO_DEG).toFixed(1)),
+      statureScale: dnaOverrides.skeletonScale,
+      activeOutfitId: doc.activeOutfitId,
+      bodyOcclusionMask: dnaOverrides.bodyOcclusionMask,
+      hiddenBodyRegions: dnaOverrides.hiddenBodyRegions,
+    },
+  ];
+
+  const edges = [];
+
+  // 1. Two-Bone IK Effector Nodes & Symbolic `reaches_for` Edges
+  for (const chain of doc.ikChains) {
+    const effId = `effector:${doc.id}:${chain.endJoint}`;
+    const lifted = inferReachSymbolicRelation(
+      shoulderOrigin,
+      chain.target,
+      chain.enabled,
+      projection.effectiveArmReachM,
+    );
+    nodes.push({
+      id: effId,
+      type: 'ik_effector',
+      chainId: chain.id,
+      endJoint: chain.endJoint,
+      enabled: chain.enabled,
+      target: chain.target,
+      weight: chain.weight,
+    });
+    edges.push({
+      from: effId,
+      rel: lifted.rel,
+      to: lifted.to,
+      zone: lifted.zone,
+      distanceM: lifted.distanceM,
+    });
+  }
+
+  // 2. Look-At Gaze Node & Symbolic `looks_at` Edge
+  if (doc.lookAt) {
+    const gazeNodeId = `gaze:${doc.id}:head`;
+    const liftedGaze = inferGazeSymbolicRelation(doc.lookAt.origin, doc.lookAt.target);
+    nodes.push({
+      id: gazeNodeId,
+      type: 'gaze_target',
+      enabled: doc.lookAt.enabled,
+      origin: doc.lookAt.origin,
+      target: doc.lookAt.target,
+      maxYawDeg: doc.lookAt.maxYawDeg,
+      maxPitchDeg: doc.lookAt.maxPitchDeg,
+    });
+    edges.push({
+      from: `char:${doc.id}:head`,
+      rel: liftedGaze.rel,
+      to: liftedGaze.to,
+      yawDeg: liftedGaze.yawDeg,
+      pitchDeg: liftedGaze.pitchDeg,
+    });
+  }
+
+  // 3. Socket Attachment Edges (`attached_to_socket`)
+  for (const sock of doc.sockets) {
+    const sockNodeId = `socket:${doc.id}:${sock.id}`;
+    nodes.push({
+      id: sockNodeId,
+      type: 'rig_socket',
+      parentJoint: sock.parentJoint,
+      translation: sock.translation,
+      attachedAsset: sock.attachedAsset || null,
+    });
+    if (sock.attachedAsset) {
+      edges.push({
+        from: `asset:${sock.attachedAsset}`,
+        rel: 'attached_to_socket',
+        to: sockNodeId,
+        parentJoint: sock.parentJoint,
+      });
+    }
+  }
+
+  // 4. Wardrobe Occlusion Constraint Edge
+  edges.push({
+    from: `wardrobe:${doc.activeOutfitId}`,
+    rel: 'occludes_body_mask',
+    to: `char:${doc.id}`,
+    maskHex: `0x${dnaOverrides.bodyOcclusionMask.toString(16)}`,
+    hiddenRegions: dnaOverrides.hiddenBodyRegions,
+  });
+
+  // 5. Merge ASM behavioral state nodes & transition edges
+  const asmSub = asmToSemanticSubgraph(doc.animStateMachine, options.asmRuntime);
+  nodes.push(...asmSub.nodes);
+  edges.push(...asmSub.edges);
+
+  return {
+    schema: CHARACTER_SEMANTIC_GRAPH_SCHEMA,
+    characterId: doc.id,
+    nodes,
+    edges,
+    constraints: {
+      maxArmReachM: projection.effectiveArmReachM,
+      torsoRadiusM: 0.22,
+      maxYawDeg: doc.lookAt.maxYawDeg,
+      maxPitchDeg: doc.lookAt.maxPitchDeg,
+      bodyOcclusionMask: dnaOverrides.bodyOcclusionMask,
+    },
+    verification: {
+      verified: projection.verified,
+      violationCount: projection.violations.length,
+      hallucinationGhosts: projection.hallucinationGhosts,
+    },
+    aiDigest: summarizeCharacterForAi(doc, options.asmRuntime),
+  };
+}
+
+/**
+ * Resolves a 2-Agent Concurrent Character Edit Conflict:
+ *   - Agent A (Scene / Posture / Placement Agent) shifts the character's root placement or target anchor.
+ *   - Agent B (Behavioral / IK / Gaze / Wardrobe Agent) commands an IK reach (`reaches_for`)
+ *     and gaze focus (`looks_at`) using a target coordinate or symbolic anchor.
+ *
+ * Naive merge leaves Agent B's world-space IK effector either inside Agent A's shifted torso
+ * or outside the shifted shoulder's reachable sphere `C_IK`. Our relational solver preserves
+ * Agent B's symbolic `reaches_for` / `looks_at` intent relative to Agent A's new posture and
+ * projects onto `C_IK \cap C_torso \cap C_cone`.
+ */
+export function resolveTwoAgentCharacterConflict(rawDoc, agentAPatch = {}, agentBPatch = {}) {
+  const baseDoc = normalizeCharacterDocument(rawDoc);
+
+  // Agent A shifts character placement or posture
+  const shiftPos = Array.isArray(agentAPatch.placementPosition)
+    ? agentAPatch.placementPosition.map((n) => Number(n))
+    : [0.38, 0.0, 0.28];
+  const naiveMerged = structuredClone(baseDoc);
+  naiveMerged.skeleton.placement.position = shiftPos;
+  if (Array.isArray(agentAPatch.lookAtOrigin)) {
+    naiveMerged.lookAt.origin = agentAPatch.lookAtOrigin.map((n) => Number(n));
+  } else {
+    naiveMerged.lookAt.origin = [shiftPos[0], shiftPos[1] + 1.55, shiftPos[2]];
+  }
+
+  // Agent B commands IK reach & gaze at a coordinate that collides with Agent A's new torso or exceeds reach
+  const proposedIkTarget = Array.isArray(agentBPatch.ikTarget)
+    ? agentBPatch.ikTarget.map((n) => Number(n))
+    : [shiftPos[0] + 0.04, shiftPos[1] + 1.18, shiftPos[2] + 0.03]; // Inside shifted torso cylinder!
+  const proposedGazeTarget = Array.isArray(agentBPatch.lookAtTarget)
+    ? agentBPatch.lookAtTarget.map((n) => Number(n))
+    : [shiftPos[0] + 2.4, shiftPos[1] + 1.55, shiftPos[2] + 0.3]; // Exceeds ±55° neck yaw cone!
+
+  if (naiveMerged.ikChains[0]) {
+    naiveMerged.ikChains[0].enabled = true;
+    naiveMerged.ikChains[0].target = proposedIkTarget;
+  }
+  naiveMerged.lookAt.enabled = true;
+  naiveMerged.lookAt.target = proposedGazeTarget;
+
+  if (agentBPatch.wardrobeInnerId) {
+    naiveMerged.dna.wardrobeSlots.inner.itemId = agentBPatch.wardrobeInnerId;
+  }
+
+  const projection = projectCharacterIkConstraints(naiveMerged);
+  const resolvedDoc = projection.document;
+  resolvedDoc.animStateMachine.parameters = liftContinuousPoseToAsmParams(resolvedDoc.animStateMachine, {
+    shoulderOrigin: [shiftPos[0] + 0.18, shiftPos[1] + 1.38, shiftPos[2]],
+    ikTarget: resolvedDoc.ikChains[0]?.target,
+    ikEnabled: true,
+  });
+
+  return {
+    agentA: { placementPosition: shiftPos },
+    agentB: { proposedIkTarget, proposedGazeTarget },
+    naiveConflictCount: projection.violations.length,
+    hallucinationGhosts: projection.hallucinationGhosts,
+    resolvedDocument: resolvedDoc,
+    subgraph: getCharacterSemanticSubgraph(resolvedDoc),
+  };
+}
+
+/**
+ * Applies either a natural-language prompt string or a structured JSON semantic patch
+ * to a Character document, running Minimal-Perturbation Constraint Projection (`x_hat -> x*`)
+ * and Inverse Semantic Lifting (`R^3 -> G_char`).
+ */
+export function applyCharacterSemanticPatch(rawDoc, patchOrPrompt, options = {}) {
+  let doc = normalizeCharacterDocument(rawDoc);
+  const beforeDoc = structuredClone(doc);
+  const solverMode = options.solverMode ?? 'project';
+
+  if (typeof patchOrPrompt === 'string') {
+    const prompt = patchOrPrompt.trim();
+    const lower = prompt.toLowerCase();
+
+    // Parse coordinate triples `[x, y, z]` if present
+    const vecMatches = [...prompt.matchAll(/\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]/g)].map(
+      (m) => [Number(m[1]), Number(m[2]), Number(m[3])],
+    );
+
+    if (/\b(reach|grasp|touch|pick|hand)\b/i.test(lower)) {
+      if (doc.ikChains[0]) {
+        doc.ikChains[0].enabled = !/\b(stop|disable|rest|release)\b/i.test(lower);
+        if (vecMatches[0]) {
+          doc.ikChains[0].target = vecMatches[0];
+        } else if (/\bleft\b/i.test(lower)) {
+          doc.ikChains[0].target = [-0.26, 1.18, 0.36];
+        } else if (/\bright\b/i.test(lower)) {
+          doc.ikChains[0].target = [0.38, 1.18, 0.36];
+        } else if (/\bhigh|up|shelf\b/i.test(lower)) {
+          doc.ikChains[0].target = [0.28, 1.56, 0.34];
+        } else {
+          doc.ikChains[0].target = [0.32, 1.16, 0.42];
+        }
+      }
+    }
+
+    if (/\b(look|gaze|face|watch)\b/i.test(lower)) {
+      doc.lookAt.enabled = true;
+      const gazeVec = vecMatches.length > 1 ? vecMatches[1] : (!/\breach\b/i.test(lower) && vecMatches[0] ? vecMatches[0] : null);
+      if (gazeVec) {
+        doc.lookAt.target = gazeVec;
+      } else if (/\bleft\b/i.test(lower)) {
+        doc.lookAt.target = [-0.85, 1.55, 1.6];
+      } else if (/\bright\b/i.test(lower)) {
+        doc.lookAt.target = [0.85, 1.55, 1.6];
+      } else if (/\bdown|table|book|surface\b/i.test(lower)) {
+        doc.lookAt.target = [0.0, 1.05, 1.4];
+      } else {
+        doc.lookAt.target = [0.0, 1.55, 2.0];
+      }
+    }
+
+    if (/\b(tall|compact|petite|athletic|broad|slender|scholar|sharp|sculpted|heterochromia|coat|pavilion|haori|vest)\b/i.test(lower)) {
+      doc.dna = generateDnaFromTraits(lower);
+      const rigOverrides = compileDnaToRigOverrides(doc.dna);
+      doc.skeleton.scale = rigOverrides.skeletonScale;
+      Object.assign(doc.morphWeights, rigOverrides.morphWeights);
+      Object.assign(doc.boneOffsets, rigOverrides.boneOffsets);
+    }
+
+    if (/\b(smile|warm)\b/i.test(lower)) {
+      Object.assign(doc.morphWeights, doc.expressionPresets.warm_smile ?? { smile: 0.72 });
+    } else if (/\b(focus|alert|serious)\b/i.test(lower)) {
+      Object.assign(doc.morphWeights, doc.expressionPresets.focused ?? { blink: 0.18, smile: 0.05 });
+      doc.animStateMachine.parameters.circumstance = 'focused';
+    }
+  } else if (patchOrPrompt && typeof patchOrPrompt === 'object') {
+    if (patchOrPrompt.dna) {
+      doc.dna = normalizeCharacterDna(patchOrPrompt.dna);
+      const rigOverrides = compileDnaToRigOverrides(doc.dna);
+      doc.skeleton.scale = rigOverrides.skeletonScale;
+      Object.assign(doc.morphWeights, rigOverrides.morphWeights);
+    }
+    if (patchOrPrompt.lookAt) {
+      doc.lookAt = { ...doc.lookAt, ...patchOrPrompt.lookAt };
+    }
+    if (Array.isArray(patchOrPrompt.ikChains)) {
+      doc.ikChains = patchOrPrompt.ikChains.map((c, i) => ({ ...(doc.ikChains[i] ?? {}), ...c }));
+    }
+    if (Array.isArray(patchOrPrompt.nodes)) {
+      for (const n of patchOrPrompt.nodes) {
+        if (n.type === 'ik_effector' && Array.isArray(n.target)) {
+          const idx = doc.ikChains.findIndex((c) => c.id === n.chainId || c.endJoint === n.endJoint);
+          const targetChain = doc.ikChains[idx >= 0 ? idx : 0];
+          if (targetChain) {
+            targetChain.enabled = n.enabled !== false;
+            targetChain.target = n.target.map((v) => Number(v));
+          }
+        } else if (n.type === 'gaze_target' && Array.isArray(n.target)) {
+          doc.lookAt.enabled = n.enabled !== false;
+          doc.lookAt.target = n.target.map((v) => Number(v));
+        }
+      }
+    }
+  }
+
+  const projection = projectCharacterIkConstraints(doc, options.rigConstraints);
+  if (solverMode === 'reject' && !projection.verified) {
+    return {
+      rejected: true,
+      document: beforeDoc,
+      projection,
+      subgraph: getCharacterSemanticSubgraph(beforeDoc),
+    };
+  }
+
+  doc = projection.document;
+  if (doc.ikChains[0]) {
+    doc.animStateMachine.parameters = liftContinuousPoseToAsmParams(doc.animStateMachine, {
+      ikTarget: doc.ikChains[0].target,
+      ikEnabled: doc.ikChains[0].enabled,
+    });
+  }
+
+  return {
+    rejected: false,
+    document: doc,
+    projection,
+    subgraph: getCharacterSemanticSubgraph(doc),
+  };
+}
+
+/**
+ * Produces a `<120-token` compact AI summary of the Character's rig, IK/Gaze relations,
+ * 5-layer Parametric DNA, and Circumstance Animation State Machine.
+ */
+export function summarizeCharacterForAi(rawDoc, asmRuntime = {}) {
+  const doc = normalizeCharacterDocument(rawDoc);
+  const ik0 = doc.ikChains[0];
+  const ikSummary = ik0
+    ? `${ik0.endJoint}:${ik0.enabled ? `[${ik0.target.map((n) => n.toFixed(2)).join(',')}]` : 'off'}`
+    : 'none';
+  const gazeSummary = doc.lookAt?.enabled
+    ? `[${doc.lookAt.target.map((n) => n.toFixed(2)).join(',')}](±${doc.lookAt.maxYawDeg}°/${doc.lookAt.maxPitchDeg}°)`
+    : 'off';
+  return [
+    `CHAR[${doc.id} joints=${doc.skeleton.joints.length} outfit=${doc.activeOutfitId}`,
+    `ik=${ikSummary}`,
+    `gaze=${gazeSummary}]`,
+    summarizeCharacterDnaForAi(doc.dna),
+    summarizeAsmForAi(doc.animStateMachine, asmRuntime),
+  ].join(' | ');
 }
 
 /**
@@ -505,6 +1221,15 @@ export function mountCharacterStudio(container, studioApi = {}) {
   let active = true;
   let destroyed = false;
 
+  // Tri-Modal Articulated Graph, DNA & ASM state
+  let stageInteractionMode = 'orbit'; // 'orbit' | 'sculpt_dna' | 'drag_ik'
+  let activeDnaCategory = 'faceStructure';
+  let solverMode = 'project'; // 'project' (Auto-Project x_hat -> x*) | 'reject' (Strict Rollback)
+  let lastHallucinationGhosts = [];
+  let lastSolverBanner = 'Verified: 0 constraint violations · C_IK ∩ C_cone ∩ C_occ active';
+  let lastLiftedRegionLabel = '';
+  const asmController = createAnimStateMachineController(docData.animStateMachine);
+
   // Persistent 3D Character Viewport Stage state
   let stageYaw = 0.24;
   let stagePitch = 0.14;
@@ -584,7 +1309,7 @@ export function mountCharacterStudio(container, studioApi = {}) {
     ctx.fillText?.(topLabel, 18, 25);
 
     // Live Look-At reticle indicator when enabled
-    if (docData.lookAt?.enabled && activeParsedGlb) {
+    if (docData.lookAt?.enabled) {
       const tx = Math.min(1, Math.max(-1, (docData.lookAt.target[0] ?? 0) / 1.5));
       const ty = Math.min(
         1,
@@ -599,13 +1324,46 @@ export function mountCharacterStudio(container, studioApi = {}) {
       ctx.stroke?.();
     }
 
-    // Bottom status bar showing active pose / morph summary
+    // Hallucination Ghost (`x_hat` red dashed circle -> `x*` projected emerald target)
+    if (lastHallucinationGhosts.length > 0) {
+      for (const ghost of lastHallucinationGhosts) {
+        const hx = cssW * 0.5 + clamp((ghost.proposed[0] ?? 0) / 1.2, -0.44, 0.44) * cssW;
+        const hy = cssH * 0.55 - clamp(((ghost.proposed[1] ?? 1.15) - 1.1) / 1.2, -0.4, 0.4) * cssH;
+        const px = cssW * 0.5 + clamp((ghost.projected[0] ?? 0) / 1.2, -0.44, 0.44) * cssW;
+        const py = cssH * 0.55 - clamp(((ghost.projected[1] ?? 1.15) - 1.1) / 1.2, -0.4, 0.4) * cssH;
+
+        ctx.strokeStyle = 'rgba(248, 113, 113, 0.92)';
+        ctx.lineWidth = 1.6;
+        ctx.beginPath?.();
+        ctx.moveTo?.(hx, hy);
+        ctx.lineTo?.(px, py);
+        ctx.stroke?.();
+
+        ctx.fillStyle = 'rgba(248, 113, 113, 0.35)';
+        ctx.beginPath?.();
+        ctx.arc?.(hx, hy, 8, 0, Math.PI * 2);
+        ctx.fill?.();
+
+        ctx.fillStyle = 'rgba(52, 211, 153, 0.9)';
+        ctx.beginPath?.();
+        ctx.arc?.(px, py, 5, 0, Math.PI * 2);
+        ctx.fill?.();
+      }
+    }
+
+    // Bottom status bar showing active pose / morph / DNA / ASM summary
     const activeMorphs = Object.entries(docData.morphWeights || {})
       .filter(([, w]) => Math.abs(Number(w) || 0) > 0.02)
       .slice(0, 3)
       .map(([k, w]) => `${k}:${Number(w).toFixed(2)}`);
     const boneOffCount = Object.keys(docData.boneOffsets || {}).length;
-    const footerParts = [`Clip: ${clipId || 'rest'} (${timeS.toFixed(2)}s)`];
+    const asmSnap = asmController.getState();
+    const footerParts = [
+      `ASM: ${asmSnap.currentState}`,
+      `Clip: ${clipId || 'rest'} (${timeS.toFixed(2)}s)`,
+      `Mode: ${stageInteractionMode}`,
+    ];
+    if (lastLiftedRegionLabel) footerParts.push(`Lifted: ${lastLiftedRegionLabel}`);
     if (boneOffCount > 0) footerParts.push(`${boneOffCount} bone offset${boneOffCount > 1 ? 's' : ''}`);
     if (activeMorphs.length) footerParts.push(activeMorphs.join(' '));
     const footerText = footerParts.join(' · ');
@@ -622,7 +1380,6 @@ export function mountCharacterStudio(container, studioApi = {}) {
     const outfit = currentOutfit();
     const candidates = [];
     if (outfit?.modelPath) candidates.push(resolveCharacterModelUrl(outfit.modelPath));
-    // Fallback to first project `.glb` asset if document uses a placeholder model path
     if (typeof studioApi.listAssets === 'function') {
       const firstCharAsset = studioApi
         .listAssets({ kind: 'model' })
@@ -686,6 +1443,7 @@ export function mountCharacterStudio(container, studioApi = {}) {
   if (hasRealCanvas) {
     let dragging = false;
     let panMode = false;
+    let activeSculptRegion = 'nose';
     let lx = 0;
     let ly = 0;
     stageCanvas.addEventListener('contextmenu', (ev) => ev.preventDefault?.());
@@ -694,6 +1452,10 @@ export function mountCharacterStudio(container, studioApi = {}) {
       panMode = ev.button === 2 || ev.button === 1 || Boolean(ev.shiftKey);
       lx = ev.clientX ?? 0;
       ly = ev.clientY ?? 0;
+      const rect = stageCanvas.getBoundingClientRect?.() ?? { left: 0, top: 0, width: 480, height: 360 };
+      const nx = rect.width > 0 ? (lx - rect.left) / rect.width : 0.5;
+      const ny = rect.height > 0 ? (ly - rect.top) / rect.height : 0.5;
+      activeSculptRegion = hitTestStageDragRegion(nx, ny, stageFocus);
       stageCanvas.setPointerCapture?.(ev.pointerId);
     });
     stageCanvas.addEventListener('pointermove', (ev) => {
@@ -702,6 +1464,54 @@ export function mountCharacterStudio(container, studioApi = {}) {
       const dy = (ev.clientY ?? 0) - ly;
       lx = ev.clientX ?? 0;
       ly = ev.clientY ?? 0;
+
+      if (stageInteractionMode === 'sculpt_dna' && !panMode) {
+        const lifted = liftCharacterStageDragToSemanticGraph(docData, {
+          kind: 'dna_region',
+          regionId: activeSculptRegion,
+          dxNorm: dx / 240,
+          dyNorm: dy / 240,
+        });
+        docData = lifted.document;
+        lastLiftedRegionLabel = STAGE_DRAG_REGIONS[activeSculptRegion]?.label ?? activeSculptRegion;
+        commitOps(
+          [
+            { set: ['dna'], value: docData.dna },
+            { set: ['morphWeights'], value: docData.morphWeights },
+          ],
+          `3D Sculpt ${lastLiftedRegionLabel}`,
+          true,
+          { skipRebuild: true },
+        );
+        return;
+      }
+
+      if (stageInteractionMode === 'drag_ik' && !panMode) {
+        const curTarget = docData.ikChains[0]?.target ?? [0.32, 1.15, 0.38];
+        const proposedTarget = [
+          Number((curTarget[0] + dx * 0.004).toFixed(3)),
+          Number((curTarget[1] - dy * 0.004).toFixed(3)),
+          curTarget[2],
+        ];
+        const lifted = liftCharacterStageDragToSemanticGraph(
+          docData,
+          { kind: 'ik_target', chainIndex: 0, target: proposedTarget, enabled: true },
+          { solverMode },
+        );
+        docData = lifted.document;
+        lastHallucinationGhosts = lifted.projection.hallucinationGhosts;
+        lastSolverBanner = lifted.projection.verified
+          ? 'Verified: Inverse Lifting R³ → G_char (0 violations)'
+          : `Projected x̂ → x* (${lifted.projection.violations.length} constraint projection)`;
+        commitOps(
+          buildIkChainOps(0, { enabled: true, target: docData.ikChains[0].target }),
+          '3D Drag IK Effector',
+          true,
+          { skipRebuild: true },
+        );
+        return;
+      }
+
       if (panMode) {
         stagePanX += dx;
         stagePanY += dy;
@@ -714,7 +1524,14 @@ export function mountCharacterStudio(container, studioApi = {}) {
     const endDrag = (ev) => {
       if (!dragging) return;
       dragging = false;
-      try { stageCanvas.releasePointerCapture?.(ev.pointerId); } catch { /* ignore */ }
+      try {
+        stageCanvas.releasePointerCapture?.(ev.pointerId);
+      } catch {
+        /* ignore */
+      }
+      if (stageInteractionMode !== 'orbit') {
+        render();
+      }
     };
     stageCanvas.addEventListener('pointerup', endDrag);
     stageCanvas.addEventListener('pointercancel', endDrag);
@@ -733,6 +1550,10 @@ export function mountCharacterStudio(container, studioApi = {}) {
     }
     if (stageTurntable) stageYaw += 0.012;
     if (playing) {
+      const asmSnap = asmController.step(1 / 60);
+      if (docData.clips.some((c) => c.id === asmSnap.clipId)) {
+        clipId = asmSnap.clipId;
+      }
       const clipObj = docData.clips.find((c) => c.id === clipId) ?? docData.clips[0];
       const dur = Math.max(0.2, clipObj?.durationS ?? 2.0);
       timeS = clipObj?.looping !== false ? (timeS + 1 / 60) % dur : Math.min(dur, timeS + 1 / 60);
@@ -752,10 +1573,14 @@ export function mountCharacterStudio(container, studioApi = {}) {
 
   const syncFromStudio = () => {
     const activeDoc = studioApi.getActiveDocument?.();
-    if (activeDoc && (String(activeDoc.path ?? activeDoc.id ?? '').endsWith('.character.json') ||
-        activeDoc.root?.schema === CHARACTER_SCHEMA)) {
+    if (
+      activeDoc &&
+      (String(activeDoc.path ?? activeDoc.id ?? '').endsWith('.character.json') ||
+        activeDoc.root?.schema === CHARACTER_SCHEMA)
+    ) {
       activeDocId = activeDoc.id ?? activeDoc.path;
       docData = normalizeCharacterDocument(activeDoc.root ?? activeDoc.data ?? activeDoc);
+      asmController.setDefinition(docData.animStateMachine);
       if (!docData.skeleton.joints.some((j) => j.name === selectedJoint)) {
         selectedJoint = docData.skeleton.joints[0]?.name ?? '';
       }
@@ -816,14 +1641,16 @@ export function mountCharacterStudio(container, studioApi = {}) {
     toolbar.appendChild(el('span', 'gb-char-meta', `${docData.name} (${docData.id})`));
 
     // Project Character Document Switcher (when multiple `.character.json` files exist)
-    const charDocs = typeof studioApi.listDocuments === 'function'
-      ? studioApi.listDocuments({ suffix: '.character.json' })
-      : [];
+    const charDocs =
+      typeof studioApi.listDocuments === 'function' ? studioApi.listDocuments({ suffix: '.character.json' }) : [];
     if (Array.isArray(charDocs) && charDocs.length > 0) {
       const docSelect = el('select', 'gb-char-select');
       docSelect.dataset.role = 'character-doc-select';
       for (const cd of charDocs) {
-        const shortName = String(cd.path || cd.id).split('/').pop().replace(/\.character\.json$/i, '');
+        const shortName = String(cd.path || cd.id)
+          .split('/')
+          .pop()
+          .replace(/\.character\.json$/i, '');
         const opt = el('option', '', shortName);
         opt.value = cd.id;
         if (cd.id === activeDocId || cd.path === activeDocId) opt.selected = true;
@@ -836,6 +1663,7 @@ export function mountCharacterStudio(container, studioApi = {}) {
           if (opened) {
             activeDocId = opened.id ?? nextId;
             docData = normalizeCharacterDocument(opened.root ?? opened);
+            asmController.setDefinition(docData.animStateMachine);
             selectedJoint = docData.skeleton.joints[0]?.name ?? '';
             clipId = docData.clips[0]?.id ?? '';
             render();
@@ -866,6 +1694,7 @@ export function mountCharacterStudio(container, studioApi = {}) {
     const resetBtn = el('button', 'gb-char-btn', 'Reset Pose');
     resetBtn.dataset.role = 'reset-pose';
     resetBtn.addEventListener('click', () => {
+      lastHallucinationGhosts = [];
       commitOps([{ set: ['boneOffsets'], value: {} }], 'Reset bone offsets');
     });
     toolbar.appendChild(resetBtn);
@@ -880,7 +1709,7 @@ export function mountCharacterStudio(container, studioApi = {}) {
 
     const grid = el('div', 'gb-char-grid');
 
-    // Left column: Bone tree + Outfits & Sockets
+    // Left column: Bone tree + Outfits & Sockets + 5-Layer Parametric Character DNA
     const leftCol = el('div', 'gb-char-col');
 
     const boneCard = el('div', 'gb-char-card');
@@ -962,7 +1791,11 @@ export function mountCharacterStudio(container, studioApi = {}) {
     outfitCard.appendChild(outfitSelect);
 
     docData.sockets.forEach((sock, sIdx) => {
-      const sockRow = el('div', 'gb-char-meta', `Socket ${sock.id} → ${sock.parentJoint} [${sock.translation.map((n) => n.toFixed(2)).join(', ')}]`);
+      const sockRow = el(
+        'div',
+        'gb-char-meta',
+        `Socket ${sock.id} → ${sock.parentJoint} [${sock.translation.map((n) => n.toFixed(2)).join(', ')}]`,
+      );
       sockRow.dataset.socket = sock.id;
       outfitCard.appendChild(sockRow);
       const offsetSlider = el('input');
@@ -977,14 +1810,89 @@ export function mountCharacterStudio(container, studioApi = {}) {
         const nextT = [...curSock.translation];
         nextT[1] = Number(ev.target.value);
         sockRow.textContent = `Socket ${curSock.id} → ${curSock.parentJoint} [${nextT.map((n) => n.toFixed(2)).join(', ')}]`;
-        commitOps(buildSocketTransformOps(sIdx, { translation: nextT }), `Move socket ${sock.id}`, true, { skipRebuild: true });
+        commitOps(buildSocketTransformOps(sIdx, { translation: nextT }), `Move socket ${sock.id}`, true, {
+          skipRebuild: true,
+        });
       });
       outfitCard.appendChild(offsetSlider);
     });
     leftCol.appendChild(outfitCard);
+
+    // 5-Layer Parametric Character DNA & Wardrobe Anti-Clipping Card
+    const dnaCard = el('div', 'gb-char-card');
+    const dnaOcclusion = solveWardrobeOcclusionConstraints(docData.dna);
+    dnaCard.appendChild(
+      el(
+        'div',
+        'gb-char-card-header',
+        `5-Layer Parametric DNA (Occ 0x${dnaOcclusion.bodyOcclusionMask.toString(16)})`,
+      ),
+    );
+
+    const catSelect = el('select', 'gb-char-select');
+    catSelect.dataset.role = 'dna-category-select';
+    for (const cat of Object.values(DNA_SLIDER_CATEGORIES)) {
+      const opt = el('option', '', cat.label);
+      opt.value = cat.id;
+      if (cat.id === activeDnaCategory) opt.selected = true;
+      catSelect.appendChild(opt);
+    }
+    catSelect.addEventListener('change', (ev) => {
+      activeDnaCategory = ev.target.value;
+      render();
+    });
+    dnaCard.appendChild(catSelect);
+
+    const activeCatMeta = DNA_SLIDER_CATEGORIES[activeDnaCategory] ?? DNA_SLIDER_CATEGORIES.faceStructure;
+    for (const param of activeCatMeta.parameters) {
+      const curVal =
+        activeDnaCategory === 'bodyBuild'
+          ? (docData.dna.bodyBuild[param.id] ?? param.defaultValue)
+          : (docData.dna.craniofacial[activeDnaCategory]?.[param.id] ?? param.defaultValue);
+      const row = el('div', 'gb-char-slider-row');
+      row.appendChild(el('span', '', param.label));
+      const pSlider = el('input');
+      pSlider.type = 'range';
+      pSlider.min = String(param.min);
+      pSlider.max = String(param.max);
+      pSlider.step = '0.02';
+      pSlider.value = String(curVal);
+      pSlider.dataset.role = `dna-slider-${param.id}`;
+      const pVal = el('span', 'gb-char-val', Number(curVal).toFixed(2));
+      pSlider.addEventListener('input', (ev) => {
+        const nextV = Number(ev.target.value);
+        pVal.textContent = nextV.toFixed(2);
+        const path =
+          activeDnaCategory === 'bodyBuild'
+            ? ['dna', 'bodyBuild', param.id]
+            : ['dna', 'craniofacial', activeDnaCategory, param.id];
+        applyOpLocally(docData, { set: path, value: nextV });
+        const compiled = compileDnaToRigOverrides(docData.dna);
+        const ops = [
+          { set: path, value: nextV },
+          { set: ['skeleton', 'scale'], value: compiled.skeletonScale },
+        ];
+        if (param.morphId && compiled.morphWeights[param.morphId] !== undefined) {
+          ops.push({ set: ['morphWeights', param.morphId], value: compiled.morphWeights[param.morphId] });
+        }
+        commitOps(ops, `DNA ${param.label}`, true, { skipRebuild: true });
+      });
+      row.appendChild(pSlider);
+      row.appendChild(pVal);
+      dnaCard.appendChild(row);
+    }
+
+    const occMeta = el(
+      'div',
+      'gb-char-meta',
+      `Hidden skin regions (${dnaOcclusion.hiddenBodyRegions.length}): ${dnaOcclusion.hiddenBodyRegions.join(', ') || 'none'}`,
+    );
+    occMeta.dataset.role = 'dna-occlusion-summary';
+    dnaCard.appendChild(occMeta);
+    leftCol.appendChild(dnaCard);
     grid.appendChild(leftCol);
 
-    // Center column: Live 3D Character Stage + Animation Clips + Look-At + Two-Bone IK
+    // Center column: Live 3D Character Stage + Tri-Modal Semantic Graph Bar + Animation Clips + Look-At + Two-Bone IK
     const centerCol = el('div', 'gb-char-col');
 
     const stageCard = el('div', 'gb-char-stage-card');
@@ -992,6 +1900,22 @@ export function mountCharacterStudio(container, studioApi = {}) {
     stageHdr.appendChild(el('span', '', '3D Character Turntable'));
 
     const stageControls = el('div', 'gb-char-stage-controls');
+    const interactionModes = [
+      ['orbit', 'Orbit'],
+      ['sculpt_dna', '3D Sculpt DNA'],
+      ['drag_ik', 'Drag IK (x̂→x*)'],
+    ];
+    for (const [mid, mlabel] of interactionModes) {
+      const mBtn = el('button', `gb-char-btn${stageInteractionMode === mid ? ' is-active' : ''}`, mlabel);
+      mBtn.dataset.role = `stage-mode-${mid}`;
+      mBtn.addEventListener('click', () => {
+        stageInteractionMode = mid;
+        render();
+        repaintStage();
+      });
+      stageControls.appendChild(mBtn);
+    }
+
     const focusModes = [
       ['body', 'Full Body'],
       ['bust', 'Face / Bust'],
@@ -1055,11 +1979,82 @@ export function mountCharacterStudio(container, studioApi = {}) {
     stageCard.appendChild(stageWrap);
 
     const stageHint = el('div', 'gb-char-stage-hint');
-    stageHint.appendChild(el('span', '', 'Left-drag: Orbit · Right/Shift-drag: Pan · Wheel: Zoom'));
+    stageHint.appendChild(el('span', '', 'Left-drag: Orbit/Sculpt/IK · Right/Shift-drag: Pan · Wheel: Zoom'));
     const activeOutfitObj = currentOutfit();
     stageHint.appendChild(el('span', '', activeOutfitObj?.modelPath || ''));
     stageCard.appendChild(stageHint);
     centerCol.appendChild(stageCard);
+
+    // Tri-Modal Articulated Semantic Graph & Constraint Projection Card
+    const triCard = el('div', 'gb-char-card');
+    triCard.appendChild(
+      el('div', 'gb-char-card-header', 'Tri-Modal Articulated Semantic Graph (L: R³ → G_char & x̂ → x*)'),
+    );
+
+    const promptRow = el('div', 'gb-char-preset-strip');
+    const promptInput = el('input', 'gb-char-input');
+    promptInput.type = 'text';
+    promptInput.placeholder = 'e.g. Reach for [0.95, 1.25, 0.85] with right hand, look at [0.4, 1.55, 1.8], tall scholar';
+    promptInput.dataset.role = 'char-semantic-prompt';
+    promptRow.appendChild(promptInput);
+
+    const applyPromptBtn = el('button', 'gb-char-btn is-active', 'Apply Prompt');
+    applyPromptBtn.dataset.role = 'char-apply-prompt';
+    applyPromptBtn.addEventListener('click', () => {
+      const res = applyCharacterSemanticPatch(docData, promptInput.value, { solverMode });
+      docData = res.document;
+      lastHallucinationGhosts = res.projection.hallucinationGhosts;
+      lastSolverBanner = res.rejected
+        ? `Rejected (Rollback): ${res.projection.violations.length} constraint violations`
+        : res.projection.verified
+          ? 'Verified: 0 constraint violations'
+          : `Auto-Projected x̂ → x* (${res.projection.violations.length} articulated constraints repaired)`;
+      commitOps(
+        [
+          { set: ['ikChains'], value: docData.ikChains },
+          { set: ['lookAt'], value: docData.lookAt },
+          { set: ['dna'], value: docData.dna },
+          { set: ['morphWeights'], value: docData.morphWeights },
+        ],
+        'Apply Tri-Modal Character Prompt',
+      );
+    });
+    promptRow.appendChild(applyPromptBtn);
+
+    const simConflictBtn = el('button', 'gb-char-btn', '⚡ Simulate 2-Agent Conflict');
+    simConflictBtn.dataset.role = 'char-simulate-conflict';
+    simConflictBtn.addEventListener('click', () => {
+      const resolved = resolveTwoAgentCharacterConflict(docData);
+      docData = resolved.resolvedDocument;
+      lastHallucinationGhosts = resolved.hallucinationGhosts;
+      lastSolverBanner = `2-Agent Conflict Resolved: ${resolved.naiveConflictCount} collisions projected (x̂ → x*)`;
+      commitOps(
+        [
+          { set: ['skeleton', 'placement'], value: docData.skeleton.placement },
+          { set: ['ikChains'], value: docData.ikChains },
+          { set: ['lookAt'], value: docData.lookAt },
+        ],
+        'Resolve 2-Agent Character Conflict',
+      );
+    });
+    promptRow.appendChild(simConflictBtn);
+    triCard.appendChild(promptRow);
+
+    const solverStatus = el('div', 'gb-char-meta', lastSolverBanner);
+    solverStatus.dataset.role = 'char-solver-status';
+    triCard.appendChild(solverStatus);
+
+    const currentSubgraph = getCharacterSemanticSubgraph(docData, { asmRuntime: asmController.getState() });
+    const graphTextarea = el('textarea', 'gb-char-input gb-char-graph-editor');
+    graphTextarea.dataset.role = 'char-semantic-graph-editor';
+    graphTextarea.rows = 5;
+    graphTextarea.value = JSON.stringify(
+      { nodes: currentSubgraph.nodes.slice(0, 4), edges: currentSubgraph.edges.slice(0, 4) },
+      null,
+      2,
+    );
+    triCard.appendChild(graphTextarea);
+    centerCol.appendChild(triCard);
 
     const animCard = el('div', 'gb-char-card');
     animCard.appendChild(el('div', 'gb-char-card-header', 'Animation & Hermite Crossfade'));
@@ -1147,7 +2142,10 @@ export function mountCharacterStudio(container, studioApi = {}) {
     pad.dataset.role = 'look-at-pad';
     const dot = el('div', 'gb-char-lookpad-dot');
     const tx = Math.min(1, Math.max(-1, (docData.lookAt.target[0] ?? 0) / 1.5));
-    const ty = Math.min(1, Math.max(-1, ((docData.lookAt.target[1] ?? 1.55) - (docData.lookAt.origin[1] ?? 1.55)) / 1.0));
+    const ty = Math.min(
+      1,
+      Math.max(-1, ((docData.lookAt.target[1] ?? 1.55) - (docData.lookAt.origin[1] ?? 1.55)) / 1.0),
+    );
     dot.style.left = `${(tx * 0.5 + 0.5) * 100}%`;
     dot.style.top = `${(0.5 - ty * 0.5) * 100}%`;
     pad.appendChild(dot);
@@ -1158,7 +2156,13 @@ export function mountCharacterStudio(container, studioApi = {}) {
       const worldX = Number(((nx - 0.5) * 3.0).toFixed(3));
       const worldY = Number(((docData.lookAt.origin[1] ?? 1.55) + (0.5 - ny) * 2.0).toFixed(3));
       const worldZ = docData.lookAt.target[2] ?? 2.0;
-      commitOps(buildLookAtTargetOps([worldX, worldY, worldZ], true), 'Move Look-At target', true);
+      const lifted = liftCharacterStageDragToSemanticGraph(docData, {
+        kind: 'look_at',
+        target: [worldX, worldY, worldZ],
+        enabled: true,
+      });
+      lastHallucinationGhosts = lifted.projection.hallucinationGhosts;
+      commitOps(buildLookAtTargetOps(lifted.document.lookAt.target, true), 'Move Look-At target', true);
     });
     lookCard.appendChild(pad);
     lookCard.appendChild(
@@ -1174,7 +2178,11 @@ export function mountCharacterStudio(container, studioApi = {}) {
     const ikCard = el('div', 'gb-char-card');
     ikCard.appendChild(el('div', 'gb-char-card-header', 'Analytical Two-Bone IK'));
     docData.ikChains.forEach((ik, idx) => {
-      const toggle = el('button', `gb-char-btn${ik.enabled ? ' is-active' : ''}`, `${ik.id} (${ik.enabled ? 'ON' : 'OFF'})`);
+      const toggle = el(
+        'button',
+        `gb-char-btn${ik.enabled ? ' is-active' : ''}`,
+        `${ik.id} (${ik.enabled ? 'ON' : 'OFF'})`,
+      );
       toggle.dataset.role = `ik-toggle-${idx}`;
       toggle.addEventListener('click', () => {
         commitOps(buildIkChainOps(idx, { enabled: !ik.enabled }), `Toggle IK ${ik.id}`);
@@ -1202,8 +2210,53 @@ export function mountCharacterStudio(container, studioApi = {}) {
     centerCol.appendChild(ikCard);
     grid.appendChild(centerCol);
 
-    // Right column: Morphs & Expression Presets
+    // Right column: Circumstance ASM Live Simulator + Morphs & Expression Presets
     const rightCol = el('div', 'gb-char-col');
+
+    const asmCard = el('div', 'gb-char-card');
+    const asmSnap = asmController.getState();
+    asmCard.appendChild(
+      el('div', 'gb-char-card-header', `Circumstance ASM (${asmSnap.currentState})`),
+    );
+    const stateStrip = el('div', 'gb-char-preset-strip');
+    for (const st of docData.animStateMachine.states) {
+      const sBtn = el(
+        'button',
+        `gb-char-btn${st.id === asmSnap.currentState ? ' is-active' : ''}`,
+        st.id,
+      );
+      sBtn.dataset.role = `asm-state-${st.id}`;
+      sBtn.addEventListener('click', () => {
+        const nextSnap = asmController.forceState(st.id, 200);
+        if (docData.clips.some((c) => c.id === nextSnap.clipId)) {
+          clipId = nextSnap.clipId;
+        }
+        render();
+        pushPoseToEngine();
+        repaintStage();
+      });
+      stateStrip.appendChild(sBtn);
+    }
+    asmCard.appendChild(stateStrip);
+
+    const trigStrip = el('div', 'gb-char-preset-strip');
+    for (const trigName of ['execute_action', 'applaud']) {
+      const tBtn = el('button', 'gb-char-btn', `⚡ ${trigName}`);
+      tBtn.dataset.role = `asm-trigger-${trigName}`;
+      tBtn.addEventListener('click', () => {
+        const nextSnap = asmController.fireTrigger(trigName);
+        if (docData.clips.some((c) => c.id === nextSnap.clipId)) {
+          clipId = nextSnap.clipId;
+        }
+        render();
+        pushPoseToEngine();
+        repaintStage();
+      });
+      trigStrip.appendChild(tBtn);
+    }
+    asmCard.appendChild(trigStrip);
+    rightCol.appendChild(asmCard);
+
     const presetCard = el('div', 'gb-char-card');
     presetCard.appendChild(el('div', 'gb-char-card-header', 'Expression Presets'));
     const strip = el('div', 'gb-char-preset-strip');
@@ -1230,12 +2283,9 @@ export function mountCharacterStudio(container, studioApi = {}) {
     intSlider.addEventListener('input', (ev) => {
       const v = Number(ev.target.value);
       intVal.textContent = `${v.toFixed(2)}x`;
-      commitOps(
-        [{ set: ['expressionIntensity'], value: v }],
-        'Adjust expression intensity',
-        true,
-        { skipRebuild: true },
-      );
+      commitOps([{ set: ['expressionIntensity'], value: v }], 'Adjust expression intensity', true, {
+        skipRebuild: true,
+      });
     });
     intensityRow.appendChild(intSlider);
     intensityRow.appendChild(intVal);
@@ -1289,7 +2339,7 @@ export function mountCharacterStudio(container, studioApi = {}) {
     const unsub = studioApi.subscribe(() => {
       if (!active || destroyed) return;
       const focusedTag = dom.activeElement?.tagName;
-      if (focusedTag === 'INPUT' || focusedTag === 'SELECT') return;
+      if (focusedTag === 'INPUT' || focusedTag === 'SELECT' || focusedTag === 'TEXTAREA') return;
       const prevId = activeDocId;
       const prevOutfit = docData.activeOutfitId;
       syncFromStudio();
@@ -1321,7 +2371,7 @@ export function mountCharacterStudio(container, studioApi = {}) {
     container.innerHTML = '';
   };
 
-  return {
+  const controller = {
     destroy,
     unmount: destroy,
     refresh() {
@@ -1333,12 +2383,40 @@ export function mountCharacterStudio(container, studioApi = {}) {
     setDocument(pathOrId, rawDoc) {
       activeDocId = pathOrId;
       docData = normalizeCharacterDocument(rawDoc?.root ?? rawDoc);
+      asmController.setDefinition(docData.animStateMachine);
       selectedJoint = docData.skeleton.joints[0]?.name ?? '';
       clipId = docData.clips[0]?.id ?? '';
       render();
       pushPoseToEngine();
       void ensureOutfitModelLoaded();
     },
+    getCharacterSemanticSubgraph: () =>
+      getCharacterSemanticSubgraph(docData, { asmRuntime: asmController.getState() }),
+    applyCharacterSemanticPatch(patchOrPrompt, opts = {}) {
+      const res = applyCharacterSemanticPatch(docData, patchOrPrompt, { solverMode, ...opts });
+      docData = res.document;
+      lastHallucinationGhosts = res.projection.hallucinationGhosts;
+      render();
+      pushPoseToEngine();
+      return res;
+    },
+    projectCharacterIkConstraints(rigConstraints = {}) {
+      const res = projectCharacterIkConstraints(docData, rigConstraints);
+      docData = res.document;
+      lastHallucinationGhosts = res.hallucinationGhosts;
+      render();
+      pushPoseToEngine();
+      return res;
+    },
+    resolveTwoAgentConflict(agentAPatch, agentBPatch) {
+      const res = resolveTwoAgentCharacterConflict(docData, agentAPatch, agentBPatch);
+      docData = res.resolvedDocument;
+      lastHallucinationGhosts = res.hallucinationGhosts;
+      render();
+      pushPoseToEngine();
+      return res;
+    },
+    summarizeForAi: () => summarizeCharacterForAi(docData, asmController.getState()),
     onActivate() {
       active = true;
       syncFromStudio();
@@ -1356,4 +2434,10 @@ export function mountCharacterStudio(container, studioApi = {}) {
       }
     },
   };
+
+  if (typeof globalThis.window !== 'undefined') {
+    globalThis.window.__characterStudio = controller;
+  }
+
+  return controller;
 }

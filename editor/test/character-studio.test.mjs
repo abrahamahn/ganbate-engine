@@ -12,13 +12,20 @@ import {
 } from '../../web/character-customization.mjs';
 import {
   CHARACTER_SCHEMA,
+  CHARACTER_SEMANTIC_GRAPH_SCHEMA,
+  applyCharacterSemanticPatch,
   buildBoneOffsetOps,
   buildPresetApplyOps,
   createDefaultCharacterDocument,
   evaluateCharacterPoseSpec,
   filterBoneTree,
+  getCharacterSemanticSubgraph,
   groupMorphTargets,
+  liftCharacterStageDragToSemanticGraph,
   mountCharacterStudio,
+  projectCharacterIkConstraints,
+  resolveTwoAgentCharacterConflict,
+  summarizeCharacterForAi,
 } from '../character-studio.js';
 
 function createMiniDom() {
@@ -152,10 +159,8 @@ test('character-customization single-call packet encoding, blend spaces, and rig
   });
   assert.equal(singleCalls, 2);
   assert.ok(lastPacket instanceof Float32Array);
-  // Crossfade active on transition -> flags bit 4 set
   assert.ok((Math.round(lastPacket[0]) & 4) !== 0);
 
-  // Verify bindCharacterShapes compatibility
   const morphCalls = [];
   const binder = bindCharacterShapes(
     {
@@ -173,7 +178,67 @@ test('character-customization single-call packet encoding, blend spaces, and rig
   assert.ok(encodePoseCommandPacket({ clips: [{ clip: 0, time: 0.2, weight: 1 }] }).length >= 12);
 });
 
-test('mountCharacterStudio renders rig hierarchy, emits studioApi.edit ops, and forwards single-call poses', () => {
+test('Tri-Modal Articulated Semantic Graph: constraint projection (x_hat -> x*), inverse lifting, and 2-agent conflict solver', () => {
+  const doc = createDefaultCharacterDocument('scholar_actor', 'Scholar Actor');
+
+  // 1. Minimal-Perturbation Articulated Constraint Projection (`projectCharacterIkConstraints`)
+  const invalidDoc = structuredClone(doc);
+  invalidDoc.ikChains[0].enabled = true;
+  invalidDoc.ikChains[0].target = [1.85, -0.35, 1.4]; // Exceeds arm reach manifold AND penetrates floor!
+  invalidDoc.lookAt.target = [3.5, 2.9, -0.5]; // Behind head plane AND exceeds ±55° yaw / ±35° pitch cone!
+
+  const proj = projectCharacterIkConstraints(invalidDoc);
+  assert.equal(proj.verified, false);
+  assert.ok(proj.violations.length >= 2);
+  assert.ok(proj.hallucinationGhosts.length >= 2);
+
+  const projectedTarget = proj.document.ikChains[0].target;
+  assert.ok(projectedTarget[1] >= 0.05, 'floor constraint must clamp y >= 0.05m');
+  const shoulder = [0.18, 1.38, 0.0];
+  const distFromShoulder = Math.hypot(
+    projectedTarget[0] - shoulder[0],
+    projectedTarget[1] - shoulder[1],
+    projectedTarget[2] - shoulder[2],
+  );
+  assert.ok(distFromShoulder <= proj.effectiveArmReachM + 1e-2, `expected dist ${distFromShoulder} <= ${proj.effectiveArmReachM}`);
+
+  // 2. Inverse Semantic Lifting (`L_char: R^3 -> G_char`)
+  const lifted = liftCharacterStageDragToSemanticGraph(doc, {
+    kind: 'ik_target',
+    chainIndex: 0,
+    target: [0.36, 1.22, 0.34],
+    enabled: true,
+  });
+  assert.equal(lifted.rejected, false);
+  assert.equal(lifted.subgraph.schema, CHARACTER_SEMANTIC_GRAPH_SCHEMA);
+  const reachEdge = lifted.liftedEdges.find((e) => e.rel === 'reaches_for');
+  assert.ok(reachEdge, 'expected symbolic reaches_for edge');
+  assert.ok(reachEdge.distanceM > 0 && reachEdge.distanceM <= 0.56);
+
+  // 3. Natural-language prompt patching (`applyCharacterSemanticPatch`)
+  const patched = applyCharacterSemanticPatch(
+    doc,
+    'Reach for [1.4, 1.2, 1.1] with right hand, look at [0.25, 1.55, 1.8], tall scholar with heterochromia',
+  );
+  assert.equal(patched.rejected, false);
+  assert.ok(patched.projection.hallucinationGhosts.length >= 1, 'unreachable IK target [1.4, 1.2, 1.1] should project x_hat -> x*');
+  assert.equal(patched.document.dna.skinIrisDecals.iris.heterochromia, true);
+
+  // 4. 2-Agent Concurrent Character Edit Conflict Resolution
+  const conflictResolved = resolveTwoAgentCharacterConflict(doc);
+  assert.ok(conflictResolved.naiveConflictCount >= 1);
+  assert.ok(conflictResolved.hallucinationGhosts.length >= 1);
+  assert.equal(conflictResolved.subgraph.verification.verified, true);
+
+  // 5. Token-compact AI summary (`<120 tokens`)
+  const digest = summarizeCharacterForAi(conflictResolved.resolvedDocument);
+  assert.ok(digest.includes('CHAR[scholar_actor'));
+  assert.ok(digest.includes('DNA['));
+  assert.ok(digest.includes('ASM['));
+  assert.ok(digest.split(/\s+/).length < 120);
+});
+
+test('mountCharacterStudio renders rig hierarchy, emits studioApi.edit ops, and exposes Tri-Modal hooks', () => {
   const container = createMiniDom();
   const edits = [];
   const packets = [];
@@ -220,6 +285,16 @@ test('mountCharacterStudio renders rig hierarchy, emits studioApi.edit ops, and 
   ikBtn.dispatch('click');
   assert.equal(edits.length, 2);
   assert.deepEqual(edits[1].ops, [{ set: ['ikChains', '0', 'enabled'], value: true }]);
+
+  // Verify Tri-Modal Hook Contract on mounted controller
+  const subgraph = handle.getCharacterSemanticSubgraph();
+  assert.equal(subgraph.schema, CHARACTER_SEMANTIC_GRAPH_SCHEMA);
+  assert.ok(subgraph.nodes.some((n) => n.type === 'articulated_humanoid'));
+
+  const conflictBtn = container.find((el) => el.dataset?.role === 'char-simulate-conflict');
+  assert.ok(conflictBtn, 'expected 2-Agent Conflict button in Character Studio');
+  conflictBtn.dispatch('click');
+  assert.equal(edits.length, 3);
 
   handle.onDeactivate();
   handle.onActivate();

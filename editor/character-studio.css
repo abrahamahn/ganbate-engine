@@ -102,6 +102,14 @@
   font-size: 11px;
 }
 
+.gb-char-graph-editor {
+  width: 100%;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10.5px;
+  line-height: 1.38;
+  resize: vertical;
+}
+
 .gb-char-bone-list {
   display: flex;
   flex-direction: column;
