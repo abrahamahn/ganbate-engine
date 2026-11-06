@@ -95,6 +95,29 @@ export const TURNTABLE_LIGHTING_PRESETS = Object.freeze({
   },
 });
 
+export const CHARACTER_ACADEMIC_SCENARIOS = Object.freeze({
+  embodied_scholar_reach: {
+    id: 'embodied_scholar_reach',
+    label: '1. Embodied Scholar Reach & Gaze',
+    prompt: 'Reach for [0.36, 1.18, 0.42] with right hand, look at [0.22, 1.52, 1.8], tall scholar coat',
+  },
+  unreachable_ik_projection: {
+    id: 'unreachable_ik_projection',
+    label: '2. Unreachable IK & Neck Cone Projection (x̂ → x*)',
+    prompt: 'Reach for [1.45, 2.10, 1.35] with right hand and look at [2.80, 2.40, -0.50]',
+  },
+  two_agent_posture_conflict: {
+    id: 'two_agent_posture_conflict',
+    label: '3. 2-Agent Posture + IK Torso Collision',
+    isTwoAgentConflict: true,
+  },
+  wardrobe_layer_occlusion: {
+    id: 'wardrobe_layer_occlusion',
+    label: '4. 5-Layer Wardrobe Occlusion & Clearance',
+    prompt: 'Tall athletic scholar wearing pavilion coat with heterochromia, focus on table',
+  },
+});
+
 const DEG_TO_RAD = Math.PI / 180;
 const RAD_TO_DEG = 180 / Math.PI;
 const clamp = (val, min, max) => Math.min(max, Math.max(min, Number.isFinite(val) ? val : 0));
@@ -1004,6 +1027,58 @@ export function applyCharacterSemanticPatch(rawDoc, patchOrPrompt, options = {})
         } else if (n.type === 'gaze_target' && Array.isArray(n.target)) {
           doc.lookAt.enabled = n.enabled !== false;
           doc.lookAt.target = n.target.map((v) => Number(v));
+        } else if (n.type === 'articulated_humanoid') {
+          if (Array.isArray(n.position)) {
+            doc.skeleton.placement.position = n.position.map((v) => Number(v));
+          }
+          if (typeof n.activeOutfitId === 'string' && n.activeOutfitId) {
+            doc.activeOutfitId = n.activeOutfitId;
+          }
+        }
+      }
+    }
+    if (Array.isArray(patchOrPrompt.edges)) {
+      for (const e of patchOrPrompt.edges) {
+        if (!e || typeof e !== 'object') continue;
+        if ((e.rel === 'reaches_for' || e.rel === 'stowed_beside') && doc.ikChains[0]) {
+          if (e.rel === 'stowed_beside' || e.to === 'torso_rest_anchor') {
+            doc.ikChains[0].enabled = false;
+          } else {
+            doc.ikChains[0].enabled = true;
+            const toAnchor = String(e.to ?? '');
+            if (Array.isArray(e.target) && e.target.length === 3) {
+              doc.ikChains[0].target = e.target.map((v) => Number(v));
+            } else if (toAnchor.includes('left_workspace')) {
+              doc.ikChains[0].target = [-0.32, 1.18, 0.36];
+            } else if (toAnchor.includes('right_workspace')) {
+              doc.ikChains[0].target = [0.42, 1.18, 0.36];
+            } else if (toAnchor.includes('elevated_shelf')) {
+              doc.ikChains[0].target = [0.28, 1.56, 0.34];
+            } else if (toAnchor.includes('low_surface')) {
+              doc.ikChains[0].target = [0.24, 0.88, 0.34];
+            } else if (toAnchor.includes('front_workspace')) {
+              doc.ikChains[0].target = [0.28, 1.16, 0.42];
+            }
+          }
+        } else if (e.rel === 'looks_at') {
+          doc.lookAt.enabled = true;
+          const toFocus = String(e.to ?? '');
+          if (Array.isArray(e.target) && e.target.length === 3) {
+            doc.lookAt.target = e.target.map((v) => Number(v));
+          } else if (toFocus.includes('left_subject')) {
+            doc.lookAt.target = [-0.85, 1.55, 1.6];
+          } else if (toFocus.includes('right_subject')) {
+            doc.lookAt.target = [0.85, 1.55, 1.6];
+          } else if (toFocus.includes('work_surface_below')) {
+            doc.lookAt.target = [0.0, 1.05, 1.4];
+          } else if (toFocus.includes('upper_gallery')) {
+            doc.lookAt.target = [0.0, 2.05, 1.6];
+          } else if (toFocus.includes('eye_level_front')) {
+            doc.lookAt.target = [0.0, 1.55, 2.0];
+          }
+        } else if (e.rel === 'occludes_body_mask' && typeof e.from === 'string' && e.from.startsWith('wardrobe:')) {
+          const outfitId = e.from.slice('wardrobe:'.length);
+          if (outfitId) doc.activeOutfitId = outfitId;
         }
       }
     }
@@ -1882,6 +1957,118 @@ export function mountCharacterStudio(container, studioApi = {}) {
       dnaCard.appendChild(row);
     }
 
+    // Layer 2: Skin Melanin & Iris Heterochromia
+    const melaninRow = el('div', 'gb-char-slider-row');
+    melaninRow.appendChild(el('span', '', 'Skin Melanin'));
+    const melaninSlider = el('input');
+    melaninSlider.type = 'range';
+    melaninSlider.min = '0';
+    melaninSlider.max = '1';
+    melaninSlider.step = '0.02';
+    melaninSlider.value = String(docData.dna.skinEyesTeeth?.skinMelanin ?? 0.32);
+    melaninSlider.dataset.role = 'dna-skin-melanin';
+    const melaninVal = el('span', 'gb-char-val', Number(docData.dna.skinEyesTeeth?.skinMelanin ?? 0.32).toFixed(2));
+    melaninSlider.addEventListener('input', (ev) => {
+      const nextV = Number(ev.target.value);
+      melaninVal.textContent = nextV.toFixed(2);
+      commitOps([{ set: ['dna', 'skinEyesTeeth', 'skinMelanin'], value: nextV }], 'Skin Melanin', true, {
+        skipRebuild: true,
+      });
+    });
+    melaninRow.appendChild(melaninSlider);
+    melaninRow.appendChild(melaninVal);
+    dnaCard.appendChild(melaninRow);
+
+    const heteroRow = el('div', 'gb-char-slider-row');
+    heteroRow.appendChild(el('span', '', 'Heterochromia'));
+    const heteroSlider = el('input');
+    heteroSlider.type = 'range';
+    heteroSlider.min = '0';
+    heteroSlider.max = '1';
+    heteroSlider.step = '0.05';
+    heteroSlider.value = String(docData.dna.skinEyesTeeth?.irisHeterochromia ?? 0);
+    heteroSlider.dataset.role = 'dna-iris-heterochromia';
+    const heteroVal = el('span', 'gb-char-val', Number(docData.dna.skinEyesTeeth?.irisHeterochromia ?? 0).toFixed(2));
+    heteroSlider.addEventListener('input', (ev) => {
+      const nextV = Number(ev.target.value);
+      heteroVal.textContent = nextV.toFixed(2);
+      commitOps([{ set: ['dna', 'skinEyesTeeth', 'irisHeterochromia'], value: nextV }], 'Iris Heterochromia', true, {
+        skipRebuild: true,
+      });
+    });
+    heteroRow.appendChild(heteroSlider);
+    heteroRow.appendChild(heteroVal);
+    dnaCard.appendChild(heteroRow);
+
+    // Layer 3: Physics Groom Spring-Bone Stiffness & Damping
+    const stiffRow = el('div', 'gb-char-slider-row');
+    stiffRow.appendChild(el('span', '', 'Groom Stiffness'));
+    const stiffSlider = el('input');
+    stiffSlider.type = 'range';
+    stiffSlider.min = '0.05';
+    stiffSlider.max = '1';
+    stiffSlider.step = '0.05';
+    stiffSlider.value = String(docData.dna.groom?.springStiffness ?? 0.62);
+    stiffSlider.dataset.role = 'dna-groom-stiffness';
+    const stiffVal = el('span', 'gb-char-val', Number(docData.dna.groom?.springStiffness ?? 0.62).toFixed(2));
+    stiffSlider.addEventListener('input', (ev) => {
+      const nextV = Number(ev.target.value);
+      stiffVal.textContent = nextV.toFixed(2);
+      commitOps([{ set: ['dna', 'groom', 'springStiffness'], value: nextV }], 'Groom Spring Stiffness', true, {
+        skipRebuild: true,
+      });
+    });
+    stiffRow.appendChild(stiffSlider);
+    stiffRow.appendChild(stiffVal);
+    dnaCard.appendChild(stiffRow);
+
+    const dampRow = el('div', 'gb-char-slider-row');
+    dampRow.appendChild(el('span', '', 'Groom Damping'));
+    const dampSlider = el('input');
+    dampSlider.type = 'range';
+    dampSlider.min = '0.05';
+    dampSlider.max = '1';
+    dampSlider.step = '0.05';
+    dampSlider.value = String(docData.dna.groom?.springDamping ?? 0.28);
+    dampSlider.dataset.role = 'dna-groom-damping';
+    const dampVal = el('span', 'gb-char-val', Number(docData.dna.groom?.springDamping ?? 0.28).toFixed(2));
+    dampSlider.addEventListener('input', (ev) => {
+      const nextV = Number(ev.target.value);
+      dampVal.textContent = nextV.toFixed(2);
+      commitOps([{ set: ['dna', 'groom', 'springDamping'], value: nextV }], 'Groom Spring Damping', true, {
+        skipRebuild: true,
+      });
+    });
+    dampRow.appendChild(dampSlider);
+    dampRow.appendChild(dampVal);
+    dnaCard.appendChild(dampRow);
+
+    // Layer 4: Modular Wardrobe Slots (`inner`, `top`, `outer`) with Live Occlusion Mask
+    for (const slotKey of ['inner', 'top', 'outer']) {
+      const catalog = WARDROBE_SLOT_CATALOG[slotKey] ?? [];
+      if (!catalog.length) continue;
+      const wRow = el('div', 'gb-char-slider-row');
+      wRow.appendChild(el('span', '', `Slot: ${slotKey}`));
+      const wSel = el('select', 'gb-char-select');
+      wSel.dataset.role = `dna-wardrobe-${slotKey}`;
+      const curItemId = docData.dna.wardrobeSlots?.[slotKey]?.itemId ?? catalog[0].id;
+      for (const item of catalog) {
+        const opt = el('option', '', item.label);
+        opt.value = item.id;
+        if (item.id === curItemId) opt.selected = true;
+        wSel.appendChild(opt);
+      }
+      wSel.addEventListener('change', (ev) => {
+        const nextItemId = ev.target.value;
+        applyOpLocally(docData, { set: ['dna', 'wardrobeSlots', slotKey, 'itemId'], value: nextItemId });
+        const solved = solveWardrobeOcclusionConstraints(docData.dna);
+        docData.dna = solved.dna;
+        commitOps([{ set: ['dna'], value: docData.dna }], `Wardrobe ${slotKey} -> ${nextItemId}`);
+      });
+      wRow.appendChild(wSel);
+      dnaCard.appendChild(wRow);
+    }
+
     const occMeta = el(
       'div',
       'gb-char-meta',
@@ -1991,6 +2178,72 @@ export function mountCharacterStudio(container, studioApi = {}) {
       el('div', 'gb-char-card-header', 'Tri-Modal Articulated Semantic Graph (L: R³ → G_char & x̂ → x*)'),
     );
 
+    const scenarioRow = el('div', 'gb-char-preset-strip');
+    const scenarioSelect = el('select', 'gb-char-select');
+    scenarioSelect.dataset.role = 'char-academic-preset';
+    for (const sc of Object.values(CHARACTER_ACADEMIC_SCENARIOS)) {
+      const opt = el('option', '', sc.label);
+      opt.value = sc.id;
+      scenarioSelect.appendChild(opt);
+    }
+    scenarioRow.appendChild(scenarioSelect);
+
+    const solverModeSelect = el('select', 'gb-char-select');
+    solverModeSelect.dataset.role = 'char-solver-mode';
+    for (const [mId, mLabel] of [
+      ['project', 'Solver: Auto-Project (x̂ → x*)'],
+      ['reject', 'Solver: Strict Reject'],
+    ]) {
+      const opt = el('option', '', mLabel);
+      opt.value = mId;
+      if (mId === solverMode) opt.selected = true;
+      solverModeSelect.appendChild(opt);
+    }
+    solverModeSelect.addEventListener('change', (ev) => {
+      solverMode = ev.target.value;
+    });
+    scenarioRow.appendChild(solverModeSelect);
+
+    const runScenarioBtn = el('button', 'gb-char-btn', '▶ Run Academic Preset');
+    runScenarioBtn.dataset.role = 'char-run-scenario';
+    runScenarioBtn.addEventListener('click', () => {
+      const sc = CHARACTER_ACADEMIC_SCENARIOS[scenarioSelect.value] ?? CHARACTER_ACADEMIC_SCENARIOS.embodied_scholar_reach;
+      if (sc.isTwoAgentConflict) {
+        const resolved = resolveTwoAgentCharacterConflict(docData);
+        docData = resolved.resolvedDocument;
+        lastHallucinationGhosts = resolved.hallucinationGhosts;
+        lastSolverBanner = `2-Agent Conflict Resolved: ${resolved.naiveConflictCount} collisions projected (x̂ → x*)`;
+        commitOps(
+          [
+            { set: ['skeleton', 'placement'], value: docData.skeleton.placement },
+            { set: ['ikChains'], value: docData.ikChains },
+            { set: ['lookAt'], value: docData.lookAt },
+          ],
+          `Academic Preset: ${sc.label}`,
+        );
+      } else {
+        const res = applyCharacterSemanticPatch(docData, sc.prompt, { solverMode });
+        docData = res.document;
+        lastHallucinationGhosts = res.projection.hallucinationGhosts;
+        lastSolverBanner = res.rejected
+          ? `Rejected (Rollback): ${res.projection.violations.length} constraint violations`
+          : res.projection.verified
+            ? `Preset Verified (${sc.id}): 0 violations`
+            : `Preset Auto-Projected x̂ → x* (${res.projection.violations.length} constraints repaired)`;
+        commitOps(
+          [
+            { set: ['ikChains'], value: docData.ikChains },
+            { set: ['lookAt'], value: docData.lookAt },
+            { set: ['dna'], value: docData.dna },
+            { set: ['morphWeights'], value: docData.morphWeights },
+          ],
+          `Academic Preset: ${sc.label}`,
+        );
+      }
+    });
+    scenarioRow.appendChild(runScenarioBtn);
+    triCard.appendChild(scenarioRow);
+
     const promptRow = el('div', 'gb-char-preset-strip');
     const promptInput = el('input', 'gb-char-input');
     promptInput.type = 'text';
@@ -2054,6 +2307,34 @@ export function mountCharacterStudio(container, studioApi = {}) {
       2,
     );
     triCard.appendChild(graphTextarea);
+
+    const applyGraphBtn = el('button', 'gb-char-btn', 'Apply Graph JSON (G_char → R³)');
+    applyGraphBtn.dataset.role = 'char-apply-graph-json';
+    applyGraphBtn.addEventListener('click', () => {
+      try {
+        const parsedPatch = JSON.parse(graphTextarea.value);
+        const res = applyCharacterSemanticPatch(docData, parsedPatch, { solverMode });
+        docData = res.document;
+        lastHallucinationGhosts = res.projection.hallucinationGhosts;
+        lastSolverBanner = res.rejected
+          ? `Rejected Graph Patch: ${res.projection.violations.length} violations`
+          : res.projection.verified
+            ? 'Verified Graph Grounding G_char → R³ (0 violations)'
+            : `Grounded & Projected G_char → R³ (${res.projection.violations.length} constraints repaired)`;
+        commitOps(
+          [
+            { set: ['ikChains'], value: docData.ikChains },
+            { set: ['lookAt'], value: docData.lookAt },
+            { set: ['activeOutfitId'], value: docData.activeOutfitId },
+          ],
+          'Apply Character Semantic Graph JSON',
+        );
+      } catch (err) {
+        lastSolverBanner = `Invalid JSON in Semantic Graph editor: ${err?.message ?? err}`;
+        solverStatus.textContent = lastSolverBanner;
+      }
+    });
+    triCard.appendChild(applyGraphBtn);
     centerCol.appendChild(triCard);
 
     const animCard = el('div', 'gb-char-card');
@@ -2255,6 +2536,92 @@ export function mountCharacterStudio(container, studioApi = {}) {
       trigStrip.appendChild(tBtn);
     }
     asmCard.appendChild(trigStrip);
+
+    // Live Condition Parameters for Circumstance ASM (`locomotionSpeed`, `interactionDistance`, `reachActive`, `circumstance`)
+    const asmParams = asmSnap.parameters ?? {};
+
+    const speedRow = el('div', 'gb-char-slider-row');
+    speedRow.appendChild(el('span', '', 'Locomotion Speed'));
+    const speedSlider = el('input');
+    speedSlider.type = 'range';
+    speedSlider.min = '0';
+    speedSlider.max = '4';
+    speedSlider.step = '0.05';
+    speedSlider.value = String(asmParams.locomotionSpeed ?? 0);
+    speedSlider.dataset.role = 'asm-param-locomotionSpeed';
+    const speedVal = el('span', 'gb-char-val', Number(asmParams.locomotionSpeed ?? 0).toFixed(2));
+    speedSlider.addEventListener('input', (ev) => {
+      const nextV = Number(ev.target.value);
+      speedVal.textContent = nextV.toFixed(2);
+      const nextSnap = asmController.setParameters({ locomotionSpeed: nextV });
+      docData.animStateMachine.parameters = nextSnap.parameters;
+      if (docData.clips.some((c) => c.id === nextSnap.clipId)) clipId = nextSnap.clipId;
+      pushPoseToEngine();
+      render();
+      repaintStage();
+    });
+    speedRow.appendChild(speedSlider);
+    speedRow.appendChild(speedVal);
+    asmCard.appendChild(speedRow);
+
+    const distRow = el('div', 'gb-char-slider-row');
+    distRow.appendChild(el('span', '', 'Interact Dist (m)'));
+    const distSlider = el('input');
+    distSlider.type = 'range';
+    distSlider.min = '0.1';
+    distSlider.max = '2.5';
+    distSlider.step = '0.05';
+    distSlider.value = String(asmParams.interactionDistance ?? 1.8);
+    distSlider.dataset.role = 'asm-param-interactionDistance';
+    const distVal = el('span', 'gb-char-val', Number(asmParams.interactionDistance ?? 1.8).toFixed(2));
+    distSlider.addEventListener('input', (ev) => {
+      const nextV = Number(ev.target.value);
+      distVal.textContent = nextV.toFixed(2);
+      const nextSnap = asmController.setParameters({ interactionDistance: nextV });
+      docData.animStateMachine.parameters = nextSnap.parameters;
+      if (docData.clips.some((c) => c.id === nextSnap.clipId)) clipId = nextSnap.clipId;
+      pushPoseToEngine();
+      render();
+      repaintStage();
+    });
+    distRow.appendChild(distSlider);
+    distRow.appendChild(distVal);
+    asmCard.appendChild(distRow);
+
+    const reachToggleBtn = el(
+      'button',
+      `gb-char-btn${asmParams.reachActive ? ' is-active' : ''}`,
+      `reachActive: ${asmParams.reachActive ? 'true' : 'false'}`,
+    );
+    reachToggleBtn.dataset.role = 'asm-param-reachActive';
+    reachToggleBtn.addEventListener('click', () => {
+      const nextReach = !asmParams.reachActive;
+      const nextSnap = asmController.setParameters({ reachActive: nextReach });
+      docData.animStateMachine.parameters = nextSnap.parameters;
+      if (docData.clips.some((c) => c.id === nextSnap.clipId)) clipId = nextSnap.clipId;
+      pushPoseToEngine();
+      render();
+      repaintStage();
+    });
+    asmCard.appendChild(reachToggleBtn);
+
+    const circSelect = el('select', 'gb-char-select');
+    circSelect.dataset.role = 'asm-param-circumstance';
+    for (const cOpt of ['calm', 'focused', 'celebratory', 'alert']) {
+      const opt = el('option', '', `Circumstance: ${cOpt}`);
+      opt.value = cOpt;
+      if (cOpt === (asmParams.circumstance ?? 'calm')) opt.selected = true;
+      circSelect.appendChild(opt);
+    }
+    circSelect.addEventListener('change', (ev) => {
+      const nextSnap = asmController.setParameters({ circumstance: ev.target.value });
+      docData.animStateMachine.parameters = nextSnap.parameters;
+      if (docData.clips.some((c) => c.id === nextSnap.clipId)) clipId = nextSnap.clipId;
+      pushPoseToEngine();
+      render();
+      repaintStage();
+    });
+    asmCard.appendChild(circSelect);
     rightCol.appendChild(asmCard);
 
     const presetCard = el('div', 'gb-char-card');

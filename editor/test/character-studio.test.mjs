@@ -11,6 +11,7 @@ import {
   sampleBlendSpace2D,
 } from '../../web/character-customization.mjs';
 import {
+  CHARACTER_ACADEMIC_SCENARIOS,
   CHARACTER_SCHEMA,
   CHARACTER_SEMANTIC_GRAPH_SCHEMA,
   applyCharacterSemanticPatch,
@@ -230,7 +231,27 @@ test('Tri-Modal Articulated Semantic Graph: constraint projection (x_hat -> x*),
   assert.ok(conflictResolved.hallucinationGhosts.length >= 1);
   assert.equal(conflictResolved.subgraph.verification.verified, true);
 
-  // 5. Token-compact AI summary (`<120 tokens`)
+  // 5. Forward Symbolic Edge Grounding (`G_char -> R^3 -> x*`)
+  const edgeGrounded = applyCharacterSemanticPatch(doc, {
+    edges: [
+      { from: 'effector:scholar_actor:hand_r', rel: 'reaches_for', to: 'anchor:left_workspace' },
+      { from: 'char:scholar_actor:head', rel: 'looks_at', to: 'anchor:work_surface_below' },
+      { from: 'wardrobe:scholar_coat', rel: 'occludes_body_mask', to: 'char:scholar_actor' },
+    ],
+  });
+  assert.equal(edgeGrounded.rejected, false);
+  assert.equal(edgeGrounded.document.ikChains[0].enabled, true);
+  assert.ok(edgeGrounded.document.ikChains[0].target[0] < 0, 'left_workspace edge should ground to negative X');
+  assert.ok(edgeGrounded.document.lookAt.target[1] < 1.35, 'work_surface_below edge should ground to lower Y');
+  assert.equal(edgeGrounded.document.activeOutfitId, 'scholar_coat');
+
+  // 6. Academic Scenarios catalog
+  assert.ok(CHARACTER_ACADEMIC_SCENARIOS.embodied_scholar_reach);
+  assert.ok(CHARACTER_ACADEMIC_SCENARIOS.unreachable_ik_projection);
+  assert.ok(CHARACTER_ACADEMIC_SCENARIOS.two_agent_posture_conflict);
+  assert.ok(CHARACTER_ACADEMIC_SCENARIOS.wardrobe_layer_occlusion);
+
+  // 7. Token-compact AI summary (`<120 tokens`)
   const digest = summarizeCharacterForAi(conflictResolved.resolvedDocument);
   assert.ok(digest.includes('CHAR[scholar_actor'));
   assert.ok(digest.includes('DNA['));
@@ -295,6 +316,26 @@ test('mountCharacterStudio renders rig hierarchy, emits studioApi.edit ops, and 
   assert.ok(conflictBtn, 'expected 2-Agent Conflict button in Character Studio');
   conflictBtn.dispatch('click');
   assert.equal(edits.length, 3);
+
+  const runScenarioBtn = container.find((el) => el.dataset?.role === 'char-run-scenario');
+  assert.ok(runScenarioBtn, 'expected Run Academic Preset button');
+  runScenarioBtn.dispatch('click');
+  assert.equal(edits.length, 4);
+
+  const applyGraphBtn = container.find((el) => el.dataset?.role === 'char-apply-graph-json');
+  assert.ok(applyGraphBtn, 'expected Apply Graph JSON button');
+  applyGraphBtn.dispatch('click');
+  assert.equal(edits.length, 5);
+
+  const outerWardrobeSelect = container.find((el) => el.dataset?.role === 'dna-wardrobe-outer');
+  assert.ok(outerWardrobeSelect, 'expected Layer 4 outer wardrobe slot selector');
+  outerWardrobeSelect.value = 'outer_pavilion_coat';
+  outerWardrobeSelect.dispatch('change');
+  assert.equal(edits.length, 6);
+
+  const asmReachToggle = container.find((el) => el.dataset?.role === 'asm-param-reachActive');
+  assert.ok(asmReachToggle, 'expected live ASM reachActive parameter toggle');
+  asmReachToggle.dispatch('click');
 
   handle.onDeactivate();
   handle.onActivate();
