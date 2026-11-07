@@ -25,20 +25,20 @@ The core workspace uses **zero third-party Cargo crates**, calling OS/GPU ABIs d
 | `crates/ganbate-pipeline` | lib | `ganbate.project.json` discovery, `.meta.json` permanent ID sidecars, object-preserving GLB import, GBEW v4 cooking |
 | `crates/ganbate-physics` | lib | Deterministic 60 Hz rigid-body solver (`+`, `-`, `*`, `/`, `sqrt` only), 5 joints, CCD, spatial queries, character controller |
 | `crates/ganbate-web` + `web/` | `ganbate_web.wasm`, `ganbate.js`, `ganbate.d.ts` | Browser WASM runtime linking both WebGPU and WebGL 2; supports standalone viewer and `createEngine()` library mode |
-| `crates/ganbate-studio` + `editor/` | `ganbate-studio` | Local HTTP/WebSocket editor host (`localhost:7480`) + browser UI (Asset Library, Outliner, Inspector, `ganbate-web` viewport) |
-| `crates/ganbate-agent` | `ganbate` | Single-line JSON CLI for AI agents & scripts (`scene inspect`, `validate`, `apply`, `undo`, `diff`, `render`) |
+| `../ganbate-editor/crates/ganbate-studio` + `../ganbate-editor/editor/` | `ganbate-studio` | Local HTTP/WebSocket editor host (`localhost:7480`) + browser UI (Asset Library, Outliner, Inspector, `ganbate-web` viewport) |
+| `../ganbate-editor/crates/ganbate-agent` | `ganbate` | Single-line JSON CLI for AI agents & scripts (`scene inspect`, `validate`, `apply`, `undo`, `diff`, `render`) |
 | `src/bin/ganbate-*` | `ganbate-player`, `ganbate-render`, `ganbate-build`, `ganbate-bench`, `ganbate-framecheck`, `ganbate-ios` | Native desktop player, headless renderer, asset importer/cooker, throughput benchmark, and 120/240 Hz display-pacing verifier |
 
 ---
 
-## 1. Edit a Scene in Ganbate Studio (Visual Editor)
+## 1. Edit a Scene in Ganbate Studio (Visual Editor — `../ganbate-editor`)
 
-Ganbate Studio pairs a local Rust host (`ganbate-studio`) that owns a project folder (`ganbate.project.json`) and undo history with a browser UI (`editor/`) whose 3D viewport runs the live `ganbate-web` runtime ([data design](docs/design/04-data.md)).
+Ganbate Studio (`../ganbate-editor`) pairs a local Rust host (`ganbate-studio`) that owns a project folder (`ganbate.project.json`) and undo history with a browser UI (`editor/`) whose 3D viewport runs the live `ganbate-web` runtime ([data design](docs/design/04-data.md)).
 
 ```sh
-scripts/build-web.sh web/dist                                        # 1. Build the browser viewport runtime
-cargo run --release --example studio_sample -- ~/ganbate-sample      # 2. Generate a synthetic sample project
-cargo run --release -p ganbate-studio -- ~/ganbate-sample            # 3. Start host, then open http://localhost:7480/
+scripts/build-web.sh web/dist                                                         # 1. Build the browser viewport runtime
+cargo run --release --example studio_sample -- ~/ganbate-sample                       # 2. Generate a synthetic sample project
+cargo run --release --manifest-path ../ganbate-editor/Cargo.toml -p ganbate-studio -- ~/ganbate-sample  # 3. Start host, then open http://localhost:7480/
 ```
 
 ### Studio Controls & Workflows

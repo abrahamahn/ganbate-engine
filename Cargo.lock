@@ -3,18 +3,6 @@
 version = 4
 
 [[package]]
-name = "ganbate-agent"
-version = "0.2.0"
-dependencies = [
- "ganbate-assets",
- "ganbate-core",
- "ganbate-engine",
- "ganbate-pipeline",
- "ganbate-scene",
- "ganbate-studio",
-]
-
-[[package]]
 name = "ganbate-assets"
 version = "0.2.0"
 dependencies = [
@@ -82,19 +70,6 @@ dependencies = [
 [[package]]
 name = "ganbate-shader"
 version = "0.2.0"
-
-[[package]]
-name = "ganbate-studio"
-version = "0.2.0"
-dependencies = [
- "ganbate-assets",
- "ganbate-core",
- "ganbate-engine",
- "ganbate-physics",
- "ganbate-pipeline",
- "ganbate-scene",
- "ganbate-shader",
-]
 
 [[package]]
 name = "ganbate-vfx"
