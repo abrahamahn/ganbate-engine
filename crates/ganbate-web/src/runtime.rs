@@ -515,6 +515,17 @@ pub extern "C" fn ganbate_rt_frames() -> u32 {
     RT.with(|cell| cell.borrow().as_ref().map_or(0, |rt| rt.frames))
 }
 
+/// Completes the world's baked vertex ambient occlusion now, rewriting the vertices it changes,
+/// for a capture that must not depend on how many frames ran before it. Returns 1, or 0 after
+/// logging why not.
+#[unsafe(no_mangle)]
+pub extern "C" fn ganbate_rt_finish_ao() -> u32 {
+    with(0, |rt| {
+        rt.renderer.finish_ao(&mut rt.device)?;
+        Ok(1)
+    })
+}
+
 /// How far the world's baked vertex ambient occlusion has converged, in thousandths (`1000`
 /// when complete or without a running engine). It refines a slice per frame after start and
 /// after world edits, nearest the camera first.

@@ -2216,6 +2216,10 @@ export async function createEngine(options) {
       return true;
     },
     frames: () => x.ganbate_rt_frames(),
+    /** Completes the baked ambient occlusion now, for captures that must not depend on frame count. */
+    finishAo: () => {
+      if (typeof x.ganbate_rt_finish_ao === 'function') ok('finishAo', x.ganbate_rt_finish_ao());
+    },
     /** Baked ambient-occlusion convergence in [0, 1]; it refines over frames after start and edits. */
     aoProgress: () => (typeof x.ganbate_rt_ao_progress === 'function' ? x.ganbate_rt_ao_progress() / 1000 : 1),
     bundleStats: () => (host.bundleStats ? host.bundleStats() : { cached: 0, candidates: 0, replays: 0 }),

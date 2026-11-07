@@ -1176,6 +1176,10 @@ impl Renderer {
     pub fn last_frame_stats(&self) -> FrameStats {
         self.stats
     }
+    /// Completes the baked vertex AO now (a capture that must not depend on frame count).
+    pub fn finish_ao(&mut self, device: &mut Device<'_>) -> Result<()> {
+        self.scene.finish_ao(device).map(|_| ())
+    }
     /// Converged fraction of the baked vertex AO in `[0, 1]` (it refines a slice per live
     /// frame after start and after world edits).
     pub fn ao_progress(&self) -> f32 {

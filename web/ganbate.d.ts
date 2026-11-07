@@ -277,6 +277,8 @@ export interface GanbateEngine {
    * refines over the following frames (nearest the camera first), and again after world edits.
    */
   aoProgress(): number;
+  /** Completes the baked ambient occlusion now (a capture that must not depend on frame count). */
+  finishAo(): void;
   /** Static WebGPU render-bundle cache telemetry (`{ cached, candidates, replays }`). */
   bundleStats(): { cached: number; candidates: number; replays: number };
   /** The last frame's pixels (RGBA rows, top first). */
