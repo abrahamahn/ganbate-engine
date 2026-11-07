@@ -31,9 +31,9 @@ const PROP_SHADER: &str = include_str!("shaders/prop_shader.wgsl");
 const HDR: Format = Format::Rgba16Float;
 const LUT_SIZE: u32 = 16;
 const MAX_LIGHTS_PER_TILE: usize = 96;
-/// Vertex AO samples a live frame may bake (each casts `AoConfig::rays` rays): a few
-/// milliseconds in wasm, so a million-vertex world converges in seconds without a stall.
-const AO_FRAME_SAMPLES: usize = 1500;
+/// Vertex AO samples a live frame may bake (each casts `AoConfig::rays` rays): about 3 ms in
+/// wasm, inside a 120 Hz frame. Nearest the camera first, so what is in view settles first.
+const AO_FRAME_SAMPLES: usize = 400;
 /// Frames a world must stay unmoved before its AO is re-baked, so a drag is not slowed by it.
 const AO_SETTLE_FRAMES: u32 = 12;
 /// The near clip distance of `view`, kept positive.

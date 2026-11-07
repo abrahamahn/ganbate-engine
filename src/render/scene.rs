@@ -141,14 +141,22 @@ fn union_bounds(a: (V3, V3), b: (V3, V3)) -> (V3, V3) {
 
 /// Appends `mesh`'s vertices placed by `m` (position, normal, uv, ao), or all at one point when
 /// hidden, which draws nothing.
+/// Appends the world-space vertices `range` of `mesh` placed by `m` (all of them: `0..len`).
 fn write_vertices(
     mesh: &EditMesh,
     m: &[f32; 16],
     visible: bool,
     ao: Option<&[f32]>,
+    range: std::ops::Range<usize>,
     out: &mut Vec<f32>,
 ) {
-    for (i, p) in mesh.positions.iter().enumerate() {
+    for (i, p) in mesh
+        .positions
+        .iter()
+        .enumerate()
+        .take(range.end)
+        .skip(range.start)
+    {
         let w = if visible {
             transform_point(m, *p)
         } else {
@@ -352,13 +360,9 @@ impl GpuScene {
             let water = mat_ref.is_some_and(|m| m.shading == Shading::Water);
             let blend = mat_ref.is_some_and(|m| m.alpha == AlphaMode::Blend);
             // Unoccluded until the AO bake reaches this instance (`step_ao`).
-            write_vertices(
-                &edit.meshes[inst.mesh as usize],
-                &m,
-                true,
-                None,
-                &mut vertices,
-            );
+            let edit_mesh = &edit.meshes[inst.mesh as usize];
+            let all = 0..edit_mesh.positions.len();
+            write_vertices(edit_mesh, &m, true, None, all, &mut vertices);
             for p in &mesh.positions {
                 let w = transform_point(&m, [p.0, p.1, p.2]);
                 for k in 0..3 {
@@ -651,22 +655,34 @@ impl GpuScene {
 
     /// Rewrites instance `index`'s vertices as it is placed now, with the AO baked for it.
     fn write_instance(&self, device: &mut Device<'_>, index: usize) -> Result<()> {
+        let mesh = self.edit.instances[index].mesh as usize;
+        let len = self.edit.meshes[mesh].positions.len();
+        self.write_instance_range(device, index, 0..len)
+    }
+
+    /// Rewrites vertices `range` of instance `index` (placement and baked AO).
+    fn write_instance_range(
+        &self,
+        device: &mut Device<'_>,
+        index: usize,
+        range: std::ops::Range<usize>,
+    ) -> Result<()> {
         let inst = &self.edit.instances[index];
         let Some(first) = inst.first_vertex else {
             return Ok(());
         };
+        if range.is_empty() {
+            return Ok(());
+        }
         let mesh = &self.edit.meshes[inst.mesh as usize];
-        let mut data = Vec::with_capacity(mesh.positions.len() * FLOATS_PER_VERTEX);
-        write_vertices(
-            mesh,
-            &inst.transform,
-            inst.visible,
-            self.ao.values(index),
-            &mut data,
-        );
+        let start = range.start as u64;
+        let mut data = Vec::with_capacity(range.len() * FLOATS_PER_VERTEX);
+        let ao = self.ao.values(index);
+        write_vertices(mesh, &inst.transform, inst.visible, ao, range, &mut data);
+        let stride = FLOATS_PER_VERTEX as u64 * 4;
         device.write_buffer(
             self.vertices,
-            u64::from(first) * (FLOATS_PER_VERTEX as u64 * 4),
+            (u64::from(first) + start) * stride,
             &f32_bytes(&data),
         )
     }
@@ -682,11 +698,11 @@ impl GpuScene {
         if self.ao.is_idle() {
             return Ok(false);
         }
-        let finished = self.ao.step(&self.edit, budget, eye);
-        for &index in &finished {
-            self.write_instance(device, index)?;
+        let updated = self.ao.step(&self.edit, budget, eye);
+        for (index, range) in &updated {
+            self.write_instance_range(device, *index, range.clone())?;
         }
-        Ok(!finished.is_empty())
+        Ok(!updated.is_empty())
     }
 
     /// Completes the AO bake now (stills, which must not depend on how many frames ran).

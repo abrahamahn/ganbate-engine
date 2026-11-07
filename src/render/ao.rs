@@ -917,12 +917,17 @@ impl AoBake {
     }
 
     /// Samples up to `budget` vertices (scanning past unchanged ones costs nothing against it),
-    /// nearest `eye` first when given. Returns the instances whose AO is now complete; their
-    /// vertices need rewriting with [`AoBake::values`].
-    pub fn step(&mut self, edit: &WorldEdit, budget: usize, eye: Option<V3>) -> Vec<usize> {
-        let mut finished = Vec::new();
+    /// nearest `eye` first when given. Returns the vertex ranges whose AO changed, per instance,
+    /// so they can be rewritten at once rather than when a large instance finishes.
+    pub fn step(
+        &mut self,
+        edit: &WorldEdit,
+        budget: usize,
+        eye: Option<V3>,
+    ) -> Vec<(usize, std::ops::Range<usize>)> {
+        let mut updated = Vec::new();
         if self.queue.is_empty() {
-            return finished;
+            return updated;
         }
         if let Some(eye) = eye
             && std::mem::take(&mut self.unordered)
@@ -958,8 +963,11 @@ impl AoBake {
             if values.len() != n {
                 *values = vec![1.0; n];
             }
+            // The span of vertices this pass gave new values.
+            let mut changed: Option<(usize, usize)> = None;
             if bvh.is_empty() {
                 values.fill(1.0);
+                changed = Some((0, n));
                 self.cursor = n;
             } else if !inst.visible {
                 // Hidden: its vertices are collapsed; it is re-queued when shown.
@@ -974,6 +982,8 @@ impl AoBake {
                 if front.region.is_some_and(|r| !contains(r, wp)) {
                     continue;
                 }
+                changed =
+                    Some(changed.map_or((vi, vi + 1), |(lo, hi)| (lo.min(vi), hi.max(vi + 1))));
                 let wn = mesh
                     .normals
                     .get(vi)
@@ -989,11 +999,13 @@ impl AoBake {
                     }
                 };
             }
+            if let Some((lo, hi)) = changed {
+                updated.push((index, lo..hi));
+            }
             if self.cursor >= n {
                 self.queue.pop_front();
                 self.queued_vertices = self.queued_vertices.saturating_sub(n);
                 self.cursor = 0;
-                finished.push(index);
             }
         }
         if self.queue.is_empty() {
@@ -1002,7 +1014,7 @@ impl AoBake {
             self.cache = HashMap::new();
             self.scope = None;
         }
-        finished
+        updated
     }
 }
 
