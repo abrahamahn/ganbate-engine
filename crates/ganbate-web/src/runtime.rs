@@ -515,6 +515,18 @@ pub extern "C" fn ganbate_rt_frames() -> u32 {
     RT.with(|cell| cell.borrow().as_ref().map_or(0, |rt| rt.frames))
 }
 
+/// How far the world's baked vertex ambient occlusion has converged, in thousandths (`1000`
+/// when complete or without a running engine). It refines a slice per frame after start and
+/// after world edits, nearest the camera first.
+#[unsafe(no_mangle)]
+pub extern "C" fn ganbate_rt_ao_progress() -> u32 {
+    RT.with(|cell| {
+        cell.borrow().as_ref().map_or(1000, |rt| {
+            (rt.renderer.ao_progress() * 1000.0).round() as u32
+        })
+    })
+}
+
 /// Switches the renderer's quality preset at runtime (`0` = realtime, `1` = still,
 /// `2` = hybrid stage, `3` = low-cost fast-path; unknown codes fall back to realtime).
 /// Returns `1` on success, `0` on error.

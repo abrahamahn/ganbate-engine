@@ -10,7 +10,7 @@ use crate::gpu::{
 };
 use crate::world::{AlphaMode, Emission, Shading, World};
 
-use super::ao::{AoConfig, bake_edit_ao};
+use super::ao::{AoBake, AoConfig, transformed_bounds};
 use super::math::{V3, aabb_extent, normalize, transform_point};
 
 /// Coarse 3D spatial cell size (metres) used to partition static world geometry per material so
@@ -64,6 +64,8 @@ pub(super) struct GpuScene {
     pub triangles: usize,
     /// What the CPU keeps so objects of the world can be moved and picked.
     pub edit: WorldEdit,
+    /// Baked vertex ambient occlusion, refined a slice at a time (`step_ao`).
+    pub ao: AoBake,
 }
 
 /// A world mesh as uploaded, kept for rewriting its instances' vertices and for picking.
@@ -334,7 +336,6 @@ impl GpuScene {
             total_verts += mesh.positions.len();
         }
         edit.vertex_count = total_verts;
-        let baked_ao = bake_edit_ao(&edit, &AoConfig::default());
 
         vertices.reserve(total_verts * FLOATS_PER_VERTEX);
         let mut active_chunk_key: Option<(usize, bool, [i32; 3])> = None;
@@ -350,11 +351,12 @@ impl GpuScene {
             let mat_ref = mesh.material.map(|m| &world.materials[m as usize]);
             let water = mat_ref.is_some_and(|m| m.shading == Shading::Water);
             let blend = mat_ref.is_some_and(|m| m.alpha == AlphaMode::Blend);
+            // Unoccluded until the AO bake reaches this instance (`step_ao`).
             write_vertices(
                 &edit.meshes[inst.mesh as usize],
                 &m,
                 true,
-                baked_ao.get(index).map(Vec::as_slice),
+                None,
                 &mut vertices,
             );
             for p in &mesh.positions {
@@ -603,12 +605,14 @@ impl GpuScene {
             land_max,
             land_centre,
             triangles,
+            ao: AoBake::new(&edit, AoConfig::default()),
             edit,
         })
     }
 
     /// Moves world instance `index` to `transform` (column-major), or hides or shows it,
-    /// rewriting its vertices. World bounds, chunk bounds, and baked AO follow on `refresh_world`.
+    /// rewriting its vertices and re-queuing the baked AO within reach of where it was and is.
+    /// World and chunk bounds follow on `refresh_world`.
     pub fn set_instance(
         &mut self,
         device: &mut Device<'_>,
@@ -626,19 +630,72 @@ impl GpuScene {
             .instances
             .get_mut(index)
             .ok_or_else(|| format!("set_world_instance: no world instance {index}"))?;
+        if inst.transform == transform && inst.visible == visible {
+            return Ok(());
+        }
+        let mesh_bounds = self.edit.meshes[inst.mesh as usize].bounds;
+        let before = transformed_bounds(mesh_bounds, &inst.transform);
+        let after = transformed_bounds(mesh_bounds, &transform);
         inst.transform = transform;
         inst.visible = visible;
+        if inst.first_vertex.is_none() {
+            return Ok(());
+        }
+        let changed = (
+            [0, 1, 2].map(|k| before.0[k].min(after.0[k])),
+            [0, 1, 2].map(|k| before.1[k].max(after.1[k])),
+        );
+        self.ao.invalidate_region(&self.edit, changed);
+        self.write_instance(device, index)
+    }
+
+    /// Rewrites instance `index`'s vertices as it is placed now, with the AO baked for it.
+    fn write_instance(&self, device: &mut Device<'_>, index: usize) -> Result<()> {
+        let inst = &self.edit.instances[index];
         let Some(first) = inst.first_vertex else {
             return Ok(());
         };
         let mesh = &self.edit.meshes[inst.mesh as usize];
         let mut data = Vec::with_capacity(mesh.positions.len() * FLOATS_PER_VERTEX);
-        write_vertices(mesh, &transform, visible, None, &mut data);
+        write_vertices(
+            mesh,
+            &inst.transform,
+            inst.visible,
+            self.ao.values(index),
+            &mut data,
+        );
         device.write_buffer(
             self.vertices,
             u64::from(first) * (FLOATS_PER_VERTEX as u64 * 4),
             &f32_bytes(&data),
         )
+    }
+
+    /// Advances the AO bake by up to `budget` vertex samples, nearest `eye` first, and rewrites
+    /// the instances it completed. Returns whether any vertices changed.
+    pub fn step_ao(
+        &mut self,
+        device: &mut Device<'_>,
+        budget: usize,
+        eye: Option<V3>,
+    ) -> Result<bool> {
+        if self.ao.is_idle() {
+            return Ok(false);
+        }
+        let finished = self.ao.step(&self.edit, budget, eye);
+        for &index in &finished {
+            self.write_instance(device, index)?;
+        }
+        Ok(!finished.is_empty())
+    }
+
+    /// Completes the AO bake now (stills, which must not depend on how many frames ran).
+    pub fn finish_ao(&mut self, device: &mut Device<'_>) -> Result<bool> {
+        let mut changed = false;
+        while !self.ao.is_idle() {
+            changed |= self.step_ao(device, usize::MAX / 128, None)?;
+        }
+        Ok(changed)
     }
 
     /// Moves world lamp `index` to `position`.
@@ -658,9 +715,9 @@ impl GpuScene {
         device.write_buffer(self.light_buffer, index as u64 * 64, &f32_bytes(&record))
     }
 
-    /// Recomputes world bounds, per-chunk bounds, water level, and baked vertex AO after one or
-    /// more world instances moved or changed visibility.
-    pub fn refresh_world(&mut self, device: &mut Device<'_>) -> Result<()> {
+    /// Recomputes world bounds, per-chunk bounds and water level after one or more world
+    /// instances moved or changed visibility (their AO follows through `step_ao`).
+    pub fn refresh_world(&mut self) {
         self.refresh_bounds();
         for (d, src) in self.draws.iter_mut().zip(&self.edit.draw_sources) {
             let mut lo = [f32::INFINITY; 3];
@@ -699,30 +756,6 @@ impl GpuScene {
             d.bounds = (lo, hi);
             d.max_extent = aabb_extent(lo, hi);
         }
-
-        if self.edit.vertex_count > 0 {
-            let baked_ao = bake_edit_ao(&self.edit, &AoConfig::default());
-            let mut vertices = vec![0.0f32; self.edit.vertex_count * FLOATS_PER_VERTEX];
-            let mut buf = Vec::new();
-            for (index, inst) in self.edit.instances.iter().enumerate() {
-                let Some(first) = inst.first_vertex else {
-                    continue;
-                };
-                let mesh = &self.edit.meshes[inst.mesh as usize];
-                buf.clear();
-                write_vertices(
-                    mesh,
-                    &inst.transform,
-                    inst.visible,
-                    baked_ao.get(index).map(Vec::as_slice),
-                    &mut buf,
-                );
-                let start = first as usize * FLOATS_PER_VERTEX;
-                vertices[start..start + buf.len()].copy_from_slice(&buf);
-            }
-            device.write_buffer(self.vertices, 0, &f32_bytes(&vertices))?;
-        }
-        Ok(())
     }
 
     /// Recomputes the bounds, the land's centre and the water level from the instances as

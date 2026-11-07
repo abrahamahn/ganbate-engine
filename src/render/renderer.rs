@@ -31,6 +31,11 @@ const PROP_SHADER: &str = include_str!("shaders/prop_shader.wgsl");
 const HDR: Format = Format::Rgba16Float;
 const LUT_SIZE: u32 = 16;
 const MAX_LIGHTS_PER_TILE: usize = 96;
+/// Vertex AO samples a live frame may bake (each casts `AoConfig::rays` rays): a few
+/// milliseconds in wasm, so a million-vertex world converges in seconds without a stall.
+const AO_FRAME_SAMPLES: usize = 1500;
+/// Frames a world must stay unmoved before its AO is re-baked, so a drag is not slowed by it.
+const AO_SETTLE_FRAMES: u32 = 12;
 /// The near clip distance of `view`, kept positive.
 fn near(view: &View) -> f32 {
     if view.near > 1e-4 { view.near } else { 1e-4 }
@@ -305,6 +310,8 @@ pub struct Renderer {
     pub(super) world_drawn: bool,
     /// A world instance moved since the last frame: bounds and the world map follow.
     pub(super) world_moved: bool,
+    /// Frames since a world instance last moved (the AO bake waits for edits to pause).
+    ao_quiet_frames: u32,
     /// Per material: the procedural detail block pushed with each draw (see `Draw` in
     /// scene.wgsl), from the Look's detail rules.
     pub(super) details: Vec<[f32; 16]>,
@@ -1123,6 +1130,7 @@ impl Renderer {
             world,
             world_drawn: false,
             world_moved: false,
+            ao_quiet_frames: AO_SETTLE_FRAMES,
             details,
             grassy,
             lut,
@@ -1167,6 +1175,11 @@ impl Renderer {
     /// Visibility, cache, and pass-skip telemetry recorded during the most recent [`Renderer::encode`].
     pub fn last_frame_stats(&self) -> FrameStats {
         self.stats
+    }
+    /// Converged fraction of the baked vertex AO in `[0, 1]` (it refines a slice per live
+    /// frame after start and after world edits).
+    pub fn ao_progress(&self) -> f32 {
+        self.scene.ao.progress()
     }
     pub fn size(&self) -> (u32, u32) {
         (self.targets.width, self.targets.height)
@@ -2146,11 +2159,26 @@ impl Renderer {
         // The world map is drawn in this frame's first passes, before anything reads it. After
         // a move it is drawn again, over the land's new bounds (as a cook of the moved world).
         if std::mem::take(&mut self.world_moved) {
-            self.scene.refresh_world(device)?;
+            self.scene.refresh_world();
             self.world = world_view(&self.scene, self.world.size);
             self.world_drawn = false;
             self.static_shadows_vp = None;
             self.ground_cached_vp = None;
+            self.ao_quiet_frames = 0;
+        } else {
+            self.ao_quiet_frames = self.ao_quiet_frames.saturating_add(1);
+        }
+        // Baked AO: a still completes it before drawing; a live view refines it a slice per
+        // frame, nearest the camera first, once edits have paused (a drag stays smooth).
+        match self.output {
+            Output::Still => {
+                self.scene.finish_ao(device)?;
+            }
+            Output::Surface(_) if self.ao_quiet_frames >= AO_SETTLE_FRAMES => {
+                self.scene
+                    .step_ao(device, AO_FRAME_SAMPLES, Some(view.eye))?;
+            }
+            Output::Surface(_) => {}
         }
         if std::mem::take(&mut self.lut_dirty) {
             device.write_texture(self.lut, 0, 0, &bake_lut(&self.look))?;

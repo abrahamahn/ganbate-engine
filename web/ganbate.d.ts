@@ -272,6 +272,11 @@ export interface GanbateEngine {
   /** Draws and presents a frame; false when it skipped (GPU busy). */
   render(): boolean;
   frames(): number;
+  /**
+   * Baked vertex ambient-occlusion convergence in [0, 1]. The world draws at once and its AO
+   * refines over the following frames (nearest the camera first), and again after world edits.
+   */
+  aoProgress(): number;
   /** Static WebGPU render-bundle cache telemetry (`{ cached, candidates, replays }`). */
   bundleStats(): { cached: number; candidates: number; replays: number };
   /** The last frame's pixels (RGBA rows, top first). */
