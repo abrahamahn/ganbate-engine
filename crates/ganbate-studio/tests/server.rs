@@ -950,10 +950,7 @@ fn xray_catalog_and_project_public_assets_are_served_inside_project_root() {
         (200, b"glTF-prop".to_vec())
     );
     assert_eq!(get(port, "/content/note.glb"), (200, b"glTF".to_vec()));
-    assert_eq!(
-        get(port, "/web/character-customization.mjs").0,
-        200
-    );
+    assert_eq!(get(port, "/web/character-customization.mjs").0, 200);
 
     // Path traversal and hidden files remain strictly refused.
     assert_eq!(get(port, "/games/../../etc/passwd").0, 403);

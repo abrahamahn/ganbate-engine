@@ -1208,7 +1208,7 @@ body:not(.workbench-active).pie-split-active #preview-frame > #pie-stage {
   font-size: 11.5px; color: #c7d1e3; line-height: 1.45;
 }
 
-@media (max-width: 960px) {
+@media (max-width: 60rem) {
   #assets-body.with-inspector { grid-template-columns: clamp(125px, 16vw, 170px) minmax(0, 1fr); }
   #assets-inspector { display: none; }
   .asset-scale-wrap { display: none; }
@@ -1306,7 +1306,7 @@ body:not(.workbench-active).pie-split-active #preview-frame > #pie-stage {
   font: 10.5px/1.35 var(--mono);
 }
 
-@media (max-width: 768px), (max-height: 520px) {
+@media (max-width: 48rem), (max-height: 32.5rem) {
   body { grid-template-rows: auto auto minmax(0, 1fr) 4px min(180px, 24vh); }
   body.workbench-active { grid-template-rows: auto minmax(0, 1fr); }
   body.workbench-active > #toolbar { display: none; }

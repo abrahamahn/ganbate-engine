@@ -325,7 +325,12 @@ impl Studio {
                 .or_else(|| file_name.strip_suffix(".character.json"))
                 .or_else(|| file_name.strip_suffix(".glb"))
                 .unwrap_or(file_name);
-            let hay = format!("{} {} {}", entry.path.to_lowercase(), stem.to_lowercase(), entry.kind.name());
+            let hay = format!(
+                "{} {} {}",
+                entry.path.to_lowercase(),
+                stem.to_lowercase(),
+                entry.kind.name()
+            );
 
             let role = if entry.kind.name() == "character"
                 || hay.contains("character")

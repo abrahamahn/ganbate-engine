@@ -58,7 +58,8 @@ fn try_open_browser(url: &str) {
     }
     let is_wsl = std::env::var_os("WSL_DISTRO_NAME").is_some()
         || Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists();
-    if is_wsl && (spawn_quiet("wslview", &[url]) || spawn_quiet("cmd.exe", &["/C", "start", "", url]))
+    if is_wsl
+        && (spawn_quiet("wslview", &[url]) || spawn_quiet("cmd.exe", &["/C", "start", "", url]))
     {
         return;
     }

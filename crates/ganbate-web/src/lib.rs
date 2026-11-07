@@ -221,7 +221,9 @@ pub(crate) fn entities_json(
                 .get(idx)
                 .copied()
                 .flatten()
-                .map_or(Value::Null, |(lo, hi)| Value::Array(vec![arr3(lo), arr3(hi)]));
+                .map_or(Value::Null, |(lo, hi)| {
+                    Value::Array(vec![arr3(lo), arr3(hi)])
+                });
             Value::Object(BTreeMap::from([
                 ("material".to_string(), Value::String(mat_name.to_string())),
                 ("bounds".into(), b),

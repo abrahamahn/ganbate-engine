@@ -14,9 +14,7 @@
       "blendMode": "additive",
       "maxParticles": 64,
       "spawnRate": 0.0,
-      "bursts": [
-        { "timeS": 0.0, "count": 48 }
-      ],
+      "bursts": [{ "timeS": 0.0, "count": 48 }],
       "lifetimeS": [0.35, 0.75],
       "shape": {
         "kind": "disc",
@@ -52,9 +50,7 @@
       "blendMode": "additive",
       "maxParticles": 46,
       "spawnRate": 0.0,
-      "bursts": [
-        { "timeS": 0.02, "count": 28 }
-      ],
+      "bursts": [{ "timeS": 0.02, "count": 28 }],
       "lifetimeS": [0.4, 0.85],
       "shape": {
         "kind": "cone",

@@ -611,7 +611,7 @@ impl Host {
 }
 
 /// Walks up at most 4 ancestor levels from `project_root` to find the enclosing git/monorepo root.
-fn find_workspace_repo_root(project_root: & std::path::Path) -> PathBuf {
+fn find_workspace_repo_root(project_root: &std::path::Path) -> PathBuf {
     let mut best = project_root.to_path_buf();
     let mut cur = project_root;
     for _ in 0..4 {

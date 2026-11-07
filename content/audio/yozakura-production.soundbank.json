@@ -535,10 +535,7 @@
       "takeCount": 2,
       "defaultDurationMs": 220,
       "transientOffsetMs": 18,
-      "tags": [
-        "foley",
-        "impact"
-      ]
+      "tags": ["foley", "impact"]
     },
     "foley_impact_02": {
       "order": 1,
@@ -550,10 +547,7 @@
       "takeCount": 2,
       "defaultDurationMs": 230,
       "transientOffsetMs": 16,
-      "tags": [
-        "foley",
-        "impact"
-      ]
+      "tags": ["foley", "impact"]
     },
     "whoosh_pre_01": {
       "order": 2,
@@ -565,10 +559,7 @@
       "takeCount": 1,
       "defaultDurationMs": 160,
       "transientOffsetMs": 60,
-      "tags": [
-        "motion",
-        "whoosh"
-      ]
+      "tags": ["motion", "whoosh"]
     },
     "riffle_shuffle_01": {
       "order": 3,
@@ -580,11 +571,7 @@
       "takeCount": 2,
       "defaultDurationMs": 420,
       "transientOffsetMs": 28,
-      "tags": [
-        "card",
-        "shuffle",
-        "foley"
-      ]
+      "tags": ["card", "shuffle", "foley"]
     },
     "card_deal_snap_01": {
       "order": 4,
@@ -596,11 +583,7 @@
       "takeCount": 2,
       "defaultDurationMs": 190,
       "transientOffsetMs": 14,
-      "tags": [
-        "card",
-        "deal",
-        "foley"
-      ]
+      "tags": ["card", "deal", "foley"]
     },
     "chip_ceramic_toss_01": {
       "order": 5,
@@ -612,11 +595,7 @@
       "takeCount": 2,
       "defaultDurationMs": 240,
       "transientOffsetMs": 18,
-      "tags": [
-        "chip",
-        "bet",
-        "foley"
-      ]
+      "tags": ["chip", "bet", "foley"]
     },
     "check_table_tap_01": {
       "order": 6,
@@ -628,11 +607,7 @@
       "takeCount": 1,
       "defaultDurationMs": 260,
       "transientOffsetMs": 16,
-      "tags": [
-        "check",
-        "tap",
-        "foley"
-      ]
+      "tags": ["check", "tap", "foley"]
     },
     "card_peel_squeeze_01": {
       "order": 7,
@@ -644,11 +619,7 @@
       "takeCount": 1,
       "defaultDurationMs": 340,
       "transientOffsetMs": 24,
-      "tags": [
-        "card",
-        "peel",
-        "foley"
-      ]
+      "tags": ["card", "peel", "foley"]
     },
     "all_in_stack_shove_01": {
       "order": 8,
@@ -660,11 +631,7 @@
       "takeCount": 2,
       "defaultDurationMs": 520,
       "transientOffsetMs": 32,
-      "tags": [
-        "chip",
-        "all-in",
-        "shove"
-      ]
+      "tags": ["chip", "all-in", "shove"]
     },
     "pot_sweep_cascade_01": {
       "order": 9,
@@ -676,11 +643,7 @@
       "takeCount": 1,
       "defaultDurationMs": 640,
       "transientOffsetMs": 22,
-      "tags": [
-        "pot",
-        "sweep",
-        "win"
-      ]
+      "tags": ["pot", "sweep", "win"]
     },
     "yozakura_room_tone_01": {
       "order": 10,
@@ -692,11 +655,7 @@
       "takeCount": 1,
       "defaultDurationMs": 1200,
       "transientOffsetMs": 10,
-      "tags": [
-        "ambience",
-        "yozakura",
-        "room"
-      ]
+      "tags": ["ambience", "yozakura", "room"]
     }
   },
   "containers": {
@@ -704,10 +663,7 @@
       "order": 0,
       "label": "Surface Impact Pool",
       "bus": "foley",
-      "assetIds": [
-        "foley_impact_01",
-        "foley_impact_02"
-      ],
+      "assetIds": ["foley_impact_01", "foley_impact_02"],
       "roundRobinMode": "shuffle-no-repeat",
       "pitchJitterCents": 35,
       "gainJitterDb": 0.8
@@ -716,9 +672,7 @@
       "order": 1,
       "label": "Motion Whoosh Pool",
       "bus": "sfx",
-      "assetIds": [
-        "whoosh_pre_01"
-      ],
+      "assetIds": ["whoosh_pre_01"],
       "roundRobinMode": "sequential",
       "pitchJitterCents": 20,
       "gainJitterDb": 0.5
@@ -727,11 +681,7 @@
       "order": 2,
       "label": "Card Handling Foley Pool",
       "bus": "foley",
-      "assetIds": [
-        "riffle_shuffle_01",
-        "card_deal_snap_01",
-        "card_peel_squeeze_01"
-      ],
+      "assetIds": ["riffle_shuffle_01", "card_deal_snap_01", "card_peel_squeeze_01"],
       "roundRobinMode": "shuffle-no-repeat",
       "pitchJitterCents": 25,
       "gainJitterDb": 0.6
@@ -740,11 +690,7 @@
       "order": 3,
       "label": "Ceramic Chip Foley Pool",
       "bus": "foley",
-      "assetIds": [
-        "chip_ceramic_toss_01",
-        "all_in_stack_shove_01",
-        "pot_sweep_cascade_01"
-      ],
+      "assetIds": ["chip_ceramic_toss_01", "all_in_stack_shove_01", "pot_sweep_cascade_01"],
       "roundRobinMode": "shuffle-no-repeat",
       "pitchJitterCents": 30,
       "gainJitterDb": 0.7
@@ -753,9 +699,7 @@
       "order": 4,
       "label": "Yozakura Spatial Ambience Pool",
       "bus": "ambience",
-      "assetIds": [
-        "yozakura_room_tone_01"
-      ],
+      "assetIds": ["yozakura_room_tone_01"],
       "roundRobinMode": "sequential",
       "pitchJitterCents": 5,
       "gainJitterDb": 0.2
@@ -2404,12 +2348,7 @@
     "ducking": {
       "dialogue_priority": {
         "sourceBus": "dialogue",
-        "targetBuses": [
-          "sfx",
-          "foley",
-          "music",
-          "ambience"
-        ],
+        "targetBuses": ["sfx", "foley", "music", "ambience"],
         "enabled": true,
         "amount": 0.35,
         "attackMs": 20,
