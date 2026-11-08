@@ -1176,6 +1176,16 @@ impl Renderer {
     pub fn last_frame_stats(&self) -> FrameStats {
         self.stats
     }
+    /// Advances the baked vertex AO by up to `samples` vertices outside a frame, nearest `eye`
+    /// first, so a host can bake in idle time with its own clock. Waits, like the per-frame step,
+    /// until world edits have paused. Returns whether any vertices changed (worth a redraw).
+    pub fn step_ao(&mut self, device: &mut Device<'_>, samples: usize, eye: V3) -> Result<bool> {
+        if self.ao_quiet_frames < AO_SETTLE_FRAMES {
+            return Ok(false);
+        }
+        self.scene.step_ao(device, samples, Some(eye))
+    }
+
     /// Completes the baked vertex AO now (a capture that must not depend on frame count).
     pub fn finish_ao(&mut self, device: &mut Device<'_>) -> Result<()> {
         self.scene.finish_ao(device).map(|_| ())

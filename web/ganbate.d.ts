@@ -277,6 +277,12 @@ export interface GanbateEngine {
    * refines over the following frames (nearest the camera first), and again after world edits.
    */
   aoProgress(): number;
+  /**
+   * Bakes up to `samples` more ambient-occlusion vertices between frames, nearest the camera
+   * first (about 7 µs each in wasm): spend idle time on it with your own clock. Returns true when
+   * a redraw would show a change.
+   */
+  stepAo(samples: number): boolean;
   /** Completes the baked ambient occlusion now (a capture that must not depend on frame count). */
   finishAo(): void;
   /** Static WebGPU render-bundle cache telemetry (`{ cached, candidates, replays }`). */

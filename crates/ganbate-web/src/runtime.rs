@@ -526,6 +526,21 @@ pub extern "C" fn ganbate_rt_finish_ao() -> u32 {
     })
 }
 
+/// Bakes up to `samples` more vertices of the world's AO between frames, nearest the camera
+/// first, so the page can spend its idle time (measured by its own clock) instead of waiting for
+/// frames. Returns 1 when vertices changed and a redraw would show them, else 0.
+#[unsafe(no_mangle)]
+pub extern "C" fn ganbate_rt_step_ao(samples: u32) -> u32 {
+    with(0, |rt| {
+        let eye = rt.view.eye;
+        Ok(u32::from(rt.renderer.step_ao(
+            &mut rt.device,
+            samples as usize,
+            eye,
+        )?))
+    })
+}
+
 /// How far the world's baked vertex ambient occlusion has converged, in thousandths (`1000`
 /// when complete or without a running engine). It refines a slice per frame after start and
 /// after world edits, nearest the camera first.
