@@ -68,7 +68,7 @@ struct Tri {
     centroid: [f32; 3],
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct Node {
     min: [f32; 3],
     max: [f32; 3],
@@ -148,68 +148,87 @@ fn spatial_spin(pos: [f32; 3], normal: [f32; 3]) -> f32 {
     (h >> 8) as f32 * (std::f32::consts::TAU / 16_777_216.0)
 }
 
-impl AoBvh {
-    /// Builds a BVH over world-space triangle vertex triples.
-    pub fn build(triangles: &[([f32; 3], [f32; 3], [f32; 3])]) -> Self {
-        let mut tris = Vec::with_capacity(triangles.len());
-        for &(a, b, c) in triangles {
-            let e1 = sub3(b, a);
-            let e2 = sub3(c, a);
-            let n = cross3(e1, e2);
-            if dot3(n, n) <= 1e-16 {
-                continue;
-            }
-            let min = [
-                a[0].min(b[0]).min(c[0]),
-                a[1].min(b[1]).min(c[1]),
-                a[2].min(b[2]).min(c[2]),
-            ];
-            let max = [
-                a[0].max(b[0]).max(c[0]),
-                a[1].max(b[1]).max(c[1]),
-                a[2].max(b[2]).max(c[2]),
-            ];
-            let centroid = [
-                (a[0] + b[0] + c[0]) * (1.0 / 3.0),
-                (a[1] + b[1] + c[1]) * (1.0 / 3.0),
-                (a[2] + b[2] + c[2]) * (1.0 / 3.0),
-            ];
-            tris.push(Tri {
-                p0: a,
-                e1,
-                e2,
-                min,
-                max,
-                centroid,
+/// A world-space triangle as the BVH stores it, or `None` for a degenerate one.
+fn make_tri(a: V3, b: V3, c: V3) -> Option<Tri> {
+    let e1 = sub3(b, a);
+    let e2 = sub3(c, a);
+    let n = cross3(e1, e2);
+    if dot3(n, n) <= 1e-16 {
+        return None;
+    }
+    Some(Tri {
+        p0: a,
+        e1,
+        e2,
+        min: [0, 1, 2].map(|k| fmin(fmin(a[k], b[k]), c[k])),
+        max: [0, 1, 2].map(|k| fmax(fmax(a[k], b[k]), c[k])),
+        centroid: [0, 1, 2].map(|k| (a[k] + b[k] + c[k]) * (1.0 / 3.0)),
+    })
+}
+
+/// A node still to split: triangles `start..end` of the builder's array, written to `node`.
+struct BuildTask {
+    node: u32,
+    start: usize,
+    end: usize,
+    depth: u32,
+}
+
+/// A BVH under construction that splits a bounded number of triangles per [`BvhBuilder::step`],
+/// so a million-triangle world never blocks a frame (or a page's input) while it is built.
+pub(super) struct BvhBuilder {
+    tris: Vec<Tri>,
+    nodes: Vec<Node>,
+    tasks: Vec<BuildTask>,
+}
+
+impl BvhBuilder {
+    fn new(tris: Vec<Tri>) -> Self {
+        let mut nodes = Vec::with_capacity(tris.len().saturating_mul(2).max(1));
+        let mut tasks = Vec::new();
+        if !tris.is_empty() {
+            nodes.push(Node::default());
+            tasks.push(BuildTask {
+                node: 0,
+                start: 0,
+                end: tris.len(),
+                depth: 0,
             });
         }
-        let mut nodes = Vec::with_capacity(tris.len().saturating_mul(2).max(1));
-        if !tris.is_empty() {
-            let len = tris.len();
-            Self::build_node(&mut tris, 0, len, 0, &mut nodes);
+        Self { tris, nodes, tasks }
+    }
+
+    /// Splits nodes until about `budget` triangles have been binned; true once the tree is
+    /// complete. Each node costs its triangle count, so the whole build costs ~n log n.
+    fn step(&mut self, budget: usize) -> bool {
+        let mut spent = 0usize;
+        while spent < budget {
+            let Some(task) = self.tasks.pop() else {
+                return true;
+            };
+            spent += (task.end - task.start).max(1);
+            self.split(task);
         }
-        Self { tris, nodes }
+        self.tasks.is_empty()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
+    fn finish(self) -> AoBvh {
+        AoBvh {
+            tris: self.tris,
+            nodes: self.nodes,
+        }
     }
 
-    fn build_node(
-        tris: &mut [Tri],
-        start: usize,
-        end: usize,
-        depth: u32,
-        nodes: &mut Vec<Node>,
-    ) -> u32 {
-        let idx = nodes.len() as u32;
-        nodes.push(Node {
-            min: [0.0; 3],
-            max: [0.0; 3],
-            left: 0,
-            right_or_first: start as u32,
-            count: 0,
-        });
+    fn split(
+        &mut self,
+        BuildTask {
+            node,
+            start,
+            end,
+            depth,
+        }: BuildTask,
+    ) {
+        let tris = &mut self.tris;
         let mut min = [f32::INFINITY; 3];
         let mut max = [f32::NEG_INFINITY; 3];
         let mut cmin = [f32::INFINITY; 3];
@@ -223,15 +242,12 @@ impl AoBvh {
             }
         }
         let count = end - start;
-        let leaf = |nodes: &mut Vec<Node>| {
-            nodes[idx as usize] = Node {
-                min,
-                max,
-                left: 0,
-                right_or_first: start as u32,
-                count: count as u32,
-            };
-            idx
+        let leaf = Node {
+            min,
+            max,
+            left: 0,
+            right_or_first: start as u32,
+            count: count as u32,
         };
         let extent = [cmax[0] - cmin[0], cmax[1] - cmin[1], cmax[2] - cmin[2]];
         let widest = if extent[0] >= extent[1] && extent[0] >= extent[2] {
@@ -242,7 +258,8 @@ impl AoBvh {
             2
         };
         if count <= LEAF_TRIS || extent[widest] <= 1e-5 {
-            return leaf(nodes);
+            self.nodes[node as usize] = leaf;
+            return;
         }
 
         let split = if depth < SAH_MAX_DEPTH {
@@ -251,7 +268,10 @@ impl AoBvh {
             None
         };
         let mid = match split {
-            Some(SahSplit::Leaf) if count <= MAX_LEAF_TRIS => return leaf(nodes),
+            Some(SahSplit::Leaf) if count <= MAX_LEAF_TRIS => {
+                self.nodes[node as usize] = leaf;
+                return;
+            }
             Some(SahSplit::At { axis, bin }) => {
                 let scale = SAH_BINS as f32 / extent[axis];
                 let lo = cmin[axis];
@@ -283,16 +303,45 @@ impl AoBvh {
         } else {
             mid
         };
-        let left = Self::build_node(tris, start, mid, depth + 1, nodes);
-        let right = Self::build_node(tris, mid, end, depth + 1, nodes);
-        nodes[idx as usize] = Node {
+        let left = self.nodes.len() as u32;
+        self.nodes.push(Node::default());
+        self.nodes.push(Node::default());
+        self.nodes[node as usize] = Node {
             min,
             max,
             left,
-            right_or_first: right,
+            right_or_first: left + 1,
             count: 0,
         };
-        idx
+        self.tasks.push(BuildTask {
+            node: left + 1,
+            start: mid,
+            end,
+            depth: depth + 1,
+        });
+        self.tasks.push(BuildTask {
+            node: left,
+            start,
+            end: mid,
+            depth: depth + 1,
+        });
+    }
+}
+
+impl AoBvh {
+    /// Builds a BVH over world-space triangle vertex triples.
+    pub fn build(triangles: &[([f32; 3], [f32; 3], [f32; 3])]) -> Self {
+        let tris = triangles
+            .iter()
+            .filter_map(|&(a, b, c)| make_tri(a, b, c))
+            .collect();
+        let mut builder = BvhBuilder::new(tris);
+        while !builder.step(usize::MAX) {}
+        builder.finish()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.nodes.is_empty()
     }
 
     fn nearest_hit(&self, origin: [f32; 3], dir: [f32; 3], t_min: f32, t_max: f32) -> Option<f32> {
@@ -757,6 +806,22 @@ fn contains(b: (V3, V3), p: V3) -> bool {
     (0..3).all(|k| b.0[k] <= p[k] && p[k] <= b.1[k])
 }
 
+/// Occluder work one AO sample's budget buys: a sample casts 16 rays, about the cost of reading
+/// or binning a hundred-odd triangles.
+const BUILD_WORK_PER_SAMPLE: usize = 128;
+
+/// The occluders a bake samples against, read and built a slice at a time.
+enum Occluders {
+    /// Reading triangles: the next instance and triangle, and those read so far.
+    Collecting {
+        instance: usize,
+        triangle: usize,
+        tris: Vec<Tri>,
+    },
+    Building(BvhBuilder),
+    Ready(AoBvh),
+}
+
 /// A receiver instance waiting to be (re)sampled: every vertex, or only those inside `region`.
 #[derive(Clone, Copy)]
 struct Pending {
@@ -776,7 +841,7 @@ pub(super) struct AoBake {
     cursor: usize,
     /// Occluders the BVH holds: all of them (`None`), or those reaching into this box.
     scope: Option<(V3, V3)>,
-    bvh: Option<AoBvh>,
+    occluders: Option<Occluders>,
     cache: HashMap<SampleKey, f32>,
     /// The queue was refilled since it was last sorted by distance to the camera.
     unordered: bool,
@@ -793,7 +858,7 @@ impl AoBake {
             queue: VecDeque::new(),
             cursor: 0,
             scope: None,
-            bvh: None,
+            occluders: None,
             cache: HashMap::new(),
             unordered: false,
             queued_vertices: 0,
@@ -868,7 +933,7 @@ impl AoBake {
             (false, Some(s)) => Some(merged(s, grown(region, reach))),
             (false, None) => None,
         };
-        self.bvh = None;
+        self.occluders = None;
         self.cache.clear();
         let front = self.queue.front().map(|p| p.instance as usize);
         for (index, inst) in edit.instances.iter().enumerate() {
@@ -884,22 +949,31 @@ impl AoBake {
         }
     }
 
-    fn build_bvh(edit: &WorldEdit, scope: Option<(V3, V3)>) -> AoBvh {
-        let mut tris = Vec::new();
-        for inst in &edit.instances {
+    /// Reads occluder triangles (all, or those reaching into `scope`) from instance `*instance`,
+    /// triangle `*triangle` on, until `*work` runs out; true once every instance is read.
+    fn collect(
+        edit: &WorldEdit,
+        scope: Option<(V3, V3)>,
+        (instance, triangle): (&mut usize, &mut usize),
+        tris: &mut Vec<Tri>,
+        work: &mut usize,
+    ) -> bool {
+        while let Some(inst) = edit.instances.get(*instance) {
             let mesh_idx = inst.mesh as usize;
-            if !inst.visible
-                || inst.first_vertex.is_none()
-                || !edit.occluder_meshes.get(mesh_idx).copied().unwrap_or(false)
-            {
-                continue;
-            }
             let mesh = &edit.meshes[mesh_idx];
             let m = &inst.transform;
-            if scope.is_some_and(|s| !overlaps(transformed_bounds(mesh.bounds, m), s)) {
-                continue;
-            }
-            for t in mesh.indices.chunks_exact(3) {
+            let skip = !inst.visible
+                || inst.first_vertex.is_none()
+                || !edit.occluder_meshes.get(mesh_idx).copied().unwrap_or(false)
+                || scope.is_some_and(|s| !overlaps(transformed_bounds(mesh.bounds, m), s));
+            let count = if skip { 0 } else { mesh.indices.len() / 3 };
+            while *triangle < count {
+                if *work == 0 {
+                    return false;
+                }
+                *work -= 1;
+                let t = &mesh.indices[*triangle * 3..*triangle * 3 + 3];
+                *triangle += 1;
                 let a = transform_point(m, mesh.positions[t[0] as usize]);
                 let b = transform_point(m, mesh.positions[t[1] as usize]);
                 let c = transform_point(m, mesh.positions[t[2] as usize]);
@@ -910,10 +984,54 @@ impl AoBake {
                         continue;
                     }
                 }
-                tris.push((a, b, c));
+                tris.extend(make_tri(a, b, c));
             }
+            *instance += 1;
+            *triangle = 0;
         }
-        AoBvh::build(&tris)
+        true
+    }
+
+    /// Advances the occluders by `work` units (a triangle read or binned); true once ready.
+    fn prepare_occluders(&mut self, edit: &WorldEdit, mut work: usize) -> bool {
+        let state = self.occluders.take().unwrap_or(Occluders::Collecting {
+            instance: 0,
+            triangle: 0,
+            tris: Vec::new(),
+        });
+        self.occluders = Some(match state {
+            Occluders::Collecting {
+                mut instance,
+                mut triangle,
+                mut tris,
+            } => {
+                let done = Self::collect(
+                    edit,
+                    self.scope,
+                    (&mut instance, &mut triangle),
+                    &mut tris,
+                    &mut work,
+                );
+                if done {
+                    Occluders::Building(BvhBuilder::new(tris))
+                } else {
+                    Occluders::Collecting {
+                        instance,
+                        triangle,
+                        tris,
+                    }
+                }
+            }
+            Occluders::Building(mut builder) => {
+                if builder.step(work) {
+                    Occluders::Ready(builder.finish())
+                } else {
+                    Occluders::Building(builder)
+                }
+            }
+            ready @ Occluders::Ready(_) => ready,
+        });
+        matches!(self.occluders, Some(Occluders::Ready(_)))
     }
 
     /// Samples up to `budget` vertices (scanning past unchanged ones costs nothing against it),
@@ -946,8 +1064,13 @@ impl AoBake {
                 rest.sort_by_cached_key(|p| distance(p).to_bits());
             }
         }
-        let scope = self.scope;
-        let bvh = self.bvh.get_or_insert_with(|| Self::build_bvh(edit, scope));
+        // The occluders come first, read and built a slice at a time like the samples.
+        if !self.prepare_occluders(edit, budget.saturating_mul(BUILD_WORK_PER_SAMPLE)) {
+            return updated;
+        }
+        let Some(Occluders::Ready(bvh)) = self.occluders.as_ref() else {
+            return updated;
+        };
         let mut cost = 0usize;
         let scan_limit = budget.saturating_mul(64);
         let mut scanned = 0usize;
@@ -1010,7 +1133,7 @@ impl AoBake {
         }
         if self.queue.is_empty() {
             // Idle: free the occluders and samples until the next edit.
-            self.bvh = None;
+            self.occluders = None;
             self.cache = HashMap::new();
             self.scope = None;
         }
