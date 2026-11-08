@@ -2217,8 +2217,8 @@ export async function createEngine(options) {
     },
     frames: () => x.ganbate_rt_frames(),
     /**
-     * Bakes up to `samples` more ambient-occlusion vertices between frames (nearest the camera
-     * first); true when a redraw would show a change. Call it from idle time with your own clock.
+     * Does up to `samples` vertices' worth of the ambient-occlusion bake between frames; true when
+     * there was work (false once converged or while edits settle). Call it from idle time.
      */
     stepAo: (samples) => (typeof x.ganbate_rt_step_ao === 'function' ? x.ganbate_rt_step_ao(Math.max(0, samples | 0)) === 1 : false),
     /** Completes the baked ambient occlusion now, for captures that must not depend on frame count. */

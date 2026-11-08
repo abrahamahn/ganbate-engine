@@ -526,9 +526,10 @@ pub extern "C" fn ganbate_rt_finish_ao() -> u32 {
     })
 }
 
-/// Bakes up to `samples` more vertices of the world's AO between frames, nearest the camera
-/// first, so the page can spend its idle time (measured by its own clock) instead of waiting for
-/// frames. Returns 1 when vertices changed and a redraw would show them, else 0.
+/// Does up to `samples` vertices' worth of the world's AO bake between frames (occluders first,
+/// then samples nearest the camera), so the page can spend its idle time, measured by its own
+/// clock, instead of waiting for frames. Returns 1 when it did work, 0 when there was none
+/// (converged, or world edits still settling).
 #[unsafe(no_mangle)]
 pub extern "C" fn ganbate_rt_step_ao(samples: u32) -> u32 {
     with(0, |rt| {
