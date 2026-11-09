@@ -13,6 +13,11 @@
 //! arguments only during the call, keeps no reference to wasm memory and never calls back into
 //! wasm, so memory cannot grow (detaching the host's view of it) while an import reads it. GL
 //! executes calls in order, so writes made after a submission never change what it read.
+//!
+//! Host images: [`write_texture_source`] uploads the host's *current source*, an image the host
+//! page set (a canvas, an image bitmap) before calling the runtime export that leads here. The
+//! source is a host slot, not a handle: it is valid only during that one export call, and the host
+//! clears it when the call returns.
 
 /// The canvas texture: an RGBA8 texture the host keeps at the canvas size and copies to the
 /// canvas (flipped: GL's window origin is the bottom-left) when a frame is presented.
@@ -54,6 +59,7 @@ unsafe extern "C" {
         data: *const u8,
         len: usize,
     );
+    fn gl_write_texture_source(texture: u32, mip: u32, layer: u32, width: u32, height: u32) -> u32;
     fn gl_generate_mips(texture: u32);
     fn gl_create_sampler(desc: *const u32, words: u32) -> u32;
     fn gl_create_program(
@@ -172,6 +178,23 @@ pub fn create_texture(
 pub fn write_texture(texture: u32, (mip, layer): (u32, u32), (w, h): (u32, u32), data: &[u8]) {
     // SAFETY: the host copies `data` during the call.
     unsafe { gl_write_texture(texture, mip, layer, w, h, data.as_ptr(), data.len()) }
+}
+
+/// Uploads the host's current source (`width` x `height`) into one whole subresource with
+/// `texSubImage2D`, unflipped and with straight alpha. Returns the host's error if there is no
+/// source, its size differs or the browser refused it.
+pub fn write_texture_source(
+    texture: u32,
+    (mip, layer): (u32, u32),
+    (w, h): (u32, u32),
+) -> Result<(), String> {
+    // SAFETY: plain values; the host reads only its own source slot.
+    let ok = unsafe { gl_write_texture_source(texture, mip, layer, w, h) };
+    if ok == 0 {
+        Err(format!("texture from source: {}", last_error()))
+    } else {
+        Ok(())
+    }
 }
 
 pub fn generate_mips(texture: u32) {

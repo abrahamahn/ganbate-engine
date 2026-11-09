@@ -121,13 +121,32 @@ export interface GanbateGovernorSnapshot {
 
 export type GanbateQualityBudget = GanbateGovernorSnapshot;
 
-/** RGBA8 pixels, or a canvas, image bitmap or loaded image. */
+/**
+ * RGBA8 pixels (straight alpha), or a canvas, image bitmap, video or loaded image. The browser
+ * copies the others to the GPU itself where it can (images only on WebGPU) and the engine reads
+ * their pixels back when it cannot; both give the same bytes.
+ */
 export type GanbateImageSource =
   | { readonly width: number; readonly height: number; readonly data: ArrayLike<number> & ArrayBufferView }
   | HTMLCanvasElement
   | OffscreenCanvas
   | ImageBitmap
-  | HTMLImageElement;
+  | HTMLImageElement
+  | HTMLVideoElement;
+
+/**
+ * A texture of one colour, filled on the GPU: no pixels are drawn, read back or copied. `clear` is
+ * `[r, g, b, a]` from 0 to 1, straight alpha with sRGB-encoded channels like a canvas colour, so
+ * the texture samples as a canvas filled with that colour would (sRGB or not). Every mip level
+ * holds the colour. A later `updateTexture` of the same size replaces it, which suits a
+ * placeholder shown until a picture is ready.
+ */
+export interface GanbateClearTexture {
+  /** Whole pixels, at least 1. */
+  readonly width: number;
+  readonly height: number;
+  readonly clear: readonly [number, number, number, number];
+}
 
 export interface GanbateMeshData {
   /** Three numbers per vertex. */
@@ -309,7 +328,8 @@ export interface GanbateEngine {
   /** Waits for submitted GPU work (WebGPU; immediate on WebGL 2). */
   idle(): Promise<void>;
 
-  createTexture(source: GanbateImageSource, options?: { readonly srgb?: boolean }): number;
+  createTexture(source: GanbateImageSource | GanbateClearTexture, options?: { readonly srgb?: boolean }): number;
+  /** New pixels for a texture from a source of the texture's size. */
   updateTexture(texture: number, source: GanbateImageSource): void;
   destroyTexture(texture: number): void;
   createMesh(mesh: GanbateMeshData): number;

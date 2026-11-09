@@ -107,7 +107,8 @@ engine.setClock(18.5, performance.now() / 1000);     // time of day, animation c
 engine.setWeather('clear');
 engine.setLampBoost(1.9);                             // momentary lamp swell (1.0 = normal hour)
 const mesh = engine.createMesh({ positions, normals, uvs, indices });
-const art = engine.createTexture(canvasOrImageBitmap);
+const art = engine.createTexture(canvasOrImageBitmap); // the browser uploads it itself
+const blank = engine.createTexture({ width: 512, height: 717, clear: [0.9, 0.88, 0.8, 1] }); // filled on the GPU
 const felt = engine.createMaterial({ name: 'felt', color: [0.1, 0.3, 0.2, 1], baseTexture: art });
 const chip = engine.createInstance(mesh, felt, matrix); // 16 numbers, column-major
 engine.setInstances([{ instance: chip, matrix, visible: true }]);

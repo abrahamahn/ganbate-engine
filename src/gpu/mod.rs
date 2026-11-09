@@ -454,6 +454,19 @@ impl Device<'_> {
     pub fn write_texture(&mut self, t: TextureId, mip: u32, layer: u32, data: &[u8]) -> Result<()> {
         web!(mut self, g => g.write_texture(t, mip, layer, data))
     }
+    /// Replaces one whole subresource of an 8-bit RGBA texture (requires `COPY_DST`) with the
+    /// image the host page set for the current runtime call (a canvas or an image bitmap), copied
+    /// by the browser: unflipped, straight alpha, sRGB-encoded bytes as `write_texture` takes them.
+    /// `size` is the image's size and must be the mip's.
+    pub fn write_texture_source(
+        &mut self,
+        t: TextureId,
+        mip: u32,
+        layer: u32,
+        size: (u32, u32),
+    ) -> Result<()> {
+        web!(mut self, g => g.write_texture_source(t, mip, layer, size))
+    }
     pub fn generate_mips(&mut self, t: TextureId) -> Result<()> {
         web!(mut self, g => g.generate_mips(t))
     }

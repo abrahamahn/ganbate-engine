@@ -25,8 +25,8 @@ use super::renderer::{Fnv, Renderer};
 use super::scene::MaterialData;
 use crate::gpu::pool::Pool;
 use crate::gpu::{
-    BindGroupId, BufferDesc, BufferId, BufferUsage, Device, Format, Memory, Resource, Result,
-    TextureDesc, TextureId, TextureUsage, f32_bytes, u32_bytes,
+    Attachment, BindGroupId, BufferDesc, BufferId, BufferUsage, Device, Format, Memory, Resource,
+    Result, TextureDesc, TextureId, TextureUsage, f32_bytes, u32_bytes,
 };
 use crate::world::Shading;
 
@@ -1027,6 +1027,23 @@ impl Props {
     }
 }
 
+/// The clear value that leaves the bytes a 2D canvas filled with `color` (straight alpha,
+/// sRGB-encoded channels from 0 to 1) holds: each channel rounded to 8 bits, and for an sRGB
+/// texture, whose stores encode linear light, the colour channels decoded from those bytes.
+fn canvas_clear(color: [f32; 4], srgb: bool) -> Result<[f32; 4]> {
+    if !color.iter().all(|c| c.is_finite()) {
+        return Err(format!("texture clear colour {color:?} is not finite"));
+    }
+    Ok(std::array::from_fn(|i| {
+        let byte = (color[i].clamp(0.0, 1.0) * 255.0).round() as u8;
+        if srgb && i < 3 {
+            math::srgb_to_linear(byte)
+        } else {
+            f32::from(byte) / 255.0
+        }
+    }))
+}
+
 impl Renderer {
     fn prop_texture_id(&self, t: Option<PropTexture>, fallback: TextureId) -> Result<TextureId> {
         match t {
@@ -1044,9 +1061,21 @@ impl Renderer {
     pub fn create_prop_texture(
         &mut self,
         device: &mut Device<'_>,
-        (width, height): (u32, u32),
+        size: (u32, u32),
         rgba: &[u8],
         srgb: bool,
+    ) -> Result<PropTexture> {
+        self.create_prop_texture_with(device, size, srgb, |d, t| d.write_texture(t, 0, 0, rgba))
+    }
+
+    /// As [`Self::create_prop_texture`], with mip 0 written by `fill` (an image the browser copies
+    /// itself, a clear) instead of from bytes; the other mips are generated from it as there.
+    pub fn create_prop_texture_with(
+        &mut self,
+        device: &mut Device<'_>,
+        (width, height): (u32, u32),
+        srgb: bool,
+        fill: impl FnOnce(&mut Device<'_>, TextureId) -> Result<()>,
     ) -> Result<PropTexture> {
         let mips = 32 - width.max(height).leading_zeros();
         let t = device.create_texture(&TextureDesc {
@@ -1064,14 +1093,33 @@ impl Renderer {
                 | TextureUsage::COPY_SRC
                 | TextureUsage::COLOR_TARGET,
         })?;
-        let written = device
-            .write_texture(t, 0, 0, rgba)
-            .and_then(|()| device.generate_mips(t));
+        let written = fill(device, t).and_then(|()| device.generate_mips(t));
         if let Err(e) = written {
             device.destroy_texture(t);
             return Err(e);
         }
         Ok(PropTexture(self.props.textures.insert(t)?))
+    }
+
+    /// A prop texture whose texels are all `color`, filled on the GPU (mip 0 cleared, then the mip
+    /// chain generated) with no pixels from the host: a placeholder until the real picture arrives
+    /// through [`Self::update_prop_texture`] at the same size. `color` is straight alpha with
+    /// sRGB-encoded channels from 0 to 1, like a canvas colour, and the texels hold the bytes a
+    /// canvas filled with it would, so either kind of texture samples what that canvas would.
+    pub fn create_prop_texture_clear(
+        &mut self,
+        device: &mut Device<'_>,
+        size: (u32, u32),
+        srgb: bool,
+        color: [f32; 4],
+    ) -> Result<PropTexture> {
+        let value = canvas_clear(color, srgb)?;
+        self.create_prop_texture_with(device, size, srgb, |d, t| {
+            let mut e = d.encoder();
+            e.begin_pass_slice(&[Attachment::clear(t, value)], None);
+            e.end_pass();
+            d.submit(e)
+        })
     }
 
     /// Replaces a prop texture's pixels (same size) and its mips.
@@ -1081,8 +1129,18 @@ impl Renderer {
         texture: PropTexture,
         rgba: &[u8],
     ) -> Result<()> {
+        self.update_prop_texture_with(device, texture, |d, t| d.write_texture(t, 0, 0, rgba))
+    }
+
+    /// As [`Self::update_prop_texture`], with mip 0 written by `fill`. Nothing changes when it fails.
+    pub fn update_prop_texture_with(
+        &mut self,
+        device: &mut Device<'_>,
+        texture: PropTexture,
+        fill: impl FnOnce(&mut Device<'_>, TextureId) -> Result<()>,
+    ) -> Result<()> {
         let t = self.prop_texture_id(Some(texture), self.dummy)?;
-        device.write_texture(t, 0, 0, rgba)?;
+        fill(device, t)?;
         let edits = self.props.texture_edits.entry(texture.0).or_default();
         *edits = edits.wrapping_add(1);
         device.generate_mips(t)
@@ -2845,5 +2903,111 @@ mod tests {
         );
 
         renderer.destroy_props(&mut device);
+    }
+
+    #[test]
+    fn canvas_clear_rounds_to_canvas_bytes_and_decodes_srgb() {
+        assert_eq!(
+            canvas_clear([0.2, 0.4, 0.8, 0.6], false),
+            Ok([51.0 / 255.0, 102.0 / 255.0, 204.0 / 255.0, 153.0 / 255.0])
+        );
+        let srgb = canvas_clear([0.2, 0.4, 0.8, 0.6], true).unwrap();
+        assert_eq!(srgb[..3], [51, 102, 204].map(math::srgb_to_linear));
+        assert_eq!(srgb[3], 153.0 / 255.0, "alpha is never sRGB-encoded");
+        assert_eq!(
+            canvas_clear([-1.0, 2.0, 0.0, 1.0], false),
+            Ok([0.0, 1.0, 0.0, 1.0])
+        );
+        assert!(canvas_clear([0.5, f32::NAN, 0.5, 1.0], true).is_err());
+        assert!(canvas_clear([0.5, 0.5, 0.5, f32::INFINITY], false).is_err());
+    }
+
+    #[test]
+    fn cleared_prop_textures_hold_the_canvas_bytes_in_every_mip_and_take_updates() {
+        use crate::render::{Look, Output, Quality};
+        use crate::world::World;
+
+        let Ok(mut device) = Device::headless() else {
+            return;
+        };
+        let mut r = Renderer::new(
+            &mut device,
+            &World::default(),
+            Look::default(),
+            Quality::low_cost(),
+            (16, 16),
+            Output::Still,
+        )
+        .expect("headless renderer");
+        let read = |device: &mut Device<'_>, r: &Renderer, t: PropTexture, mip: u32| {
+            let id = r.prop_texture_id(Some(t), r.dummy).expect("texture");
+            let (w, h) = device.texture_desc(id).expect("desc").mip_size(mip);
+            let rb = device
+                .create_buffer(&BufferDesc {
+                    size: u64::from(w * h * 4),
+                    usage: BufferUsage::COPY_DST,
+                    memory: Memory::Readback,
+                })
+                .expect("readback");
+            let mut e = device.encoder();
+            e.copy_texture_to_buffer(id, mip, 0, rb, 0);
+            device.submit(e).expect("copy");
+            let bytes = device.read_buffer(rb).expect("read");
+            device.destroy_buffer(rb);
+            bytes
+        };
+        let solid = |px: [u8; 4], n: usize| px.repeat(n);
+
+        // 5x3 has mips 5x3, 2x1 and 1x1; every one holds the bytes a canvas of the colour would.
+        let srgb = r
+            .create_prop_texture_clear(&mut device, (5, 3), true, [0.2, 0.4, 0.8, 1.0])
+            .expect("srgb clear");
+        let unorm = r
+            .create_prop_texture_clear(&mut device, (5, 3), false, [0.2, 0.4, 0.8, 0.6])
+            .expect("unorm clear");
+        for (mip, n) in [(0, 15), (1, 2), (2, 1)] {
+            assert_eq!(
+                read(&mut device, &r, srgb, mip),
+                solid([51, 102, 204, 255], n)
+            );
+            assert_eq!(
+                read(&mut device, &r, unorm, mip),
+                solid([51, 102, 204, 153], n)
+            );
+        }
+
+        // A placeholder takes the picture later at its size; a wrong size or a failed fill
+        // leaves it and its edit count as they were.
+        let edits = |r: &Renderer| r.props.texture_edits.get(&srgb.0).copied().unwrap_or(0);
+        assert!(r.update_prop_texture(&mut device, srgb, &[9; 4]).is_err());
+        let refused = r.update_prop_texture_with(&mut device, srgb, |_, _| Err("refused".into()));
+        assert_eq!(refused, Err("refused".into()));
+        assert_eq!(edits(&r), 0);
+        assert_eq!(
+            read(&mut device, &r, srgb, 0),
+            solid([51, 102, 204, 255], 15)
+        );
+        r.update_prop_texture(&mut device, srgb, &solid([200, 10, 30, 255], 15))
+            .expect("update");
+        assert_eq!(edits(&r), 1);
+        assert_eq!(
+            read(&mut device, &r, srgb, 0),
+            solid([200, 10, 30, 255], 15)
+        );
+        assert_eq!(read(&mut device, &r, srgb, 2), solid([200, 10, 30, 255], 1));
+
+        // A refused fill or colour makes no prop texture.
+        let count = |r: &Renderer| r.props.textures.iter().count();
+        let before = count(&r);
+        let made =
+            r.create_prop_texture_with(&mut device, (4, 4), true, |_, _| Err("no source".into()));
+        assert_eq!(made, Err("no source".into()));
+        assert!(
+            r.create_prop_texture_clear(&mut device, (4, 4), true, [f32::NAN, 0.0, 0.0, 1.0])
+                .is_err()
+        );
+        assert_eq!(count(&r), before);
+
+        r.destroy_props(&mut device);
     }
 }

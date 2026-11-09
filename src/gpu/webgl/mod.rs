@@ -623,6 +623,24 @@ impl<'w> Gpu<'w> {
         Ok(())
     }
 
+    /// Uploads the host's current source image (see `ffi::write_texture_source`) into one whole
+    /// subresource; `size` is the source's size, which must be the mip's. A source arrives in
+    /// RGBA order, so BGRA textures (stored as RGBA8 here) need no swizzle.
+    pub fn write_texture_source(
+        &mut self,
+        id: TextureId,
+        mip: u32,
+        layer: u32,
+        size: (u32, u32),
+    ) -> Result<()> {
+        let t = self.texture(id)?;
+        if t.surface {
+            return Err("write_texture_source: the canvas texture cannot be written".into());
+        }
+        t.desc.check_source_write(mip, layer, size)?;
+        ffi::write_texture_source(t.js, (mip, layer), size)
+    }
+
     pub fn generate_mips(&mut self, id: TextureId) -> Result<()> {
         let t = self.texture(id)?;
         let need = TextureUsage::COPY_SRC | TextureUsage::COPY_DST;

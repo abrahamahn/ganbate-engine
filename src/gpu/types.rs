@@ -251,6 +251,36 @@ impl TextureDesc {
         let h = self.height >> mip;
         (if w == 0 { 1 } else { w }, if h == 0 { 1 } else { h })
     }
+    /// Whether a browser host may copy a `size` image of its own (a canvas, an image bitmap)
+    /// straight into one whole subresource: the texture needs `COPY_DST`, an 8-bit RGBA or BGRA
+    /// format and exactly that mip's extent.
+    pub fn check_source_write(&self, mip: u32, layer: u32, size: (u32, u32)) -> Result<()> {
+        if !self.usage.contains(TextureUsage::COPY_DST) {
+            return Err("write_texture_source: the texture lacks COPY_DST usage".into());
+        }
+        if !matches!(
+            self.format,
+            Format::Rgba8Unorm | Format::Rgba8Srgb | Format::Bgra8Unorm | Format::Bgra8Srgb
+        ) {
+            return Err(format!(
+                "write_texture_source: {:?} is not an 8-bit RGBA format",
+                self.format
+            ));
+        }
+        if mip >= self.mips || layer >= self.layers {
+            return Err(format!(
+                "write_texture_source: mip {mip} layer {layer} is outside the texture"
+            ));
+        }
+        let want = self.mip_size(mip);
+        if size != want {
+            return Err(format!(
+                "write_texture_source: a {}x{} image for a {}x{} mip",
+                size.0, size.1, want.0, want.1
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Where a buffer lives.
@@ -543,5 +573,44 @@ pub fn u32_bytes(values: &[u32]) -> Vec<u8> {
             out.extend_from_slice(&v.to_le_bytes());
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_writes_need_copy_dst_rgba8_and_the_exact_mip_size() {
+        let usage = TextureUsage::SAMPLED | TextureUsage::COPY_DST;
+        let mut d = TextureDesc::new(512, 717, Format::Rgba8Srgb, usage);
+        d.mips = 10;
+        assert_eq!(d.check_source_write(0, 0, (512, 717)), Ok(()));
+        assert_eq!(d.check_source_write(9, 0, (1, 1)), Ok(()));
+        for format in [Format::Rgba8Unorm, Format::Bgra8Unorm, Format::Bgra8Srgb] {
+            let t = TextureDesc { format, ..d };
+            assert_eq!(t.check_source_write(1, 0, (256, 358)), Ok(()));
+        }
+
+        let err =
+            |t: &TextureDesc, mip, layer, size| t.check_source_write(mip, layer, size).unwrap_err();
+        assert!(err(&d, 0, 0, (717, 512)).contains("a 717x512 image for a 512x717 mip"));
+        assert!(err(&d, 1, 0, (512, 717)).contains("for a 256x358 mip"));
+        assert!(err(&d, 10, 0, (1, 1)).contains("mip 10 layer 0 is outside"));
+        assert!(err(&d, 0, 1, (512, 717)).contains("mip 0 layer 1 is outside"));
+        let sampled_only = TextureDesc {
+            usage: TextureUsage::SAMPLED,
+            ..d
+        };
+        assert!(err(&sampled_only, 0, 0, (512, 717)).contains("lacks COPY_DST"));
+        for format in [
+            Format::Rgba16Float,
+            Format::R8Unorm,
+            Format::Depth32Float,
+            Format::Bc7RgbaSrgb,
+        ] {
+            let t = TextureDesc { format, ..d };
+            assert!(err(&t, 0, 0, (512, 717)).contains("not an 8-bit RGBA format"));
+        }
     }
 }

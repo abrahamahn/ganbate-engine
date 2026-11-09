@@ -15,6 +15,11 @@
 //! arguments only during the call, keeps no reference to wasm memory and never calls back into
 //! wasm, so memory cannot grow (detaching the host's view of it) while an import reads it.
 //! Queue writes and submissions execute in call order on the GPU queue.
+//!
+//! Host images: [`copy_source`] copies the host's *current source*, an image the host page set
+//! (a canvas, an image bitmap) before calling the runtime export that leads here. The source is
+//! a host slot, not a handle: it is valid only during that one export call, and the host clears it
+//! when the call returns.
 
 /// First handle value reserved for objects owned by the host.
 pub const SPECIAL: u32 = 0xFFFF_FF00;
@@ -55,6 +60,7 @@ unsafe extern "C" {
         data: *const u8,
         len: usize,
     );
+    fn gpu_copy_source(texture: u32, mip: u32, layer: u32, width: u32, height: u32) -> u32;
     fn gpu_generate_mips(texture: u32);
     fn gpu_create_sampler(desc: *const u32, words: u32) -> u32;
     fn gpu_create_shader(code: *const u8, len: usize) -> u32;
@@ -167,6 +173,23 @@ pub fn write_texture(
             data.as_ptr(),
             data.len(),
         )
+    }
+}
+
+/// Copies the host's current source (`width` x `height`, straight alpha, sRGB-encoded) into one
+/// whole subresource (`copyExternalImageToTexture`). Returns the host's error if there is no
+/// source, its size differs or the browser refused it.
+pub fn copy_source(
+    texture: u32,
+    (mip, layer): (u32, u32),
+    (width, height): (u32, u32),
+) -> Result<(), String> {
+    // SAFETY: plain values; the host reads only its own source slot.
+    let ok = unsafe { gpu_copy_source(texture, mip, layer, width, height) };
+    if ok == 0 {
+        Err(format!("texture from source: {}", last_error()))
+    } else {
+        Ok(())
     }
 }
 

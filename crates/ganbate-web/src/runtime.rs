@@ -722,6 +722,60 @@ pub unsafe extern "C" fn ganbate_rt_texture_update(
     })
 }
 
+/// As [`ganbate_rt_texture_create`], from the image the host set for this call (a canvas or an
+/// image bitmap of `width` x `height`), which the browser copies to the GPU itself. 0 when the
+/// host has no such image or the browser refused it: the host then sends the pixels instead.
+#[unsafe(no_mangle)]
+pub extern "C" fn ganbate_rt_texture_create_source(width: u32, height: u32, srgb: u32) -> u32 {
+    with(0, |rt| {
+        let t = rt.renderer.create_prop_texture_with(
+            &mut rt.device,
+            (width, height),
+            srgb != 0,
+            |d, t| d.write_texture_source(t, 0, 0, (width, height)),
+        )?;
+        Ok(t.raw())
+    })
+}
+
+/// As [`ganbate_rt_texture_update`], from the image the host set for this call, which must be
+/// `width` x `height`, the texture's size.
+#[unsafe(no_mangle)]
+pub extern "C" fn ganbate_rt_texture_update_source(texture: u32, width: u32, height: u32) -> u32 {
+    with(0, |rt| {
+        rt.renderer.update_prop_texture_with(
+            &mut rt.device,
+            PropTexture::from_raw(texture),
+            |d, t| d.write_texture_source(t, 0, 0, (width, height)),
+        )?;
+        Ok(1)
+    })
+}
+
+/// A `width` x `height` texture of one colour (straight alpha, sRGB-encoded channels from 0 to
+/// 1, like a canvas colour), filled on the GPU with no pixels from the host, with a full mip
+/// chain; a later update of the same size replaces it.
+#[unsafe(no_mangle)]
+pub extern "C" fn ganbate_rt_texture_create_clear(
+    width: u32,
+    height: u32,
+    srgb: u32,
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+) -> u32 {
+    with(0, |rt| {
+        let t = rt.renderer.create_prop_texture_clear(
+            &mut rt.device,
+            (width, height),
+            srgb != 0,
+            [r, g, b, a],
+        )?;
+        Ok(t.raw())
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn ganbate_rt_texture_destroy(texture: u32) -> u32 {
     with(0, |rt| {

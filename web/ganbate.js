@@ -84,6 +84,8 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
   let memory = null;
   let surfaceTexture = null;
   let surfaceView = null;
+  /** The image `gpu_copy_source` copies: set by the engine around one runtime call. */
+  let source = null;
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
 
@@ -494,6 +496,16 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
         [width, height, 1],
       );
     },
+    gpu_copy_source: guard('copyExternalImageToTexture', (h, mip, layer, width, height) => {
+      // Straight alpha and sRGB-encoded values, the image's top row first: the bytes pixelsOf
+      // reads back (an -srgb texture stores the same bytes as its unorm twin).
+      device.queue.copyExternalImageToTexture(
+        { source: sourceOfSize(source, width, height), flipY: false },
+        { texture: objects[h >>> 0].texture, mipLevel: mip, origin: [0, 0, layer], colorSpace: 'srgb', premultipliedAlpha: false },
+        [width, height],
+      );
+      return 1;
+    }),
     gpu_generate_mips(h) {
       const t = objects[h >>> 0];
       const enc = device.createCommandEncoder();
@@ -620,6 +632,8 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
     imports: { ganbate: imports },
     errors,
     attach(instance) { memory = instance.exports.memory; },
+    /** Sets (or with null clears) the image the next runtime call may copy into a texture. */
+    setSource(image) { source = image; },
     /** Forgets the canvas texture of the last frame (call once per animation frame). */
     nextFrame() { surfaceTexture = null; surfaceView = null; },
     /** The canvas texture of the current frame, if one was rendered. */
@@ -700,6 +714,8 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
   const errors = [];
   let lastError = '';
   let memory = null;
+  /** The image `gl_write_texture_source` uploads: set by the engine around one runtime call. */
+  let source = null;
   const encoder = new TextEncoder();
   const decoder = new TextDecoder();
   const report = (message) => {
@@ -1361,6 +1377,25 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
       if (t.target === gl.TEXTURE_2D_ARRAY) gl.texSubImage3D(t.target, mip, 0, 0, layer, w, hgt, 1, fm.format, fm.type, data);
       else gl.texSubImage2D(t.target, mip, 0, 0, w, hgt, fm.format, fm.type, data);
     },
+    gl_write_texture_source: guard('texSubImage2D', (h, mip, layer, w, hgt) => {
+      const image = sourceOfSize(source, w, hgt);
+      const t = objects[h >>> 0];
+      bindScratch(t);
+      // Unflipped (top row first) and straight alpha, as pixelsOf reads it back. Colour
+      // conversion stays the browser's default, as drawImage applies it. The page's own
+      // unpack state comes back afterwards.
+      const unpack = [[gl.UNPACK_FLIP_Y_WEBGL, false], [gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false],
+        [gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.BROWSER_DEFAULT_WEBGL]];
+      const saved = unpack.map(([p]) => gl.getParameter(p));
+      for (const [p, v] of unpack) gl.pixelStorei(p, v);
+      try {
+        if (t.target === gl.TEXTURE_2D_ARRAY) gl.texSubImage3D(t.target, mip, 0, 0, layer, w, hgt, 1, t.f.format, t.f.type, image);
+        else gl.texSubImage2D(t.target, mip, 0, 0, w, hgt, t.f.format, t.f.type, image);
+      } finally {
+        unpack.forEach(([p], i) => gl.pixelStorei(p, saved[i]));
+      }
+      return 1;
+    }),
     gl_generate_mips(h) {
       const t = objects[h >>> 0];
       bindScratch(t);
@@ -1472,6 +1507,8 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
     imports: { ganbate: imports },
     errors,
     attach(instance) { memory = instance.exports.memory; },
+    /** Sets (or with null clears) the image the next runtime call may upload into a texture. */
+    setSource(image) { source = image; },
     nextFrame() {},
     frameTexture() { return surface; },
     bundleStats: () => ({ cached: 0, candidates: 0, replays: 0 }),
@@ -1495,12 +1532,12 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
 
 const GPU_IMPORTS = ['gpu_info', 'gpu_adapter_name', 'gpu_last_error', 'gpu_error_count', 'gpu_error',
   'gpu_canvas', 'gpu_create_buffer', 'gpu_write_buffer', 'gpu_create_texture', 'gpu_write_texture',
-  'gpu_generate_mips', 'gpu_create_sampler', 'gpu_create_shader', 'gpu_create_bind_group_layout',
+  'gpu_copy_source', 'gpu_generate_mips', 'gpu_create_sampler', 'gpu_create_shader', 'gpu_create_bind_group_layout',
   'gpu_create_pipeline_layout', 'gpu_create_render_pipeline', 'gpu_create_compute_pipeline',
   'gpu_create_bind_group', 'gpu_submit', 'gpu_release'];
 const GL_IMPORTS = ['gl_info', 'gl_renderer_name', 'gl_last_error', 'gl_error_count', 'gl_error',
   'gl_canvas', 'gl_create_buffer', 'gl_write_buffer', 'gl_read_buffer', 'gl_create_texture',
-  'gl_write_texture', 'gl_generate_mips', 'gl_create_sampler', 'gl_create_program',
+  'gl_write_texture', 'gl_write_texture_source', 'gl_generate_mips', 'gl_create_sampler', 'gl_create_program',
   'gl_create_pipeline', 'gl_create_vao', 'gl_submit', 'gl_release'];
 
 const KEY_CODES = { ArrowLeft: 1, ArrowRight: 2, ArrowUp: 3, ArrowDown: 4, ShiftLeft: 5, ShiftRight: 5, Space: 32 };
@@ -1889,12 +1926,35 @@ export async function startPlayer(options) {
 
 // ------------------------------------------------------------------------------ Library mode
 
+/** An image source's size in pixels: an image's natural size, a video's frame size. */
+function sourceSize(source) {
+  return [source.naturalWidth || source.videoWidth || source.width,
+    source.naturalHeight || source.videoHeight || source.height];
+}
+
+/** `source` when it is set and `width` x `height`; throws otherwise (a host's upload check). */
+function sourceOfSize(source, width, height) {
+  if (!source) throw new Error('no source image is set for this call');
+  const [w, h] = sourceSize(source);
+  if (w !== width || h !== height) throw new Error(`the source image is ${w}x${h}, not ${width}x${height}`);
+  return source;
+}
+
+/**
+ * Whether the browser can copy `source` into a texture itself: canvases, image bitmaps and
+ * videos, and on WebGPU images too. `{width, height, data}` stays pixels, and so do images on
+ * WebGL 2, where an upload without premultiplication makes Chrome decode them again.
+ */
+function copiesDirectly(source, webgpu) {
+  if (!source || typeof source !== 'object' || source.data) return false;
+  return webgpu || !('naturalWidth' in source);
+}
+
 /** RGBA8 pixels of an image source: `{width, height, data}` passes through; canvases, image
  * bitmaps and images are drawn into a 2D canvas and read back (straight alpha). */
 function pixelsOf(source) {
   if (source && source.data && source.width && source.height) return source;
-  const width = source.naturalWidth || source.videoWidth || source.width;
-  const height = source.naturalHeight || source.videoHeight || source.height;
+  const [width, height] = sourceSize(source);
   if (!width || !height) throw new Error('createTexture: the source has no size');
   const c = typeof OffscreenCanvas !== 'undefined'
     ? new OffscreenCanvas(width, height)
@@ -1954,9 +2014,15 @@ export async function createEngine(options) {
   const { canvas } = options;
   let lastError = '';
   const onLog = options.onLog || (() => {});
+  // While a texture is copied from its source: a refusal falls back to the pixels, so it warns.
+  let trying = false;
   const { gpu, host, x, errors } = await boot({
     ...options,
     onLog: (level, text) => {
+      if (trying && level >= 2) {
+        onLog(1, `${text}; sending the pixels instead`);
+        return;
+      }
       if (level >= 2) lastError = text;
       onLog(level, text);
     },
@@ -1999,6 +2065,27 @@ export async function createEngine(options) {
       mem.set(new Uint8Array(a.buffer, a.byteOffset, a.byteLength), base + offsets[i]);
       return base + offsets[i];
     });
+  };
+  /**
+   * Has the browser copy `source` straight into a texture (no readback, no copy through wasm
+   * memory): `call(width, height)` is the runtime export, and the host holds `source` for that
+   * call only. 0 when the module, the browser or the source cannot; the caller then sends pixels.
+   */
+  const fromSource = (source, call) => {
+    if (typeof x.ganbate_rt_texture_create_source !== 'function' || !copiesDirectly(source, gpu.api !== 'webgl2')) return 0;
+    const [width, height] = sourceSize(source);
+    if (!width || !height) return 0;
+    host.setSource(source);
+    trying = true;
+    try {
+      return call(width, height);
+    } catch (e) {
+      onLog(1, `texture from source: ${e.message}; sending the pixels instead`);
+      return 0;
+    } finally {
+      trying = false;
+      host.setSource(null);
+    }
   };
   const text = (s) => encoder.encode(s);
   const f32 = (a) => (a instanceof Float32Array ? a : new Float32Array(a));
@@ -2292,13 +2379,31 @@ export async function createEngine(options) {
     /** Waits until the GPU has finished submitted work (WebGPU; immediate on WebGL 2). */
     async idle() { if (gpu.device) await gpu.device.queue.onSubmittedWorkDone(); },
 
-    /** `source`: {width, height, data (RGBA8)} or a canvas, ImageBitmap or loaded image. */
+    /**
+     * `source`: {width, height, data (RGBA8)}; a canvas, ImageBitmap, video or loaded image, which
+     * the browser copies to the GPU itself where it can (otherwise its pixels are read back); or
+     * {width, height, clear: [r, g, b, a]}: one colour (straight alpha, sRGB-encoded channels
+     * from 0 to 1, like a canvas colour) filled on the GPU, sampling as a canvas of it would.
+     */
     createTexture(source, { srgb = true } = {}) {
+      const s = srgb ? 1 : 0;
+      if (source && !source.data && source.clear) {
+        const { width, height, clear } = source;
+        if (!(Number.isInteger(width) && Number.isInteger(height) && width > 0 && height > 0)
+          || clear.length !== 4 || !Array.prototype.every.call(clear, Number.isFinite)) {
+          throw new Error('createTexture: a cleared texture takes a width and height in whole pixels and clear: [r, g, b, a]');
+        }
+        return ok('createTexture', x.ganbate_rt_texture_create_clear(width, height, s, ...clear));
+      }
+      const direct = fromSource(source, (w, h) => x.ganbate_rt_texture_create_source(w, h, s));
+      if (direct) return direct;
       const { width, height, data } = pixelsOf(source);
       const [p] = place(data);
-      return ok('createTexture', x.ganbate_rt_texture_create(width, height, p, data.byteLength, srgb ? 1 : 0));
+      return ok('createTexture', x.ganbate_rt_texture_create(width, height, p, data.byteLength, s));
     },
+    /** New pixels for a texture, from a source of its size (as createTexture's, without clear). */
     updateTexture(texture, source) {
+      if (fromSource(source, (w, h) => x.ganbate_rt_texture_update_source(texture, w, h))) return;
       const { data } = pixelsOf(source);
       const [p] = place(data);
       ok('updateTexture', x.ganbate_rt_texture_update(texture, p, data.byteLength));

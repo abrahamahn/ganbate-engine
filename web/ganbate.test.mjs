@@ -295,6 +295,304 @@ test('without ResizeObserver, project and fitCanvas read the CSS box on every ca
   assert.equal(probe.reads, 6);
 });
 
+/** Sets globals for one test and puts the previous values back afterwards. */
+async function withGlobals(values, run) {
+  const saved = Object.keys(values).map((k) => [k, Object.getOwnPropertyDescriptor(globalThis, k)]);
+  for (const [k, v] of Object.entries(values)) {
+    Object.defineProperty(globalThis, k, { configurable: true, writable: true, value: v });
+  }
+  try {
+    return await run();
+  } finally {
+    for (const [k, d] of saved) {
+      if (d) Object.defineProperty(globalThis, k, d);
+      else delete globalThis[k];
+    }
+  }
+}
+
+/** pixelsOf's 2D canvas: counts the readbacks and returns pixels of 7. */
+function makeReadbackCanvas(readbacks) {
+  return class {
+    constructor(width, height) { Object.assign(this, { width, height }); readbacks.push([width, height]); }
+    getContext() {
+      return {
+        clearRect() {},
+        drawImage() {},
+        getImageData: (_x, _y, w, h) => ({ data: new Uint8ClampedArray(w * h * 4).fill(7) }),
+      };
+    }
+  };
+}
+
+/**
+ * An engine on `api` over a mock module whose texture exports act like the runtime: during the
+ * call they create the texture through the host's imports and fill it from the host's source,
+ * and a refusal is logged at level 2 and returns 0. `uploads` records what reached the GPU API.
+ */
+async function makeTextureEngine(api, exportOverrides = {}) {
+  const t = { calls: [], uploads: [], logs: [], readbacks: [], imports: null, unpack: null, refuse: false };
+  const sizes = new Map();
+  const mock = makeMockWasm({
+    ganbate_rt_texture_create_source(w, h, srgb) {
+      t.calls.push(['create_source', w, h, srgb]);
+      const g = t.imports;
+      const tex = api === 'webgl2'
+        ? g.gl_create_texture(w, h, 1, 1, srgb ? 2 : 1, 0)
+        : g.gpu_create_texture(w, h, 1, 1, srgb ? 2 : 1, 0);
+      sizes.set(tex, [w, h]);
+      if (write(tex, w, h)) return tex;
+      say('texture: the browser refused the source');
+      return 0;
+    },
+    ganbate_rt_texture_update_source(tex, w, h) {
+      t.calls.push(['update_source', tex, w, h]);
+      const [tw, th] = sizes.get(tex);
+      if (tw === w && th === h && write(tex, w, h)) return 1;
+      say(`write_texture_source: a ${w}x${h} image for a ${tw}x${th} mip`);
+      return 0;
+    },
+    ganbate_rt_texture_create(w, h, _p, len, srgb) {
+      t.calls.push(['create', w, h, len, srgb]);
+      return 99;
+    },
+    ganbate_rt_texture_update(tex, _p, len) {
+      t.calls.push(['update', tex, len]);
+      const [tw, th] = sizes.get(tex) || [0, 0];
+      if (len === tw * th * 4) return 1;
+      say(`write_texture: expected ${tw * th * 4} bytes, got ${len}`);
+      return 0;
+    },
+    ganbate_rt_texture_create_clear(...args) {
+      t.calls.push(['clear', ...args]);
+      return 77;
+    },
+    ...exportOverrides,
+  });
+  const write = (tex, w, h) => (api === 'webgl2'
+    ? t.imports.gl_write_texture_source(tex, 0, 0, w, h)
+    : t.imports.gpu_copy_source(tex, 0, 0, w, h)) === 1;
+  const say = (text) => {
+    const bytes = new TextEncoder().encode(text);
+    new Uint8Array(mock.memory.buffer, 64, bytes.length).set(bytes);
+    t.imports.log(2, 64, bytes.length);
+  };
+
+  let canvas;
+  const globals = { OffscreenCanvas: makeReadbackCanvas(t.readbacks) };
+  if (api === 'webgl2') {
+    const made = makeRecordingWebGl2Canvas(16, 16);
+    canvas = made.canvas;
+    const { gl } = made;
+    // The page left its own unpack state, which an upload must restore.
+    const unpack = { 0x9240: true, 0x9241: true, 0x9243: 0 };
+    t.unpack = unpack;
+    Object.assign(gl, {
+      UNPACK_FLIP_Y_WEBGL: 0x9240,
+      UNPACK_PREMULTIPLY_ALPHA_WEBGL: 0x9241,
+      UNPACK_COLORSPACE_CONVERSION_WEBGL: 0x9243,
+      BROWSER_DEFAULT_WEBGL: 0x9244,
+      TEXTURE_2D_ARRAY: 0x8C1A,
+    });
+    const baseGetParameter = gl.getParameter;
+    gl.getParameter = (p) => (p in unpack ? unpack[p] : baseGetParameter(p));
+    gl.pixelStorei = (p, v) => { if (p in unpack) unpack[p] = v; };
+    gl.texSubImage2D = (...args) => t.uploads.push({ args, unpack: { ...unpack } });
+  } else {
+    const device = new Proxy({
+      lost: new Promise(() => {}),
+      queue: {
+        copyExternalImageToTexture(src, dst, size) {
+          if (t.refuse) throw new Error('unsupported source');
+          t.uploads.push({ src, dst, size });
+        },
+        submit() {},
+      },
+      createTexture: (desc) => ({ desc, destroy() {} }),
+    }, {
+      get(target, prop) {
+        if (prop === 'then') return undefined;
+        if (prop in target) return target[prop];
+        return () => ({ destroy() {} });
+      },
+    });
+    canvas = { width: 16, height: 16, clientWidth: 16, clientHeight: 16, getContext: () => ({ configure() {} }) };
+    Object.assign(globals, {
+      GPUTextureUsage: { RENDER_ATTACHMENT: 0x10, COPY_SRC: 0x01 },
+      GPUShaderStage: { VERTEX: 1, FRAGMENT: 2, COMPUTE: 4 },
+      GPUBufferUsage: { UNIFORM: 0x40, COPY_DST: 0x08 },
+      navigator: {
+        gpu: {
+          getPreferredCanvasFormat: () => 'bgra8unorm',
+          requestAdapter: async () => ({
+            features: new Set(),
+            limits: { maxBufferSize: 65536, maxStorageBufferBindingSize: 65536, maxTextureDimension2D: 2048 },
+            info: { vendor: 'MockWebGPU' },
+            requestDevice: async () => device,
+          }),
+        },
+      },
+    });
+  }
+  // The module is instantiated with the host's imports, so the mock exports can call them.
+  const instantiate = WebAssembly.instantiate;
+  WebAssembly.instantiate = async (_bytes, imports) => {
+    t.imports = imports.ganbate;
+    return { instance: mock.instance };
+  };
+  try {
+    t.engine = await withGlobals(globals, () => createEngine({
+      canvas, wasm: new Uint8Array(8), api, onLog: (level, text) => t.logs.push([level, text]),
+    }));
+  } finally {
+    WebAssembly.instantiate = instantiate;
+  }
+  t.withGlobals = (run) => withGlobals(globals, run);
+  return t;
+}
+
+const canvasSource = (width, height) => ({ width, height, getContext() { return null; } });
+const imageSource = (width, height) => ({ naturalWidth: width, naturalHeight: height, width, height });
+
+test('WebGL 2: canvases and bitmaps upload from the source itself with straight alpha, unflipped, and the page\'s unpack state comes back', async () => {
+  const t = await makeTextureEngine('webgl2');
+  await t.withGlobals(() => {
+    const canvas = canvasSource(4, 2);
+    const tex = t.engine.createTexture(canvas, { srgb: false });
+    assert.deepEqual(t.calls, [['create_source', 4, 2, 0]]);
+    assert.equal(t.readbacks.length, 0, 'no pixels are read back');
+    assert.equal(t.uploads.length, 1);
+    const [target, mip, x, y, w, h, , , image] = t.uploads[0].args;
+    assert.deepEqual([target, mip, x, y, w, h, image], [0x0DE1, 0, 0, 0, 4, 2, canvas]);
+    assert.deepEqual(t.uploads[0].unpack, { 0x9240: false, 0x9241: false, 0x9243: 0x9244 });
+    assert.deepEqual(t.unpack, { 0x9240: true, 0x9241: true, 0x9243: 0 });
+
+    const bitmap = { width: 4, height: 2, close() {} };
+    t.engine.updateTexture(tex, bitmap);
+    assert.deepEqual(t.calls[1], ['update_source', tex, 4, 2]);
+    assert.equal(t.uploads[1].args[8], bitmap);
+    assert.equal(t.readbacks.length, 0);
+    // The host holds the source for that one call only.
+    assert.equal(t.imports.gl_write_texture_source(tex, 0, 0, 4, 2), 0);
+    assert.equal(t.uploads.length, 2);
+  });
+});
+
+test('WebGL 2 keeps images and {data} on the pixel path; WebGPU copies images too', async () => {
+  const gl = await makeTextureEngine('webgl2');
+  await gl.withGlobals(() => {
+    gl.engine.createTexture(imageSource(4, 2));
+    gl.engine.createTexture({ width: 1, height: 1, data: new Uint8Array(4) });
+    assert.deepEqual(gl.calls, [['create', 4, 2, 32, 1], ['create', 1, 1, 4, 1]]);
+    assert.deepEqual(gl.readbacks, [[4, 2]], 'only the image is read back');
+  });
+
+  const gpu = await makeTextureEngine('webgpu');
+  await gpu.withGlobals(() => {
+    const image = imageSource(4, 2);
+    gpu.engine.createTexture(image);
+    assert.deepEqual(gpu.calls, [['create_source', 4, 2, 1]]);
+    assert.equal(gpu.readbacks.length, 0);
+    assert.deepEqual(gpu.uploads, [{
+      src: { source: image, flipY: false },
+      dst: { texture: gpu.uploads[0].dst.texture, mipLevel: 0, origin: [0, 0, 0], colorSpace: 'srgb', premultipliedAlpha: false },
+      size: [4, 2],
+    }]);
+    assert.equal(gpu.uploads[0].dst.texture.desc.format, 'rgba8unorm-srgb');
+  });
+});
+
+test('a refused, failing or missing source upload falls back to the pixels with a warning', async () => {
+  // The browser refuses the source: the runtime logs at level 2, which the engine turns into a warning.
+  const refused = await makeTextureEngine('webgpu');
+  refused.refuse = true;
+  await refused.withGlobals(() => {
+    assert.equal(refused.engine.createTexture(canvasSource(4, 2)), 99);
+    assert.deepEqual(refused.calls.map((c) => c[0]), ['create_source', 'create']);
+    assert.deepEqual(refused.readbacks, [[4, 2]]);
+    assert.ok(refused.logs.some(([l, s]) => l === 1 && s.includes('refused') && s.includes('sending the pixels instead')));
+    assert.ok(!refused.logs.some(([l]) => l >= 2), 'no error is reported');
+  });
+
+  // The export throws (a trap): the same fallback.
+  const trapped = await makeTextureEngine('webgl2', {
+    ganbate_rt_texture_create_source() { throw new WebAssembly.RuntimeError('unreachable'); },
+  });
+  await trapped.withGlobals(() => {
+    assert.equal(trapped.engine.createTexture(canvasSource(2, 2)), 99);
+    assert.deepEqual(trapped.readbacks, [[2, 2]]);
+    assert.ok(trapped.logs.some(([l, s]) => l === 1 && s.includes('unreachable')));
+  });
+
+  // An older module without the exports reads the pixels, as before.
+  const old = await makeTextureEngine('webgl2', {
+    ganbate_rt_texture_create_source: undefined,
+    ganbate_rt_texture_update_source: undefined,
+  });
+  await old.withGlobals(() => {
+    assert.equal(old.engine.createTexture(canvasSource(2, 2)), 99);
+    assert.deepEqual(old.calls, [['create', 2, 2, 16, 1]]);
+  });
+});
+
+test('updateTexture with a source of another size fails after trying the pixels', async () => {
+  const t = await makeTextureEngine('webgl2');
+  await t.withGlobals(() => {
+    const tex = t.engine.createTexture(canvasSource(4, 2));
+    assert.throws(() => t.engine.updateTexture(tex, canvasSource(8, 8)),
+      /updateTexture: write_texture: expected 32 bytes, got 256/);
+    assert.deepEqual(t.calls.slice(1), [['update_source', tex, 8, 8], ['update', tex, 256]]);
+    assert.ok(t.logs.some(([l, s]) => l === 1 && s.includes('a 8x8 image for a 4x2 mip')));
+    assert.equal(t.uploads.length, 1, 'the mismatched source never reaches the texture');
+  });
+});
+
+test('createTexture({width, height, clear}) fills on the GPU and checks its arguments', async () => {
+  const t = await makeTextureEngine('webgl2');
+  await t.withGlobals(() => {
+    assert.equal(t.engine.createTexture({ width: 512, height: 717, clear: [0.9, 0.88, 0.8, 1] }), 77);
+    assert.equal(t.engine.createTexture({ width: 2, height: 3, clear: new Float32Array([0, 0.5, 1, 0.25]) }, { srgb: false }), 77);
+    assert.deepEqual(t.calls, [['clear', 512, 717, 1, 0.9, 0.88, 0.8, 1], ['clear', 2, 3, 0, 0, 0.5, 1, 0.25]]);
+    for (const bad of [
+      { width: 0, height: 4, clear: [0, 0, 0, 1] },
+      { width: 4.5, height: 4, clear: [0, 0, 0, 1] },
+      { width: 4, height: 4, clear: [0, 0, 1] },
+      { width: 4, height: 4, clear: [0, 0, Number.NaN, 1] },
+      { width: 4, height: 4, clear: 'red!' },
+    ]) {
+      assert.throws(() => t.engine.createTexture(bad), /a cleared texture takes/, JSON.stringify(bad));
+    }
+    assert.equal(t.calls.length, 2);
+    assert.equal(t.readbacks.length, 0);
+  });
+});
+
+test('the WebGPU source copy checks the slot and the size before copying', async () => {
+  const copies = [];
+  const device = new Proxy({
+    lost: new Promise(() => {}),
+    queue: { copyExternalImageToTexture: (...args) => copies.push(args) },
+    createTexture: (desc) => ({ desc, destroy() {} }),
+  }, { get: (target, prop) => (prop in target ? target[prop] : () => ({})) });
+  const host = await withGlobals({
+    GPUShaderStage: { VERTEX: 1, FRAGMENT: 2, COMPUTE: 4 },
+    GPUBufferUsage: { UNIFORM: 0x40, COPY_DST: 0x08 },
+  }, () => createHost({ api: 'webgpu', device, canvas: null, context: null }));
+  const memory = new WebAssembly.Memory({ initial: 1 });
+  host.attach({ exports: { memory } });
+  const g = host.imports.ganbate;
+  const lastError = () => new TextDecoder().decode(new Uint8Array(memory.buffer, 0, g.gpu_last_error(0, 256)));
+  const tex = g.gpu_create_texture(4, 2, 1, 3, 1, 0);
+  assert.equal(g.gpu_copy_source(tex, 0, 0, 4, 2), 0);
+  assert.match(lastError(), /copyExternalImageToTexture: no source image is set/);
+  host.setSource(canvasSource(4, 2));
+  assert.equal(g.gpu_copy_source(tex, 1, 0, 2, 1), 0);
+  assert.match(lastError(), /the source image is 4x2, not 2x1/);
+  assert.equal(copies.length, 0);
+  assert.equal(g.gpu_copy_source(tex, 0, 0, 4, 2), 1);
+  assert.equal(copies.length, 1);
+});
+
 test('glContext and setXrTarget support WebXR stereo eye framebuffer blits on WebGL 2 and restore canvas blit', async () => {
   const { canvas, gl, recorded, constants } = makeRecordingWebGl2Canvas(640, 360);
   let glSubmit = null;
@@ -485,4 +783,25 @@ test('web/ganbate.d.ts and compiled ganbate_web.wasm expose Wave 8 ray-picking a
   );
   assert.ok(exportedFns.has('ganbate_rt_pick_ray'), 'missing WASM export ganbate_rt_pick_ray');
   assert.ok(exportedFns.has('ganbate_rt_pick_world_ray'), 'missing WASM export ganbate_rt_pick_world_ray');
+});
+
+test('both hosts provide every import of the compiled ganbate_web.wasm, which has the texture source exports', async () => {
+  const wasmPath = path.join(REPO_ROOT, 'target', 'wasm32-unknown-unknown', 'release', 'ganbate_web.wasm');
+  if (!fs.existsSync(wasmPath)) return;
+  const mod = new WebAssembly.Module(fs.readFileSync(wasmPath));
+  const exported = new Set(WebAssembly.Module.exports(mod).map((e) => e.name));
+  for (const name of ['ganbate_rt_texture_create_source', 'ganbate_rt_texture_update_source', 'ganbate_rt_texture_create_clear']) {
+    assert.ok(exported.has(name), `missing WASM export ${name}`);
+  }
+  const { gl, canvas } = makeRecordingWebGl2Canvas();
+  const glHost = createGlHost({ api: 'webgl2', gl, ext: {}, canvas, adapterName: 'mock', features: [], format: 'rgba8unorm' });
+  const gpuHost = await withGlobals({
+    GPUShaderStage: { VERTEX: 1, FRAGMENT: 2, COMPUTE: 4 },
+    GPUBufferUsage: { UNIFORM: 0x40, COPY_DST: 0x08 },
+  }, () => createHost({ api: 'webgpu', device: new Proxy({ lost: new Promise(() => {}) }, { get: (t, p) => (p in t ? t[p] : () => ({})) }), canvas: null, context: null }));
+  const needed = WebAssembly.Module.imports(mod).filter((i) => i.module === 'ganbate').map((i) => i.name);
+  assert.ok(needed.includes('gpu_copy_source') && needed.includes('gl_write_texture_source'));
+  for (const host of [glHost, gpuHost]) {
+    for (const name of needed) assert.equal(typeof host.imports.ganbate[name], 'function', `host lacks ${name}`);
+  }
 });
