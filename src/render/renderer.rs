@@ -116,7 +116,9 @@ impl Quality {
     pub fn realtime() -> Self {
         Self {
             shadow_size: 2048,
-            reflection_scale: 0.5,
+            // A quarter of the view: the water's ripples blur the mirror past that detail, and at
+            // half the pass cost the table 6 ms of an 18 ms frame (780x1328, Radeon 780M).
+            reflection_scale: 0.25,
             ao_scale: 0.5,
             ao_samples: 8,
             tile_size: 32,
@@ -136,7 +138,7 @@ impl Quality {
     pub fn hybrid_stage() -> Self {
         Self {
             shadow_size: 1024,
-            reflection_scale: 0.35,
+            reflection_scale: 0.2,
             ao_scale: 0.25,
             ao_samples: 0,
             tile_size: 32,
