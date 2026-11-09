@@ -229,14 +229,19 @@ enum WorldPart {
     Opaque,
     /// The alpha-tested draws, in scene order.
     Masked,
-    /// The water, in scene order (its surface moves, so a cached world leaves it out).
+    /// The water without an alpha test, in scene order (its surface moves, so a cached world
+    /// leaves it out; it takes the pipeline that never discards, so what stands in front of it
+    /// hides it before it is shaded).
     Water,
+    /// The water with an alpha test.
+    MaskedWater,
 }
 
 pub(super) struct Pipelines {
     pub(super) scene: PipelineId,
-    /// The scene shading without the alpha test, for opaque world surfaces in the main view: a
-    /// shader that never discards lets the GPU drop hidden fragments before shading them.
+    /// The scene shading without the alpha test, for opaque world surfaces and the water in the
+    /// main view: a shader that never discards lets the GPU drop hidden fragments before shading
+    /// them.
     scene_opaque: PipelineId,
     /// The scene shading for props (model-space vertices placed per instance).
     pub(super) scene_prop: PipelineId,
@@ -2219,11 +2224,13 @@ impl Renderer {
                 continue;
             }
             // Without an alpha test and off the water, a draw is opaque.
-            let opaque = !d.water && self.scene.materials[d.material].params[0] < 0.0;
+            let solid = self.scene.materials[d.material].params[0] < 0.0;
+            let opaque = !d.water && solid;
             match part {
                 WorldPart::Opaque if !opaque => continue,
                 WorldPart::Masked if opaque || d.water => continue,
-                WorldPart::Water if !d.water => continue,
+                WorldPart::Water if !d.water || !solid => continue,
+                WorldPart::MaskedWater if !d.water || solid => continue,
                 _ => {}
             }
             total += 1;
@@ -2694,10 +2701,16 @@ impl Renderer {
             enc.set_bind_group(0, slot.scene[0]);
             count(self.draw_world(enc, &mut push, &eye, true, WorldPart::Masked));
         }
-        // The water moves with the clock, so it is drawn every frame.
-        enc.set_pipeline(p.scene);
+        // The water moves with the clock, so it is drawn every frame. Without an alpha test it
+        // never discards, so the floor and the table in front of it hide it before it is
+        // shaded: behind the room it spans the whole view.
+        enc.set_pipeline(p.scene_opaque);
         enc.set_bind_group(0, slot.scene[0]);
         count(self.draw_world(enc, &mut push, &eye, true, WorldPart::Water));
+        enc.set_pipeline(p.scene);
+        enc.set_bind_group(0, slot.scene[0]);
+        count(self.draw_world(enc, &mut push, &eye, true, WorldPart::MaskedWater));
+
         stats.world_cached = cached && !rebuild;
         stats.world_draws_total = total_draws;
         stats.world_draws_submitted = submitted_draws;
