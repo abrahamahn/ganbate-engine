@@ -16,10 +16,12 @@
 //!
 //! Handles are generational: using one after its object was destroyed is an error, never a
 //! different object.
+use std::collections::HashMap;
+
 use super::View;
 use super::look::SurfaceModel;
 use super::math::{self, M4, V3};
-use super::renderer::Renderer;
+use super::renderer::{Fnv, Renderer};
 use super::scene::MaterialData;
 use crate::gpu::pool::Pool;
 use crate::gpu::{
@@ -373,6 +375,11 @@ pub(super) struct MeshEntry {
     max: V3,
     /// A skinned mesh's records in the shared skin buffer.
     skin: Option<SkinRange>,
+    /// Counts changes to its vertices or skin, which its instances' pictures follow.
+    revision: u32,
+    /// A skinned mesh's per-joint bind-space bounds ([`joint_boxes`]): where its instances'
+    /// posed vertices can lie.
+    joint_boxes: Vec<Option<(V3, V3)>>,
 }
 
 /// Where a skinned mesh's vertices' joints and weights lie in the shared skin records.
@@ -391,6 +398,8 @@ pub(super) struct MaterialEntry {
     group: BindGroupId,
     shadow_group: Option<BindGroupId>,
     detail: [f32; 16],
+    /// Counts changes to it, which the pictures of instances using it follow.
+    revision: u32,
 }
 
 impl MaterialEntry {
@@ -424,6 +433,15 @@ struct InstanceEntry {
     pick: u32,
     /// A skinned mesh's joint matrices for this instance (empty: drawn as modelled).
     joints: Vec<M4>,
+    /// What its picture depends on as of the last frame ([`signature`]), and for how many
+    /// frames since then it has stayed the same.
+    sig: u64,
+    still: u32,
+    /// Its world bounds as drawn this frame and the last (none while hidden or incomplete).
+    world_bounds: Option<(V3, V3)>,
+    prev_bounds: Option<(V3, V3)>,
+    /// Where its image and shadows lie in the cached picture, while it is drawn there.
+    cached: Option<Rect>,
 }
 
 /// One instanced draw of this frame: instances `first..first + count` of the buffer.
@@ -434,6 +452,260 @@ pub(super) struct Batch {
     first: u32,
     count: u32,
     layer: Layer,
+    /// Its instances are drawn into the cached picture rather than over it each frame.
+    settled: bool,
+}
+
+/// Which opaque prop batches a draw takes: all of them, those in the cached picture, or those
+/// drawn over it each frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PropSet {
+    All,
+    Settled,
+    Live,
+}
+
+impl PropSet {
+    fn takes(self, b: &Batch) -> bool {
+        match self {
+            Self::All => true,
+            Self::Settled => b.settled,
+            Self::Live => !b.settled,
+        }
+    }
+}
+
+/// A region of the picture in pixels: left, top, right, bottom (exclusive).
+pub(super) type Rect = [u32; 4];
+
+/// Frames an instance stays the same before it is drawn into the cached picture: what moves now
+/// and then (a card dealt, a chip pushed) stays live while it moves and a little after.
+const SETTLE_FRAMES: u32 = 8;
+
+/// What an instance's picture depends on besides the frame: where and how it is drawn, its
+/// joints, and its mesh, material and textures as they stand.
+fn signature(
+    inst: &InstanceEntry,
+    mesh: &MeshEntry,
+    mat: &MaterialEntry,
+    edits: &HashMap<u32, u32>,
+) -> u64 {
+    let mut h = Fnv::new();
+    h.write(&[u8::from(inst.visible)]);
+    h.write(&f32_bytes(&inst.model));
+    h.write(&f32_bytes(&inst.tint));
+    for j in &inst.joints {
+        h.write(&f32_bytes(j));
+    }
+    for n in [inst.mesh.0, mesh.revision, inst.material.0, mat.revision] {
+        h.write(&n.to_le_bytes());
+    }
+    let d = &mat.desc;
+    for t in [d.base_texture, d.normal_texture, d.emissive_texture]
+        .into_iter()
+        .flatten()
+    {
+        h.write(&t.0.to_le_bytes());
+        h.write(&edits.get(&t.0).copied().unwrap_or(0).to_le_bytes());
+    }
+    h.finish()
+}
+
+/// Whether an instance is drawn into the cached picture: a shown opaque scene prop that has
+/// stayed the same for a few frames (not water, whose surface moves with the clock).
+fn settles(inst: &InstanceEntry, mat: &MaterialEntry) -> bool {
+    inst.still >= SETTLE_FRAMES
+        && inst.world_bounds.is_some()
+        && mat.layer() == Layer::Opaque
+        && mat.desc.shading != Shading::Water
+}
+
+/// The pixels the points cover in a `size` picture seen through `view_proj`, widened by
+/// `margin` pixels; all of it when one lies behind the eye.
+pub(super) fn screen_rect(
+    points: &[V3],
+    view_proj: &M4,
+    size: (u32, u32),
+    margin: f32,
+) -> Option<Rect> {
+    let (w, h) = (size.0 as f32, size.1 as f32);
+    let (mut lo, mut hi) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+    for p in points {
+        let c = math::transform(view_proj, [p[0], p[1], p[2], 1.0]);
+        if c[3] <= 1e-4 {
+            return Some([0, 0, size.0, size.1]);
+        }
+        let x = (c[0] / c[3] * 0.5 + 0.5) * w;
+        let y = (c[1] / c[3] * 0.5 + 0.5) * h;
+        lo = [lo[0].min(x), lo[1].min(y)];
+        hi = [hi[0].max(x), hi[1].max(y)];
+    }
+    let r = [
+        (lo[0] - margin).floor().clamp(0.0, w) as u32,
+        (lo[1] - margin).floor().clamp(0.0, h) as u32,
+        (hi[0] + margin).ceil().clamp(0.0, w) as u32,
+        (hi[1] + margin).ceil().clamp(0.0, h) as u32,
+    ];
+    (r[0] < r[2] && r[1] < r[3]).then_some(r)
+}
+
+pub(super) fn corners((lo, hi): (V3, V3)) -> [V3; 8] {
+    std::array::from_fn(|c| {
+        [
+            if c & 1 == 0 { lo[0] } else { hi[0] },
+            if c & 2 == 0 { lo[1] } else { hi[1] },
+            if c & 4 == 0 { lo[2] } else { hi[2] },
+        ]
+    })
+}
+
+/// The smallest region holding both.
+pub(super) fn union(a: Rect, b: Rect) -> Rect {
+    [
+        a[0].min(b[0]),
+        a[1].min(b[1]),
+        a[2].max(b[2]),
+        a[3].max(b[3]),
+    ]
+}
+
+/// What the cached picture is drawn for: the eye and the picture size.
+pub(super) struct CacheView<'a> {
+    pub(super) view_proj: &'a M4,
+    pub(super) size: (u32, u32),
+}
+
+/// What changed in the cached picture this frame ([`track_cached_props`]).
+#[derive(Default)]
+pub(super) struct CacheChanges {
+    /// Regions to empty and draw again: where an instance entered or left the picture.
+    pub(super) regions: Vec<Rect>,
+    /// Where props that cast shadows moved (or changed, came or went): their bounds last frame
+    /// and now, overlapping ones joined. The picture's pixels their shadows can reach are
+    /// shaded again ([`Renderer::reshade`]).
+    pub(super) moved: Vec<(V3, V3)>,
+    /// The bounds of the props the picture holds.
+    pub(super) settled: Vec<(V3, V3)>,
+}
+
+/// Boxes that overlap joined into one, so casters moving together are followed as one.
+pub(super) fn merge_boxes(mut boxes: Vec<(V3, V3)>) -> Vec<(V3, V3)> {
+    let overlap = |a: &(V3, V3), b: &(V3, V3)| (0..3).all(|k| a.0[k] <= b.1[k] && b.0[k] <= a.1[k]);
+    let mut merged = true;
+    while merged {
+        merged = false;
+        'scan: for i in 0..boxes.len() {
+            for j in i + 1..boxes.len() {
+                if overlap(&boxes[i], &boxes[j]) {
+                    let b = boxes.swap_remove(j);
+                    let a = &mut boxes[i];
+                    for k in 0..3 {
+                        a.0[k] = a.0[k].min(b.0[k]);
+                        a.1[k] = a.1[k].max(b.1[k]);
+                    }
+                    merged = true;
+                    break 'scan;
+                }
+            }
+        }
+    }
+    boxes
+}
+
+/// Follows the props into and out of the cached picture for this frame: the regions of it to
+/// draw again where an instance entered or left it, and where opaque props moved (their
+/// shadows on what it holds change). `full` when the whole picture is drawn again: the records
+/// are then made afresh and nothing is returned.
+pub(super) fn track_cached_props(
+    props: &mut Props,
+    full: bool,
+    view: &CacheView<'_>,
+) -> CacheChanges {
+    let mut regions = std::mem::take(&mut props.vacated);
+    let mut moved = std::mem::take(&mut props.vacated_boxes);
+    let mut settled = vec![];
+    for (_, inst) in props.instances.iter_mut() {
+        let Some(mat) = props.materials.get(inst.material.0) else {
+            regions.extend(inst.cached.take());
+            continue;
+        };
+        if settles(inst, mat) {
+            if full || inst.cached.is_none() {
+                let image = inst
+                    .world_bounds
+                    .and_then(|b| screen_rect(&corners(b), view.view_proj, view.size, 2.0));
+                regions.extend(image);
+                inst.cached = Some(image.unwrap_or_default());
+            }
+            settled.extend(inst.world_bounds);
+        } else {
+            regions.extend(inst.cached.take());
+            if inst.still == 0 && mat.layer() == Layer::Opaque {
+                moved.extend(inst.prev_bounds.into_iter().chain(inst.world_bounds));
+            }
+        }
+    }
+    if full {
+        return CacheChanges {
+            settled,
+            ..CacheChanges::default()
+        };
+    }
+    regions.retain(|r| r[0] < r[2] && r[1] < r[3]);
+    CacheChanges {
+        regions,
+        moved: merge_boxes(moved),
+        settled,
+    }
+}
+
+/// Per joint, the bind-space bounds of the vertices it moves (`records`: per vertex its joints
+/// and weights, as [`Renderer::set_prop_mesh_skin`] packs them).
+fn joint_boxes(positions: &[V3], records: &[[f32; 4]]) -> Vec<Option<(V3, V3)>> {
+    let mut boxes: Vec<Option<(V3, V3)>> = vec![];
+    for (p, pair) in positions.iter().zip(records.chunks_exact(2)) {
+        for (j, w) in pair[0].iter().zip(pair[1]) {
+            if w <= 0.0 {
+                continue;
+            }
+            let j = *j as usize;
+            if boxes.len() <= j {
+                boxes.resize(j + 1, None);
+            }
+            let b = boxes[j].get_or_insert((*p, *p));
+            *b = (
+                std::array::from_fn(|k| b.0[k].min(p[k])),
+                std::array::from_fn(|k| b.1[k].max(p[k])),
+            );
+        }
+    }
+    boxes
+}
+
+/// World bounds of an instance as drawn: its mesh's bounds placed by its model, or for a skinned
+/// one posed by its joints, each joint's share of the mesh moved by that joint.
+fn posed_bounds(inst: &InstanceEntry, mesh: &MeshEntry) -> (V3, V3) {
+    fn add(out: &mut (V3, V3), m: &M4, b: (V3, V3)) {
+        for p in corners(b) {
+            let w = math::transform_point(m, p);
+            *out = (
+                std::array::from_fn(|k| out.0[k].min(w[k])),
+                std::array::from_fn(|k| out.1[k].max(w[k])),
+            );
+        }
+    }
+    let mut out = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    if mesh.skin.is_some() && !inst.joints.is_empty() {
+        for (joint, b) in inst.joints.iter().zip(&mesh.joint_boxes) {
+            if let Some(b) = b {
+                add(&mut out, &math::mul(&inst.model, joint), *b);
+            }
+        }
+    }
+    if out.0[0] > out.1[0] {
+        add(&mut out, &inst.model, (mesh.min, mesh.max));
+    }
+    out
 }
 
 /// A game's prop shader: its compiled stages and the overlay pipelines made from them so far.
@@ -486,6 +758,13 @@ pub(super) struct Props {
     capacity: u32,
     /// Joint matrices each slot's joint buffer holds.
     joint_capacity: u32,
+    /// Edits of each prop texture's pixels (by handle), which the pictures of the props using
+    /// it follow.
+    texture_edits: HashMap<u32, u32>,
+    /// Regions of the cached picture held by instances destroyed since the last frame.
+    vacated: Vec<Rect>,
+    /// Bounds of the instances destroyed since the last frame (their shadows are drawn away).
+    vacated_boxes: Vec<(V3, V3)>,
     /// Every skinned mesh's vertices' joints and weights, packed in mesh order of creation.
     skin_records: Vec<[f32; 4]>,
     /// Their GPU copy (and how many records it holds), rewritten when `skin_dirty`.
@@ -494,6 +773,16 @@ pub(super) struct Props {
     batches: Vec<Batch>,
     /// World bounds of this frame's visible instances.
     bounds: Option<(V3, V3)>,
+}
+
+impl Props {
+    /// Removes an instance; what it held in the cached picture is drawn again.
+    fn remove_instance(&mut self, id: u32) {
+        if let Some(i) = self.instances.remove(id) {
+            self.vacated.extend(i.cached);
+            self.vacated_boxes.extend(i.world_bounds);
+        }
+    }
 }
 
 fn normal_matrix(m: &M4) -> M4 {
@@ -794,6 +1083,8 @@ impl Renderer {
     ) -> Result<()> {
         let t = self.prop_texture_id(Some(texture), self.dummy)?;
         device.write_texture(t, 0, 0, rgba)?;
+        let edits = self.props.texture_edits.entry(texture.0).or_default();
+        *edits = edits.wrapping_add(1);
         device.generate_mips(t)
     }
 
@@ -802,6 +1093,7 @@ impl Renderer {
         if let Some(t) = self.props.textures.remove(texture.0) {
             device.destroy_texture(t);
         }
+        self.props.texture_edits.remove(&texture.0);
     }
 
     pub fn create_prop_mesh(
@@ -849,6 +1141,8 @@ impl Renderer {
             min,
             max,
             skin: None,
+            revision: 0,
+            joint_boxes: vec![],
         };
         Ok(PropMesh(self.props.meshes.insert(entry)?))
     }
@@ -892,10 +1186,13 @@ impl Renderer {
                 }
             }
         }
+        let boxes = joint_boxes(&m.positions, &records);
         self.drop_prop_mesh_skin(mesh);
         let first = self.props.skin_records.len() as u32;
         self.props.skin_records.extend(records);
         if let Some(m) = self.props.meshes.get_mut(mesh.0) {
+            m.revision = m.revision.wrapping_add(1);
+            m.joint_boxes = boxes;
             m.skin = Some(SkinRange {
                 first,
                 count: (n * 2) as u32,
@@ -951,6 +1248,12 @@ impl Renderer {
         device.write_buffer(m.vertices, 0, &f32_bytes(&data))?;
         m.positions.copy_from_slice(positions);
         (m.min, m.max) = bounds(positions);
+        m.revision = m.revision.wrapping_add(1);
+        if let Some(skin) = m.skin {
+            let records = &self.props.skin_records;
+            let range = skin.first as usize..(skin.first + skin.count) as usize;
+            m.joint_boxes = joint_boxes(&m.positions, &records[range]);
+        }
         Ok(())
     }
 
@@ -987,6 +1290,23 @@ impl Renderer {
         device.write_buffer(m.vertices, first as u64 * 32, &f32_bytes(&data))?;
         m.positions[first..end].copy_from_slice(positions);
         (m.min, m.max) = bounds(&m.positions);
+        m.revision = m.revision.wrapping_add(1);
+        // A morph each frame: its joints' bounds only widen to hold the moved vertices (they
+        // stay bounds; a full update makes them afresh).
+        if let Some(skin) = m.skin {
+            let records = &self.props.skin_records;
+            let at = skin.first as usize + first * 2;
+            let moved = joint_boxes(positions, &records[at..at + positions.len() * 2]);
+            for (held, b) in m.joint_boxes.iter_mut().zip(moved) {
+                if let Some(b) = b {
+                    let h = held.get_or_insert(b);
+                    *h = (
+                        std::array::from_fn(|k| h.0[k].min(b.0[k])),
+                        std::array::from_fn(|k| h.1[k].max(b.1[k])),
+                    );
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1002,7 +1322,7 @@ impl Renderer {
                 .map(|(id, _)| id)
                 .collect();
             for id in users {
-                self.props.instances.remove(id);
+                self.props.remove_instance(id);
             }
             device.destroy_buffer(m.vertices);
             device.destroy_buffer(m.indices);
@@ -1106,6 +1426,7 @@ impl Renderer {
             group,
             shadow_group,
             detail: super::renderer::detail_block(&self.look, &desc.name).0,
+            revision: 0,
         })
     }
 
@@ -1180,7 +1501,10 @@ impl Renderer {
             .materials
             .get_mut(material.0)
             .ok_or_else(|| format!("{material:?} was destroyed"))?;
-        m.desc.params = *params;
+        if m.desc.params != *params {
+            m.desc.params = *params;
+            m.revision = m.revision.wrapping_add(1);
+        }
         Ok(())
     }
 
@@ -1204,8 +1528,10 @@ impl Renderer {
             return Err(format!("{material:?} was destroyed"));
         }
         let entry = self.material_entry(device, desc)?;
-        if let Some(old) = self.props.materials.get_mut(material.0) {
-            let old = std::mem::replace(old, entry);
+        if let Some(held) = self.props.materials.get_mut(material.0) {
+            let revision = held.revision.wrapping_add(1);
+            let old = std::mem::replace(held, entry);
+            held.revision = revision;
             device.destroy_bind_group(old.group);
             if let Some(g) = old.shadow_group {
                 device.destroy_bind_group(g);
@@ -1234,7 +1560,7 @@ impl Renderer {
                 .map(|(id, _)| id)
                 .collect();
             for id in users {
-                self.props.instances.remove(id);
+                self.props.remove_instance(id);
             }
             device.destroy_bind_group(m.group);
             if let Some(g) = m.shadow_group {
@@ -1265,6 +1591,11 @@ impl Renderer {
             visible: true,
             pick: 1,
             joints: vec![],
+            sig: 0,
+            still: 0,
+            world_bounds: None,
+            prev_bounds: None,
+            cached: None,
         };
         Ok(PropInstance(self.props.instances.insert(entry)?))
     }
@@ -1365,7 +1696,7 @@ impl Renderer {
     }
 
     pub fn destroy_prop_instance(&mut self, instance: PropInstance) {
-        self.props.instances.remove(instance.0);
+        self.props.remove_instance(instance.0);
     }
 
     /// Live prop instances.
@@ -1531,6 +1862,7 @@ impl Renderer {
     ) -> Result<()> {
         struct Live<'a> {
             layer: Layer,
+            settled: bool,
             order: f32,
             /// Negative squared distance: far first.
             far: f32,
@@ -1538,33 +1870,55 @@ impl Renderer {
             mesh: u32,
             inst: &'a InstanceEntry,
         }
+        // What each instance's picture depends on now, how long that has held, and its bounds.
+        {
+            let Props {
+                instances,
+                meshes,
+                materials,
+                texture_edits,
+                ..
+            } = &mut self.props;
+            for (_, inst) in instances.iter_mut() {
+                let (Some(m), Some(mat)) =
+                    (meshes.get(inst.mesh.0), materials.get(inst.material.0))
+                else {
+                    inst.world_bounds = None;
+                    inst.still = 0;
+                    continue;
+                };
+                let sig = signature(inst, m, mat, texture_edits);
+                inst.still = if sig == inst.sig {
+                    inst.still.saturating_add(1)
+                } else {
+                    0
+                };
+                inst.sig = sig;
+                let posed = inst.visible.then(|| posed_bounds(inst, m));
+                inst.prev_bounds = std::mem::replace(&mut inst.world_bounds, posed);
+            }
+        }
         let mut lo = [f32::INFINITY; 3];
         let mut hi = [f32::NEG_INFINITY; 3];
         let mut live: Vec<Live> = Vec::new();
         for (_, inst) in self.props.instances.iter() {
-            let (Some(m), Some(mat)) = (
-                self.props.meshes.get(inst.mesh.0),
+            let (Some(mat), Some(m), true) = (
                 self.props.materials.get(inst.material.0),
+                self.props.meshes.get(inst.mesh.0),
+                inst.world_bounds.is_some(),
             ) else {
                 continue;
             };
-            if !inst.visible {
-                continue;
-            }
-            let layer = mat.layer();
+            // The frame's prop bounds (which fit the shadow cascades) as modelled, not posed.
             let (mut blo, mut bhi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
-            for corner in 0..8 {
-                let p = [
-                    if corner & 1 == 0 { m.min[0] } else { m.max[0] },
-                    if corner & 2 == 0 { m.min[1] } else { m.max[1] },
-                    if corner & 4 == 0 { m.min[2] } else { m.max[2] },
-                ];
+            for p in corners((m.min, m.max)) {
                 let w = math::transform_point(&inst.model, p);
                 for k in 0..3 {
                     blo[k] = blo[k].min(w[k]);
                     bhi[k] = bhi[k].max(w[k]);
                 }
             }
+            let layer = mat.layer();
             if layer != Layer::Overlay {
                 for k in 0..3 {
                     lo[k] = lo[k].min(blo[k]);
@@ -1575,6 +1929,7 @@ impl Renderer {
             let to = math::sub(centre, eye);
             live.push(Live {
                 layer,
+                settled: settles(inst, mat),
                 order: if layer == Layer::Opaque {
                     0.0
                 } else {
@@ -1593,6 +1948,7 @@ impl Renderer {
         live.sort_by(|a, b| {
             a.layer
                 .cmp(&b.layer)
+                .then(a.settled.cmp(&b.settled))
                 .then(a.order.total_cmp(&b.order))
                 .then(a.far.total_cmp(&b.far))
                 .then((a.material, a.mesh).cmp(&(b.material, b.mesh)))
@@ -1605,6 +1961,7 @@ impl Renderer {
                 Some(b)
                     if l.layer == Layer::Opaque
                         && b.layer == Layer::Opaque
+                        && b.settled == l.settled
                         && b.material == l.material
                         && b.mesh == l.mesh =>
                 {
@@ -1616,6 +1973,7 @@ impl Renderer {
                     first: n as u32,
                     count: 1,
                     layer: l.layer,
+                    settled: l.settled,
                 }),
             }
             data.extend_from_slice(&l.inst.model);
@@ -1889,43 +2247,48 @@ impl Renderer {
         push
     }
 
-    /// Draws this frame's opaque prop batches with the scene shading (`view` 0 main, 1
-    /// reflection).
-    pub(super) fn draw_props(&self, enc: &mut crate::gpu::Encoder, slot: usize, view: usize) {
+    /// Draws this frame's opaque prop batches in `set` with the scene shading (`view` 0 main,
+    /// 1 reflection).
+    pub(super) fn draw_props(
+        &self,
+        enc: &mut crate::gpu::Encoder,
+        slot: usize,
+        view: usize,
+        set: PropSet,
+    ) {
         let Some(Some(s)) = self.props.slots.get(slot) else {
             return;
         };
-        if !self.props.batches.iter().any(|b| b.layer == Layer::Opaque) {
+        let opaque = |b: &&Batch| b.layer == Layer::Opaque && set.takes(b);
+        if !self.props.batches.iter().any(|b| opaque(&b)) {
             return;
         }
         // In the main view, materials without an alpha test take the pipeline that never
         // discards (so hidden fragments are dropped before shading); the reflection keeps the
         // clip under the water, so it draws everything with the cutting one.
+        // The settled props draw only into the cached picture, with its shadow target.
+        let (opaque_pipeline, cut_pipeline) = if set == PropSet::Settled {
+            (self.pipelines.cache_prop[1], self.pipelines.cache_prop[0])
+        } else {
+            (self.pipelines.scene_prop_opaque, self.pipelines.scene_prop)
+        };
         let groups: Vec<(crate::gpu::PipelineId, Option<bool>)> = if view == 0 {
-            vec![
-                (self.pipelines.scene_prop_opaque, Some(true)),
-                (self.pipelines.scene_prop, Some(false)),
-            ]
+            vec![(opaque_pipeline, Some(true)), (cut_pipeline, Some(false))]
         } else {
             vec![(self.pipelines.scene_prop, None)]
         };
-        for (pipeline, opaque) in groups {
+        for (pipeline, no_cut) in groups {
             enc.set_pipeline(pipeline);
             enc.set_bind_group(0, s.scene[view]);
             let mut bound = None;
-            for b in self
-                .props
-                .batches
-                .iter()
-                .filter(|b| b.layer == Layer::Opaque)
-            {
+            for b in self.props.batches.iter().filter(opaque) {
                 let (Some(mesh), Some(mat)) = (
                     self.props.meshes.get(b.mesh),
                     self.props.materials.get(b.material),
                 ) else {
                     continue;
                 };
-                if opaque.is_some_and(|o| o != (mat.data.params[0] < 0.0)) {
+                if no_cut.is_some_and(|o| o != (mat.data.params[0] < 0.0)) {
                     continue;
                 }
                 if view == 1 && mat.data.params[3] == 2.0 {
@@ -2050,6 +2413,10 @@ impl Renderer {
         }
         self.props.instances.drain();
         self.props.batches.clear();
+        self.props.vacated.clear();
+        self.props.vacated_boxes.clear();
+        self.props.texture_edits.clear();
+        self.forget_world_cache();
     }
 }
 
@@ -2120,6 +2487,7 @@ mod tests {
             group: BindGroupId::from_raw(1),
             shadow_group: None,
             detail: [0.0; 16],
+            revision: 0,
         }
     }
 
@@ -2141,6 +2509,8 @@ mod tests {
             min,
             max,
             skin: None,
+            revision: 0,
+            joint_boxes: vec![],
         }
     }
 
@@ -2150,6 +2520,45 @@ mod tests {
         m[13] = y;
         m[14] = z;
         m
+    }
+
+    #[test]
+    fn posed_bounds_follow_the_joints_of_a_skinned_prop() {
+        // Two vertices, one on each joint; joint 1 lifts its vertex 3 m.
+        let mut mesh = z_quad_mesh_entry(0.5);
+        mesh.positions = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
+        mesh.skin = Some(SkinRange {
+            first: 0,
+            count: 4,
+            max_joint: 1,
+        });
+        let records = [
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+        ];
+        mesh.joint_boxes = joint_boxes(&mesh.positions, &records);
+        let model = translation_matrix(10.0, 0.0, 0.0);
+        let inst = InstanceEntry {
+            mesh: PropMesh::from_raw(1),
+            material: PropMaterial::from_raw(1),
+            model,
+            normal: normal_matrix(&model),
+            tint: [1.0; 4],
+            visible: true,
+            pick: 0,
+            joints: vec![math::IDENTITY, translation_matrix(0.0, 3.0, 0.0)],
+            sig: 0,
+            still: 0,
+            world_bounds: None,
+            prev_bounds: None,
+            cached: None,
+        };
+        assert_eq!(
+            posed_bounds(&inst, &mesh),
+            ([10.0, 0.0, 0.0], [11.0, 3.0, 0.0])
+        );
     }
 
     #[test]
@@ -2191,6 +2600,11 @@ mod tests {
                     visible: true,
                     pick: 0b0001,
                     joints: Vec::new(),
+                    sig: 0,
+                    still: 0,
+                    world_bounds: None,
+                    prev_bounds: None,
+                    cached: None,
                 })
                 .unwrap(),
         );
@@ -2208,6 +2622,11 @@ mod tests {
                     visible: true,
                     pick: 0b0010,
                     joints: Vec::new(),
+                    sig: 0,
+                    still: 0,
+                    world_bounds: None,
+                    prev_bounds: None,
+                    cached: None,
                 })
                 .unwrap(),
         );
@@ -2254,6 +2673,11 @@ mod tests {
                     visible: true,
                     pick: 0b0100,
                     joints: Vec::new(),
+                    sig: 0,
+                    still: 0,
+                    world_bounds: None,
+                    prev_bounds: None,
+                    cached: None,
                 })
                 .unwrap(),
         );

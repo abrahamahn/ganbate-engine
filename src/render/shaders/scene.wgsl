@@ -30,6 +30,12 @@ struct Light {
 };
 
 @group(0) @binding(1) var<storage, read> lights: array<Light>;
+
+// What this pixel's shading took from the shadows props can move: the key light's (`shadow`;
+// w = 1 once taken) and a game's shadowed lights' (layers 0, 1; 1 where a light does not reach
+// or shade it). The cached picture keeps them (`CacheOut::shadow`) so a frame can tell which
+// of its pixels moved props changed (`fs_reshade_mask`).
+var<private> cast_shadows: vec4f = vec4f(1.0, 1.0, 1.0, 0.0);
 @group(0) @binding(2) var<storage, read> tiles: array<vec2u>;
 @group(0) @binding(3) var<storage, read> light_index: array<u32>;
 @group(0) @binding(4) var shadow_map: texture_depth_2d_array;
@@ -175,6 +181,110 @@ fn shadow_taps(world: vec3f, n: vec3f, dist: f32, frag: vec2f, count: i32) -> f3
   return select(s1, 1.0, s1 < 0.0);
 }
 
+// ---------------------------------------------------------------- re-shading the cached picture
+
+// Per entry, a moved prop's footprint in one shadow map (`Renderer::reshade_plan`): its
+// clip-space rect (xy min, xy max), then its nearest depth and the map (0, 1 the key light's
+// cascades; 2, 3 a game's shadowed lights).
+struct Reshade {
+  head: vec4u,              // entries, then the light buffer index + 1 of a game's shadowed
+                            // lights (layers 0, 1; 0: none), unused
+  entries: array<vec4f, 64>,
+};
+
+@group(0) @binding(15) var cache_depth: texture_depth_2d;
+@group(0) @binding(16) var cache_aux: texture_2d<f32>;
+@group(0) @binding(17) var<uniform> reshade: Reshade;
+@group(0) @binding(18) var cache_shadow: texture_2d<f32>;
+
+struct Marked {
+  @builtin(frag_depth) depth: f32,
+};
+
+// Whether a lookup at `c` (clip coordinates in shadow map `map`) can see what moved: inside a
+// footprint and behind its nearest point.
+fn moved_footprint(map: u32, c: vec4f) -> bool {
+  if (c.w <= 1e-6) {
+    return true;
+  }
+  let q = c.xyz / c.w;
+  for (var i = 0u; i < reshade.head.x; i++) {
+    let r = reshade.entries[2u * i];
+    let e = reshade.entries[2u * i + 1u];
+    if (u32(e.y) == map && all(q.xy >= r.xy) && all(q.xy <= r.zw) && q.z >= e.x) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// What a game light's shadow lets through to a surface, as `lamp_light` takes it (1 where the
+// light does not reach it, or casts no shadow).
+fn game_light_share(world: vec3f, n: vec3f, l: Light, frag: vec2f) -> f32 {
+  let d = l.pos.xyz - world;
+  let d2 = dot(d, d);
+  let r2 = l.pos.w * l.pos.w;
+  if (d2 >= r2 || l.spot.w <= -1.5 || l.cone.z <= 0.5) {
+    return 1.0;
+  }
+  let lit = select(frame.amb_sky.w, 1.0, l.cone.y > 0.5);
+  if (lit <= 0.001) {
+    return 1.0;
+  }
+  let ld = d * inverseSqrt(d2 + 1e-6);
+  let win = 1.0 - d2 / r2;
+  let att = win * win / (1.0 + d2 * 0.45) * lit * smoothstep(l.spot.w, l.cone.x, dot(-ld, l.spot.xyz));
+  if (att <= 0.0) {
+    return 1.0;
+  }
+  return light_shadow(world, n, ld, l, i32(l.cone.z + 0.5) - 1, frag);
+}
+
+// Marks the cached picture's pixels whose shading moved props changed: where a lookup of a
+// shadow they cast into falls in their footprint and the shadow it finds now differs from the
+// one the picture was shaded with (`cast_shadows`). Depth 0 there (a re-shade pass then draws
+// what the picture holds over them), 1 elsewhere.
+@fragment fn fs_reshade_mask(@builtin(position) frag: vec4f) -> Marked {
+  var o: Marked;
+  o.depth = 1.0;
+  let px = vec2i(frag.xy);
+  let d = textureLoad(cache_depth, px, 0);
+  if (d <= 0.0) {
+    return o;
+  }
+  let uv = frag.xy * frame.viewport.zw;
+  let h = frame.inv_view_proj * vec4f(uv * 2.0 - 1.0, d, 1.0);
+  let world = h.xyz / h.w;
+  // The surface's normal as its shading offset its shadow lookups (aux.xyz).
+  let n = textureLoad(cache_aux, px, 0).xyz;
+  let was = textureLoad(cache_shadow, px, 0);
+  let changed = 1e-3;
+  for (var layer = 0u; layer < 2u; layer++) {
+    let index = select(reshade.head.y, reshade.head.z, layer == 1u);
+    var m = frame.light_shadow0;
+    if (layer == 1u) {
+      m = frame.light_shadow1;
+    }
+    if (index > 0u && moved_footprint(2u + layer, m * vec4f(world, 1.0))) {
+      let now = game_light_share(world, n, lights[index - 1u], frag.xy);
+      if (abs(now - select(was.y, was.z, layer == 1u)) > changed) {
+        o.depth = 0.0;
+        return o;
+      }
+    }
+  }
+  if (was.w > 0.5) {
+    let grow = 1.0 + 1.5 * (1.0 - abs(dot(n, frame.key_dir.xyz)));
+    let c0 = frame.shadow0 * vec4f(world + n * (frame.cascades.y * grow), 1.0);
+    let c1 = frame.shadow1 * vec4f(world + n * (frame.cascades.z * grow), 1.0);
+    if ((moved_footprint(0u, c0) || moved_footprint(1u, c1))
+        && abs(shadow(world, n, length(frame.camera.xyz - world), frag.xy) - was.x) > changed) {
+      o.depth = 0.0;
+    }
+  }
+  return o;
+}
+
 // Normal mapping without stored tangents (screen-space cotangent frame).
 fn perturb(n: vec3f, p: vec3f, uv: vec2f, m: vec3f) -> vec3f {
   let dp1 = dpdx(p);
@@ -254,8 +364,14 @@ fn lamp_light(world: vec3f, n: vec3f, frag: vec2f, foliage: bool) -> vec3f {
     if (l.spot.w > -1.5) {
       att *= smoothstep(l.spot.w, l.cone.x, dot(-ld, l.spot.xyz));
       if (l.cone.z > 0.5 && att > 0.0) {
-        let lit_share = light_shadow(world, n, ld, l, i32(l.cone.z + 0.5) - 1, frag);
+        let layer = i32(l.cone.z + 0.5) - 1;
+        let lit_share = light_shadow(world, n, ld, l, layer, frag);
         att *= 1.0 - l.cone.w * (1.0 - lit_share);
+        if (layer == 0) {
+          cast_shadows.y = lit_share;
+        } else {
+          cast_shadows.z = lit_share;
+        }
       }
     }
     let nl = dot(n, ld);
@@ -678,6 +794,8 @@ fn shade_scene(in: VsOut, front: bool, frag: vec4f, cut: bool) -> FsOut {
   }
 
   let sh = shadow(in.world, geo_n, dist, frag.xy);
+  cast_shadows.x = sh;
+  cast_shadows.w = 1.0;
   let foliage = shading == 1;
   let lamps = lamp_light(in.world, n, frag.xy, foliage);
 
@@ -825,6 +943,30 @@ fn shade_scene(in: VsOut, front: bool, frag: vec4f, cut: bool) -> FsOut {
 // Opaque world surfaces in the main view, drawn nearest first.
 @fragment fn fs_main_opaque(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> FsOut {
   return shade_scene(in, front, frag, false);
+}
+
+// The cached picture's shading: as `fs_main` and `fs_main_opaque`, with the shadows moved props
+// can change.
+struct CacheOut {
+  @location(0) color: vec4f,
+  @location(1) aux: vec4f,
+  @location(2) shadow: vec4f,
+};
+
+fn cache_out(o: FsOut) -> CacheOut {
+  var c: CacheOut;
+  c.color = o.color;
+  c.aux = o.aux;
+  c.shadow = cast_shadows;
+  return c;
+}
+
+@fragment fn fs_main_cache(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> CacheOut {
+  return cache_out(shade_scene(in, front, frag, true));
+}
+
+@fragment fn fs_main_opaque_cache(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> CacheOut {
+  return cache_out(shade_scene(in, front, frag, false));
 }
 
 // ---------------------------------------------------------------- grass and flowers

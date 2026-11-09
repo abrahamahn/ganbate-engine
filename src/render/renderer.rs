@@ -19,6 +19,9 @@ use super::math::{
     self, Frustum, M4, V3, aabb_distance, add, cross, invert, look_at, mul, normalize, ortho,
     perspective, reflect_y, scale, sub, transform,
 };
+use super::props::{
+    CacheChanges, CacheView, PropSet, Rect, corners, screen_rect, track_cached_props, union,
+};
 use super::scene::{DrawItem, GpuScene};
 use super::sky::Environment;
 
@@ -37,19 +40,100 @@ const AO_CACHE_REFRESH_FRAMES: u32 = 15;
 const CAMERA_SECONDS: usize = 5 * 64 + 12;
 
 /// FNV-1a over bytes: a fingerprint of what the cached world was drawn for.
-struct Fnv(u64);
+pub(super) struct Fnv(u64);
 impl Fnv {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self(0xcbf2_9ce4_8422_2325)
     }
-    fn write(&mut self, bytes: &[u8]) {
+    pub(super) fn write(&mut self, bytes: &[u8]) {
         for b in bytes {
             self.0 = (self.0 ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
         }
     }
-    fn finish(&self) -> u64 {
+    pub(super) fn finish(&self) -> u64 {
         self.0
     }
+}
+/// Footprints of moved props (a shadow map apiece) `fs_reshade_mask` tests at most; more boxes
+/// are joined into one.
+const MAX_RESHADE_ENTRIES: usize = 32;
+/// Bytes of the re-shade block (`Reshade` in scene.wgsl): a count, then two vec4s an entry.
+const RESHADE_BYTES: u64 = 16 + MAX_RESHADE_ENTRIES as u64 * 32;
+
+/// Where each world draw lies, for re-shading the cached picture ([`Renderer::reshade_plan`]):
+/// in each shadow map props cast into (the key light's cascades 0, 1, grown by the offset its
+/// receivers sample from; a game's lights 0, 1) its clip-space rect and farthest depth, and in
+/// the picture. Made when first needed after the picture is drawn whole (the maps and the view
+/// hold while it holds).
+struct ReceiverBounds {
+    key: u64,
+    maps: Vec<[([f32; 4], f32); 4]>,
+    screen: Vec<Option<Rect>>,
+}
+
+/// A box in a shadow map seen through `m`: its clip-space rect, nearest and farthest depth, or
+/// all of it when part lies behind a spot light.
+fn map_bounds(b: (V3, V3), m: &M4) -> ([f32; 4], f32, f32) {
+    let mut r = [
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    ];
+    let (mut near, mut far) = (f32::INFINITY, f32::NEG_INFINITY);
+    for p in corners(b) {
+        let c = transform(m, [p[0], p[1], p[2], 1.0]);
+        if c[3] <= 1e-6 {
+            return ([-1e9, -1e9, 1e9, 1e9], -1e9, 1e9);
+        }
+        let q = [c[0] / c[3], c[1] / c[3], c[2] / c[3]];
+        r = [
+            r[0].min(q[0]),
+            r[1].min(q[1]),
+            r[2].max(q[0]),
+            r[3].max(q[1]),
+        ];
+        (near, far) = (near.min(q[2]), far.max(q[2]));
+    }
+    (r, near, far)
+}
+
+/// The picture's pixels a frame shades again because moved props' shadows can reach them
+/// ([`Renderer::reshade_plan`]).
+struct ReshadePlan {
+    /// The `Reshade` block: per entry the footprint (clip-space rect), the nearest depth of
+    /// what moved and the shadow map (0, 1 the key light's cascades, 2, 3 a game's lights).
+    block: Vec<u32>,
+    /// The world's draws a footprint can reach (the rest cannot be in a marked pixel).
+    draws: Vec<bool>,
+    /// The region of the picture holding them.
+    region: Rect,
+}
+/// Regions of the cached picture drawn again in one frame, at most; more are drawn as the one
+/// region holding them all.
+const MAX_CACHE_REGIONS: usize = 6;
+
+/// The regions to draw again, overlapping ones joined, at most [`MAX_CACHE_REGIONS`].
+fn merge_regions(mut rects: Vec<Rect>) -> Vec<Rect> {
+    let overlap = |a: &Rect, b: &Rect| a[0] < b[2] && b[0] < a[2] && a[1] < b[3] && b[1] < a[3];
+    let mut merged = true;
+    while merged {
+        merged = false;
+        'scan: for i in 0..rects.len() {
+            for j in i + 1..rects.len() {
+                if overlap(&rects[i], &rects[j]) {
+                    let b = rects.swap_remove(j);
+                    rects[i] = union(rects[i], b);
+                    merged = true;
+                    break 'scan;
+                }
+            }
+        }
+    }
+    if rects.len() > MAX_CACHE_REGIONS {
+        rects = rects.into_iter().reduce(union).into_iter().collect();
+    }
+    rects
 }
 /// Vertex AO samples a live frame may bake (each casts `AoConfig::rays` rays): about 3 ms in
 /// wasm, inside a 120 Hz frame. Nearest the camera first, so what is in view settles first.
@@ -209,6 +293,11 @@ pub struct FrameStats {
     pub fused_tonemap: bool,
     /// The frame started from the cached world rather than drawing it.
     pub world_cached: bool,
+    /// Regions of the cached picture drawn again this frame (where props settled, left or
+    /// moved their shadows).
+    pub cache_regions: u32,
+    /// Pixels of the cached picture that moved props' shadows can reach were shaded again.
+    pub reshaded: bool,
 }
 
 /// Where the final pass writes.
@@ -247,6 +336,10 @@ pub(super) struct Pipelines {
     pub(super) scene_prop: PipelineId,
     /// The same without the alpha test, for opaque prop materials in the main view.
     pub(super) scene_prop_opaque: PipelineId,
+    /// The same four drawing into the cached picture, which also keeps the shadows moved props
+    /// can change (`fs_main_cache`): world cut and opaque, props cut and opaque.
+    cache_scene: [PipelineId; 2],
+    pub(super) cache_prop: [PipelineId; 2],
     /// The same, blended over the scene without writing depth: alpha, additive.
     pub(super) scene_prop_blend: [PipelineId; 2],
     /// Props over the finished image: [opaque, alpha, additive][without the scene's depth, testing
@@ -264,6 +357,11 @@ pub(super) struct Pipelines {
     pub(super) prop_vs: Compiled,
     /// Copies the cached world back into the frame's colour, aux and depth targets.
     restore: PipelineId,
+    /// Empties a region of the cached picture (colour, aux and depth) before it is drawn again.
+    cache_clear: PipelineId,
+    /// Marks the cached picture's pixels moved props' shadows can reach (`fs_reshade_mask`):
+    /// depth 0 there, 1 elsewhere, so a re-shade pass draws only there.
+    reshade_mask: PipelineId,
     shadow: PipelineId,
     shadow_masked: PipelineId,
     pub(super) shadow_prop: PipelineId,
@@ -293,6 +391,11 @@ pub(super) struct Targets {
     cache_hdr: TextureId,
     cache_aux: TextureId,
     cache_depth: TextureId,
+    /// Where a frame marks the cached picture's pixels to shade again (`fs_reshade_mask`).
+    reshade_depth: TextureId,
+    /// The shadows moved props can change, as the cached picture was shaded with them
+    /// (`CacheOut::shadow`).
+    cache_shadow: TextureId,
     refl: (u32, u32),
     pub(super) refl_hdr: TextureId,
     refl_aux: TextureId,
@@ -326,6 +429,9 @@ pub(super) struct Slot {
     flower: BindGroupId,
     particle: BindGroupId,
     restore: BindGroupId,
+    /// `fs_reshade_mask`'s group and its `Reshade` block.
+    mask: BindGroupId,
+    reshade: BufferId,
     ssao: BindGroupId,
     air: BindGroupId,
     down: Vec<BindGroupId>,
@@ -340,6 +446,8 @@ pub struct Renderer {
     /// What the cached world was drawn for (view, size, frame inputs, world revision); `None`
     /// until it is drawn and after anything that changes it without changing those.
     world_cache: Option<u64>,
+    /// The world's draws' bounds for re-shading the cached picture, as of `world_cache`.
+    receivers: Option<ReceiverBounds>,
     /// The AO refinement the cached world shows, and the frames since it was drawn.
     cache_ao_revision: u64,
     cache_age: u32,
@@ -562,6 +670,7 @@ impl Pipelines {
             colors: mrt(),
         })?;
         let opaque_fs = compile(SCENE, Stage::Fragment, "fs_main_opaque")?;
+        let world_layout_cache = world_layout.clone();
         let scene_opaque = device.create_render_pipeline(&RenderPipelineDesc {
             vertex: &vs,
             fragment: Some(&opaque_fs),
@@ -594,6 +703,39 @@ impl Pipelines {
             depth: Some(reverse_depth(Compare::Greater, true)),
             colors: mrt(),
         })?;
+        // The cached picture's pipelines: the same shading with the shadows moved props can
+        // change written to a third target.
+        let mrt3 = || {
+            vec![
+                color(HDR, Blend::Replace),
+                color(HDR, Blend::Replace),
+                color(HDR, Blend::Replace),
+            ]
+        };
+        let cache_fs = [
+            compile(SCENE, Stage::Fragment, "fs_main_cache")?,
+            compile(SCENE, Stage::Fragment, "fs_main_opaque_cache")?,
+        ];
+        let world_vs = compile(SCENE, Stage::Vertex, "vs_main")?;
+        let mut cache_scene = [scene; 2];
+        let mut cache_prop = [scene_prop; 2];
+        for (i, fs) in cache_fs.iter().enumerate() {
+            for (out, vs, vertex_layout) in [
+                (&mut cache_scene[i], &world_vs, world_layout_cache.clone()),
+                (&mut cache_prop[i], &vs, layout.clone()),
+            ] {
+                *out = device.create_render_pipeline(&RenderPipelineDesc {
+                    vertex: vs,
+                    fragment: Some(fs),
+                    vertex_layout: Some(vertex_layout),
+                    topology: Topology::TriangleList,
+                    cull: Cull::None,
+                    front_ccw: true,
+                    depth: Some(reverse_depth(Compare::Greater, true)),
+                    colors: mrt3(),
+                })?;
+            }
+        }
         // Blended props leave the aux target (normals for outlines and occlusion) alone.
         let mut scene_prop_blend = [scene_prop; 2];
         for (i, blend) in [Blend::Premultiplied, Blend::Additive]
@@ -813,6 +955,8 @@ impl Pipelines {
             scene_opaque,
             scene_prop,
             scene_prop_opaque,
+            cache_scene,
+            cache_prop,
             scene_prop_blend,
             overlay,
             output_format: output,
@@ -844,6 +988,44 @@ impl Pipelines {
                     clamp: false,
                 }),
                 colors: vec![color(HDR, Blend::Replace), color(HDR, Blend::Replace)],
+            })?,
+            cache_clear: device.create_render_pipeline(&RenderPipelineDesc {
+                vertex: &fsvs,
+                fragment: Some(&compile(POST, Stage::Fragment, "fs_clear")?),
+                vertex_layout: None,
+                topology: Topology::TriangleList,
+                cull: Cull::None,
+                front_ccw: true,
+                depth: Some(DepthState {
+                    format: Format::Depth32Float,
+                    compare: Compare::Always,
+                    write: true,
+                    bias_constant: 0.0,
+                    bias_slope: 0.0,
+                    clamp: false,
+                }),
+                colors: vec![
+                    color(HDR, Blend::Replace),
+                    color(HDR, Blend::Replace),
+                    color(HDR, Blend::Replace),
+                ],
+            })?,
+            reshade_mask: device.create_render_pipeline(&RenderPipelineDesc {
+                vertex: &fsvs,
+                fragment: Some(&compile(SCENE, Stage::Fragment, "fs_reshade_mask")?),
+                vertex_layout: None,
+                topology: Topology::TriangleList,
+                cull: Cull::None,
+                front_ccw: true,
+                depth: Some(DepthState {
+                    format: Format::Depth32Float,
+                    compare: Compare::Always,
+                    write: true,
+                    bias_constant: 0.0,
+                    bias_slope: 0.0,
+                    clamp: false,
+                }),
+                colors: vec![],
             })?,
             ssao: fullscreen(device, &fsvs, "fs_ssao", Format::R16Float, Blend::Replace)?,
             air: fullscreen(device, &fsvs, "fs_air", HDR, Blend::Replace)?,
@@ -886,6 +1068,30 @@ pub(super) struct Eye {
     pub(super) inv: M4,
     pos: V3,
     near: f32,
+}
+
+impl Eye {
+    /// This eye narrowed to the pixels `r` of a `size` picture: what it culls lies outside them.
+    fn within(&self, r: &Rect, size: (u32, u32)) -> Eye {
+        let (w, h) = (size.0 as f32, size.1 as f32);
+        let (x0, x1) = (r[0] as f32 / w * 2.0 - 1.0, r[2] as f32 / w * 2.0 - 1.0);
+        let (y0, y1) = (r[1] as f32 / h * 2.0 - 1.0, r[3] as f32 / h * 2.0 - 1.0);
+        let (sx, sy) = ((x1 - x0) * 0.5, (y1 - y0) * 0.5);
+        let (cx, cy) = ((x0 + x1) * 0.5, (y0 + y1) * 0.5);
+        #[rustfmt::skip]
+        let narrow: M4 = [
+            1.0 / sx, 0.0, 0.0, 0.0,
+            0.0, 1.0 / sy, 0.0, 0.0,
+            0.0, 0.0, 1.0, 0.0,
+            -cx / sx, -cy / sy, 0.0, 1.0,
+        ];
+        Eye {
+            view_proj: mul(&narrow, &self.view_proj),
+            inv: self.inv,
+            pos: self.pos,
+            near: self.near,
+        }
+    }
 }
 
 struct Cascades {
@@ -1232,6 +1438,7 @@ impl Renderer {
             world,
             world_drawn: false,
             world_cache: None,
+            receivers: None,
             cache_ao_revision: 0,
             cache_age: 0,
             world_moved: false,
@@ -1264,6 +1471,10 @@ impl Renderer {
 
     pub fn look(&self) -> &Look {
         &self.look
+    }
+    /// Draws the cached picture afresh next frame.
+    pub(super) fn forget_world_cache(&mut self) {
+        self.world_cache = None;
     }
     pub fn set_look(&mut self, look: Look) {
         (self.details, self.grassy) = material_details(&look, &self.scene);
@@ -1360,6 +1571,8 @@ impl Renderer {
             cache_hdr: tex(device, width, height, HDR, rt)?,
             cache_aux: tex(device, width, height, HDR, rt)?,
             cache_depth: tex(device, width, height, Format::Depth32Float, depth_usage)?,
+            reshade_depth: tex(device, width, height, Format::Depth32Float, depth_usage)?,
+            cache_shadow: tex(device, width, height, HDR, rt)?,
             refl,
             refl_hdr: tex(device, refl.0, refl.1, HDR, rt)?,
             refl_aux: tex(device, refl.0, refl.1, HDR, rt)?,
@@ -1494,6 +1707,22 @@ impl Renderer {
                 (5, Resource::Sampler(self.linear_clamp)),
             ],
         )?;
+        let reshade = upload(device, RESHADE_BYTES, BufferUsage::UNIFORM)?;
+        let mask = device.create_bind_group(
+            p.reshade_mask,
+            0,
+            &[
+                (0, buf(frame[0])),
+                (1, buf(self.scene.light_buffer)),
+                (4, Resource::Texture(self.shadow_map)),
+                (5, Resource::Sampler(self.shadow_sampler)),
+                (14, Resource::Texture(self.light_shadow_map)),
+                (15, Resource::Texture(t.cache_depth)),
+                (16, Resource::Texture(t.cache_aux)),
+                (17, buf(reshade)),
+                (18, Resource::Texture(t.cache_shadow)),
+            ],
+        )?;
         let ssao = post(device, p.ssao, none, none)?;
         let air = post(
             device,
@@ -1556,6 +1785,8 @@ impl Renderer {
             flower,
             particle,
             restore,
+            mask,
+            reshade,
             ssao,
             air,
             down,
@@ -1573,7 +1804,9 @@ impl Renderer {
                 .scene
                 .into_iter()
                 .chain(s.sky)
-                .chain([s.grass, s.flower, s.particle, s.restore, s.ssao, s.air])
+                .chain([
+                    s.grass, s.flower, s.particle, s.restore, s.mask, s.ssao, s.air,
+                ])
                 .chain([s.tonemap, s.tonemap_final, s.paint, s.output])
             {
                 device.destroy_bind_group(g);
@@ -1581,7 +1814,13 @@ impl Renderer {
             for g in s.down.into_iter().chain(s.up) {
                 device.destroy_bind_group(g);
             }
-            for b in s.frame.into_iter().chain(s.tiles).chain(s.index) {
+            for b in s
+                .frame
+                .into_iter()
+                .chain(s.tiles)
+                .chain(s.index)
+                .chain([s.reshade])
+            {
                 device.destroy_buffer(b);
             }
         }
@@ -1595,6 +1834,8 @@ impl Renderer {
             old.cache_hdr,
             old.cache_aux,
             old.cache_depth,
+            old.reshade_depth,
+            old.cache_shadow,
             old.refl_hdr,
             old.refl_aux,
             old.refl_depth,
@@ -1913,6 +2154,158 @@ impl Renderer {
 
     /// Light lists per screen tile for one camera. Lights are sorted nearest first so a full
     /// tile keeps the lights that matter most.
+    /// The shadow maps props cast into, as `fs_reshade_mask` numbers them (0, 1 the key light's
+    /// cascades; 2, 3 a game's lights), with their view-projection and margins around a
+    /// footprint (clip units: the filter and a few texels) and around a receiver (metres: the
+    /// key light's receivers sample from a point off their surface).
+    fn prop_shadow_maps(&self, cas: &Cascades) -> [(M4, f32, f32); 4] {
+        let texel = 2.0 / self.quality.shadow_size.max(16) as f32;
+        let offset = 2.5 * cas.offset[0].max(cas.offset[1]);
+        let light_texel = 2.0 / self.quality.light_shadow_size.max(16) as f32;
+        let lights = self.game_lights.shadow_views();
+        std::array::from_fn(|v| match v {
+            0 | 1 => (cas.mats[v], 2.0 * cas.radius[v] + 4.0 * texel, offset),
+            _ => (
+                lights.get(v - 2).copied().unwrap_or(math::IDENTITY),
+                6.0 * light_texel,
+                0.0,
+            ),
+        })
+    }
+
+    /// Where each world draw lies in the shadow maps and the picture ([`ReceiverBounds`]).
+    fn receiver_bounds(
+        &self,
+        key: u64,
+        eye: &Eye,
+        size: (u32, u32),
+        cas: &Cascades,
+    ) -> ReceiverBounds {
+        let maps = self.prop_shadow_maps(cas);
+        let none = ([1.0, 1.0, -1.0, -1.0], f32::NEG_INFINITY);
+        let (bounds, screen) = self
+            .scene
+            .draws
+            .iter()
+            .map(|d| {
+                if d.water {
+                    return ([none; 4], None);
+                }
+                let b = std::array::from_fn(|v| {
+                    let (m, _, grow) = &maps[v];
+                    let grown = (d.bounds.0.map(|x| x - grow), d.bounds.1.map(|x| x + grow));
+                    let (r, _, far) = map_bounds(grown, m);
+                    (r, far)
+                });
+                (
+                    b,
+                    screen_rect(&corners(d.bounds), &eye.view_proj, size, 2.0),
+                )
+            })
+            .unzip();
+        ReceiverBounds {
+            key,
+            maps: bounds,
+            screen,
+        }
+    }
+
+    /// What the GPU needs to shade again the cached picture's pixels that shadows of `moved`
+    /// (boxes where props were and are) can reach: each shadow map's footprint of what moved,
+    /// which `fs_reshade_mask` tests per pixel; the world's draws a footprint can reach; and the
+    /// region of the picture holding them and the reachable settled props. None when nothing
+    /// the picture holds is in reach. `key`: the key light shines and its cascades hold props.
+    fn reshade_plan(
+        &self,
+        moved: &[(V3, V3)],
+        settled: &[(V3, V3)],
+        eye: &Eye,
+        size: (u32, u32),
+        cas: &Cascades,
+        key: bool,
+    ) -> Option<ReshadePlan> {
+        let receivers = self.receivers.as_ref()?;
+        let maps = self.prop_shadow_maps(cas);
+        let lights = self.game_lights.shadow_views().len().min(2);
+        let active: Vec<usize> = (0..4)
+            .filter(|&v| if v < 2 { key } else { v - 2 < lights })
+            .collect();
+        if active.is_empty() {
+            return None;
+        }
+        let boxes = if moved.len() * active.len() > MAX_RESHADE_ENTRIES {
+            let all = moved.iter().copied().reduce(|a, b| {
+                (
+                    std::array::from_fn(|k| a.0[k].min(b.0[k])),
+                    std::array::from_fn(|k| a.1[k].max(b.1[k])),
+                )
+            });
+            all.into_iter().collect()
+        } else {
+            moved.to_vec()
+        };
+        let mut entries = vec![];
+        for b in &boxes {
+            for &v in &active {
+                let (m, margin, _) = &maps[v];
+                let (r, near, _) = map_bounds(*b, m);
+                let r = [r[0] - margin, r[1] - margin, r[2] + margin, r[3] + margin];
+                entries.push((v, r, near));
+            }
+        }
+        // Whether a receiver can sample a footprint: its bounds in that map overlap the
+        // footprint and reach past its nearest depth.
+        let reached = |maps: &[([f32; 4], f32); 4]| {
+            entries.iter().any(|(v, er, near)| {
+                let (r, far) = &maps[*v];
+                r[0] <= er[2] && er[0] <= r[2] && r[1] <= er[3] && er[1] <= r[3] && *far >= *near
+            })
+        };
+        let mut region: Option<Rect> = None;
+        let mut grow = |r: Rect| region = Some(region.map_or(r, |a| union(a, r)));
+        let draws: Vec<bool> = receivers
+            .maps
+            .iter()
+            .zip(&receivers.screen)
+            .map(|(m, screen)| {
+                let hit = reached(m);
+                if hit {
+                    screen.map(&mut grow);
+                }
+                hit
+            })
+            .collect();
+        for b in settled {
+            let bounds = std::array::from_fn(|v| {
+                let (m, _, grow) = &maps[v];
+                let (r, _, far) = map_bounds((b.0.map(|x| x - grow), b.1.map(|x| x + grow)), m);
+                (r, far)
+            });
+            if reached(&bounds) {
+                screen_rect(&corners(*b), &eye.view_proj, size, 2.0).map(&mut grow);
+            }
+        }
+        let region = region?;
+        // The light buffer index (+ 1) of a game's light casting into each shadow layer.
+        let lamps = self.scene.lights.len() as u32;
+        let mut shadowed = [0u32; 2];
+        for (k, r) in self.game_lights.records().iter().enumerate() {
+            if let Some(slot) = shadowed.get_mut((r[14] as usize).wrapping_sub(1)) {
+                *slot = lamps + k as u32 + 1;
+            }
+        }
+        let mut block = vec![entries.len() as u32, shadowed[0], shadowed[1], 0];
+        for (v, r, near) in &entries {
+            block.extend(r.map(f32::to_bits));
+            block.extend([near.to_bits(), (*v as f32).to_bits(), 0, 0]);
+        }
+        Some(ReshadePlan {
+            block,
+            draws,
+            region,
+        })
+    }
+
     /// What a view's light tiles ([`Renderer::tile_lights`]) depend on: the eye, the picture and
     /// tile sizes, whether the lamps are lit, and where the world's lamps and the game's lights
     /// stand.
@@ -2242,6 +2635,7 @@ impl Renderer {
         eye: &Eye,
         water: bool,
         part: WorldPart,
+        only: Option<&[bool]>,
     ) -> (u32, u32) {
         enc.set_vertex_buffer(self.scene.vertices, 0);
         enc.set_index_buffer(self.scene.indices, 0);
@@ -2251,7 +2645,7 @@ impl Renderer {
         let mut nearest: Vec<(f32, usize)> = vec![];
         let mut bound = usize::MAX;
         for (i, d) in self.scene.draws.iter().enumerate() {
-            if d.water && !water {
+            if (d.water && !water) || only.is_some_and(|o| !o[i]) {
                 continue;
             }
             // Without an alpha test and off the water, a draw is opaque.
@@ -2517,6 +2911,36 @@ impl Renderer {
         } else {
             self.cache_age = self.cache_age.saturating_add(1);
         }
+        if !cached {
+            // A still draws everything itself; the picture no longer follows the props.
+            self.world_cache = None;
+        }
+        // The props the cached picture holds, and the regions of it to draw again: where props
+        // settled or left, and where the shadows of live ones moved over it.
+        let CacheChanges {
+            regions,
+            moved,
+            settled,
+        } = if cached {
+            let view = CacheView {
+                view_proj: &eye.view_proj,
+                size,
+            };
+            track_cached_props(&mut self.props, rebuild, &view)
+        } else {
+            CacheChanges::default()
+        };
+        let regions = merge_regions(regions);
+        // The pixels of the picture moved props' shadows can reach, shaded again below.
+        let reshade = if cached && !rebuild && !moved.is_empty() {
+            if self.receivers.as_ref().is_none_or(|r| r.key != world_key) {
+                self.receivers = Some(self.receiver_bounds(world_key, &eye, size, &cas));
+            }
+            let key = env.key_intensity > 0.0 && has_prop_shadows;
+            self.reshade_plan(&moved, &settled, &eye, size, &cas, key)
+        } else {
+            None
+        };
         let mut stats = FrameStats::default();
 
         // Shadow cascades: layers 0..2 cache static world depth; layers 2..4 hold dynamic props.
@@ -2673,8 +3097,8 @@ impl Renderer {
             });
             enc.set_pipeline(self.pipelines.scene);
             enc.set_bind_group(0, self.slots[slot_index].scene[1]);
-            self.draw_world(enc, &mut push, re, false, WorldPart::All);
-            self.draw_props(enc, slot_index, 1);
+            self.draw_world(enc, &mut push, re, false, WorldPart::All, None);
+            self.draw_props(enc, slot_index, 1, PropSet::All);
             enc.set_pipeline(self.pipelines.sky);
             enc.set_bind_group(0, self.slots[slot_index].sky[1]);
             enc.draw(3, 1, 0, 0);
@@ -2701,21 +3125,83 @@ impl Renderer {
             total_draws += total;
             submitted_draws += submitted;
         };
-        if rebuild {
+        // The cached picture: the world and the settled props, drawn whole or in regions (each
+        // emptied, then drawn again within it).
+        if rebuild || !regions.is_empty() {
+            let target = |texture| Attachment {
+                load: if rebuild {
+                    Load::Clear(clear)
+                } else {
+                    Load::Load
+                },
+                ..Attachment::clear(texture, clear)
+            };
+            let shadow_target = Attachment {
+                load: if rebuild {
+                    Load::Clear([1.0, 1.0, 1.0, 0.0])
+                } else {
+                    Load::Load
+                },
+                ..Attachment::clear(t.cache_shadow, clear)
+            };
             enc.begin_pass(PassDesc {
-                colors: vec![
-                    Attachment::clear(t.cache_hdr, clear),
-                    Attachment::clear(t.cache_aux, clear),
-                ],
-                depth: Some(Attachment::clear(t.cache_depth, clear)),
+                colors: vec![target(t.cache_hdr), target(t.cache_aux), shadow_target],
+                depth: Some(target(t.cache_depth)),
             });
-            enc.set_pipeline(p.scene_opaque);
-            enc.set_bind_group(0, slot.scene[0]);
-            count(self.draw_world(enc, &mut push, &eye, true, WorldPart::Opaque));
-            enc.set_pipeline(p.scene);
-            enc.set_bind_group(0, slot.scene[0]);
-            count(self.draw_world(enc, &mut push, &eye, true, WorldPart::Masked));
+            let whole = [[0, 0, size.0, size.1]];
+            for r in if rebuild { &whole[..] } else { &regions[..] } {
+                if !rebuild {
+                    enc.set_scissor(r[0], r[1], r[2] - r[0], r[3] - r[1]);
+                    enc.set_pipeline(p.cache_clear);
+                    enc.draw(3, 1, 0, 0);
+                }
+                let within = eye.within(r, size);
+                // The settled props first: they stand nearest and cover most of the picture.
+                self.draw_props(enc, slot_index, 0, PropSet::Settled);
+                enc.set_pipeline(p.cache_scene[1]);
+                enc.set_bind_group(0, slot.scene[0]);
+                count(self.draw_world(enc, &mut push, &within, true, WorldPart::Opaque, None));
+                enc.set_pipeline(p.cache_scene[0]);
+                enc.set_bind_group(0, slot.scene[0]);
+                count(self.draw_world(enc, &mut push, &within, true, WorldPart::Masked, None));
+            }
             enc.end_pass();
+        }
+        stats.cache_regions = if rebuild { 0 } else { regions.len() as u32 };
+        if let Some(plan) = &reshade {
+            // Mark the pixels to shade again (depth 0; elsewhere 1, which nothing passes), then
+            // draw what the picture holds over them alone, as the picture was drawn.
+            device.write_buffer(slot.reshade, 0, &crate::gpu::u32_bytes(&plan.block))?;
+            let [x0, y0, x1, y1] = plan.region;
+            let keep = |texture| Attachment {
+                load: Load::Load,
+                ..Attachment::clear(texture, clear)
+            };
+            enc.begin_pass(PassDesc {
+                colors: vec![],
+                depth: Some(Attachment::clear(t.reshade_depth, [1.0; 4])),
+            });
+            enc.set_scissor(x0, y0, x1 - x0, y1 - y0);
+            enc.set_pipeline(p.reshade_mask);
+            enc.set_bind_group(0, slot.mask);
+            enc.draw(3, 1, 0, 0);
+            enc.end_pass();
+            enc.begin_pass(PassDesc {
+                colors: vec![keep(t.cache_hdr), keep(t.cache_aux), keep(t.cache_shadow)],
+                depth: Some(keep(t.reshade_depth)),
+            });
+            enc.set_scissor(x0, y0, x1 - x0, y1 - y0);
+            let within = eye.within(&plan.region, size);
+            self.draw_props(enc, slot_index, 0, PropSet::Settled);
+            enc.set_pipeline(p.cache_scene[1]);
+            enc.set_bind_group(0, slot.scene[0]);
+            let only = Some(&plan.draws[..]);
+            count(self.draw_world(enc, &mut push, &within, true, WorldPart::Opaque, only));
+            enc.set_pipeline(p.cache_scene[0]);
+            enc.set_bind_group(0, slot.scene[0]);
+            count(self.draw_world(enc, &mut push, &within, true, WorldPart::Masked, only));
+            enc.end_pass();
+            stats.reshaded = true;
         }
 
         // Main pass: world, sky, weather.
@@ -2727,31 +3213,31 @@ impl Renderer {
             depth: Some(Attachment::clear(t.depth, clear)),
         });
         if cached {
-            // The cached world (colour, aux and depth), then the props over it.
+            // The cached picture (colour, aux and depth), then the live props over it.
             enc.set_pipeline(p.restore);
             enc.set_bind_group(0, slot.restore);
             enc.draw(3, 1, 0, 0);
-            self.draw_props(enc, slot_index, 0);
+            self.draw_props(enc, slot_index, 0, PropSet::Live);
         } else {
             // The game's props first: the table and its players stand nearest and cover most
             // of the screen, so the world behind them fails the depth test before it is shaded.
-            self.draw_props(enc, slot_index, 0);
+            self.draw_props(enc, slot_index, 0, PropSet::All);
             enc.set_pipeline(p.scene_opaque);
             enc.set_bind_group(0, slot.scene[0]);
-            count(self.draw_world(enc, &mut push, &eye, true, WorldPart::Opaque));
+            count(self.draw_world(enc, &mut push, &eye, true, WorldPart::Opaque, None));
             enc.set_pipeline(p.scene);
             enc.set_bind_group(0, slot.scene[0]);
-            count(self.draw_world(enc, &mut push, &eye, true, WorldPart::Masked));
+            count(self.draw_world(enc, &mut push, &eye, true, WorldPart::Masked, None));
         }
         // The water moves with the clock, so it is drawn every frame. Without an alpha test it
         // never discards, so the floor and the table in front of it hide it before it is
         // shaded: behind the room it spans the whole view.
         enc.set_pipeline(p.scene_opaque);
         enc.set_bind_group(0, slot.scene[0]);
-        count(self.draw_world(enc, &mut push, &eye, true, WorldPart::Water));
+        count(self.draw_world(enc, &mut push, &eye, true, WorldPart::Water, None));
         enc.set_pipeline(p.scene);
         enc.set_bind_group(0, slot.scene[0]);
-        count(self.draw_world(enc, &mut push, &eye, true, WorldPart::MaskedWater));
+        count(self.draw_world(enc, &mut push, &eye, true, WorldPart::MaskedWater, None));
 
         stats.world_cached = cached && !rebuild;
         stats.world_draws_total = total_draws;
@@ -3022,6 +3508,14 @@ mod tests {
         CompileOptions, ShaderLibrary, SpecValue, compile_glsl_with_options,
         compile_msl_with_options, compile_wgsl_with_options, compile_with_options,
     };
+
+    #[test]
+    fn the_cached_picture_shaders_compile() {
+        compile(SCENE, Stage::Fragment, "fs_reshade_mask").expect("fs_reshade_mask");
+        compile(SCENE, Stage::Fragment, "fs_main_cache").expect("fs_main_cache");
+        compile(SCENE, Stage::Fragment, "fs_main_opaque_cache").expect("fs_main_opaque_cache");
+        compile(POST, Stage::Fragment, "fs_clear").expect("fs_clear");
+    }
 
     #[test]
     fn specialize_brdf_permutations_all_backends() {
