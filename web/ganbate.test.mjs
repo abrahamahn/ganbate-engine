@@ -243,9 +243,11 @@ test('project, pick and fitCanvas use the observed CSS box and read the drawn si
     engine.pickWorld(10, 20);
     engine.project([1, 2, 3]);
     assert.deepEqual(probe.picks, [[20, 40], [20, 40]]);
+    assert.equal(probe.reads, 0, 'project and pick read no layout after start');
+    // fitCanvas reads the box itself, once a frame: a page's own resize handler may run first.
     engine.fitCanvas(3);
     assert.deepEqual([canvas.width, canvas.height], [960, 540]);
-    assert.equal(probe.reads, 0, 'no layout reads after start');
+    assert.equal(probe.reads, 2);
     assert.equal(probe.sizeCalls, 1, 'the drawn size is read once until the next frame');
 
     // Resizes arrive through the observer, rounded to whole CSS pixels like clientWidth.
@@ -260,9 +262,12 @@ test('project, pick and fitCanvas use the observed CSS box and read the drawn si
     resize({ contentBoxSize: { inlineSize: 640, blockSize: 360 } });
     assert.deepEqual(engine.project([0, 0, 0]), { x: 100, y: 50, depth: 2 });
     resize({ contentRect: { width: 160, height: 90 } });
+    assert.deepEqual(engine.project([0, 0, 0]), { x: 25, y: 12.5, depth: 2 });
+    assert.equal(probe.reads, 2);
+    probe.box = [160, 90];
     engine.fitCanvas(2);
     assert.deepEqual([canvas.width, canvas.height], [320, 180]);
-    assert.equal(probe.reads, 0);
+    assert.equal(probe.reads, 4);
 
     // A frame may resize the drawing, so the next call reads the size again.
     assert.equal(probe.sizeCalls, 1);
@@ -454,7 +459,7 @@ async function makeTextureEngine(api, exportOverrides = {}) {
 const canvasSource = (width, height) => ({ width, height, getContext() { return null; } });
 const imageSource = (width, height) => ({ naturalWidth: width, naturalHeight: height, width, height });
 
-test('WebGL 2: canvases and bitmaps upload from the source itself with straight alpha, unflipped, and the page\'s unpack state comes back', async () => {
+test('WebGL 2: canvases upload from the source itself with straight alpha, unflipped, and the page\'s unpack state comes back', async () => {
   const t = await makeTextureEngine('webgl2');
   await t.withGlobals(() => {
     const canvas = canvasSource(4, 2);
@@ -467,10 +472,10 @@ test('WebGL 2: canvases and bitmaps upload from the source itself with straight 
     assert.deepEqual(t.uploads[0].unpack, { 0x9240: false, 0x9241: false, 0x9243: 0x9244 });
     assert.deepEqual(t.unpack, { 0x9240: true, 0x9241: true, 0x9243: 0 });
 
-    const bitmap = { width: 4, height: 2, close() {} };
-    t.engine.updateTexture(tex, bitmap);
+    const redrawn = canvasSource(4, 2);
+    t.engine.updateTexture(tex, redrawn);
     assert.deepEqual(t.calls[1], ['update_source', tex, 4, 2]);
-    assert.equal(t.uploads[1].args[8], bitmap);
+    assert.equal(t.uploads[1].args[8], redrawn);
     assert.equal(t.readbacks.length, 0);
     // The host holds the source for that one call only.
     assert.equal(t.imports.gl_write_texture_source(tex, 0, 0, 4, 2), 0);
@@ -485,6 +490,17 @@ test('WebGL 2 keeps images and {data} on the pixel path; WebGPU copies images to
     gl.engine.createTexture({ width: 1, height: 1, data: new Uint8Array(4) });
     assert.deepEqual(gl.calls, [['create', 4, 2, 32, 1], ['create', 1, 1, 4, 1]]);
     assert.deepEqual(gl.readbacks, [[4, 2]], 'only the image is read back');
+    // An image bitmap's alpha cannot be un-premultiplied by a WebGL upload, so it is read back too.
+    const saved = globalThis.ImageBitmap;
+    globalThis.ImageBitmap = class { constructor(w, h) { this.width = w; this.height = h; } close() {} };
+    try {
+      gl.engine.createTexture(new globalThis.ImageBitmap(2, 2));
+    } finally {
+      if (saved === undefined) delete globalThis.ImageBitmap;
+      else globalThis.ImageBitmap = saved;
+    }
+    assert.deepEqual(gl.calls.at(-1), ['create', 2, 2, 16, 1]);
+    assert.deepEqual(gl.readbacks.at(-1), [2, 2]);
   });
 
   const gpu = await makeTextureEngine('webgpu');
@@ -514,14 +530,13 @@ test('a refused, failing or missing source upload falls back to the pixels with 
     assert.ok(!refused.logs.some(([l]) => l >= 2), 'no error is reported');
   });
 
-  // The export throws (a trap): the same fallback.
+  // The export traps: the module is dead, so the trap surfaces instead of a fallback into it.
   const trapped = await makeTextureEngine('webgl2', {
     ganbate_rt_texture_create_source() { throw new WebAssembly.RuntimeError('unreachable'); },
   });
   await trapped.withGlobals(() => {
-    assert.equal(trapped.engine.createTexture(canvasSource(2, 2)), 99);
-    assert.deepEqual(trapped.readbacks, [[2, 2]]);
-    assert.ok(trapped.logs.some(([l, s]) => l === 1 && s.includes('unreachable')));
+    assert.throws(() => trapped.engine.createTexture(canvasSource(2, 2)), WebAssembly.RuntimeError);
+    assert.deepEqual(trapped.readbacks, []);
   });
 
   // An older module without the exports reads the pixels, as before.

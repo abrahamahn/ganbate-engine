@@ -1941,13 +1941,16 @@ function sourceOfSize(source, width, height) {
 }
 
 /**
- * Whether the browser can copy `source` into a texture itself: canvases, image bitmaps and
- * videos, and on WebGPU images too. `{width, height, data}` stays pixels, and so do images on
- * WebGL 2, where an upload without premultiplication makes Chrome decode them again.
+ * Whether the browser can copy `source` into a texture itself: canvases and videos, and on WebGPU
+ * image bitmaps and images too. `{width, height, data}` stays pixels. On WebGL 2 so do images,
+ * where an upload without premultiplication makes Chrome decode them again, and image bitmaps,
+ * whose alpha the upload cannot un-premultiply (it ignores UNPACK_PREMULTIPLY_ALPHA_WEBGL).
  */
 function copiesDirectly(source, webgpu) {
   if (!source || typeof source !== 'object' || source.data) return false;
-  return webgpu || !('naturalWidth' in source);
+  if (webgpu) return true;
+  const bitmap = typeof ImageBitmap !== 'undefined' && source instanceof ImageBitmap;
+  return !bitmap && !('naturalWidth' in source);
 }
 
 /** RGBA8 pixels of an image source: `{width, height, data}` passes through; canvases, image
@@ -2019,7 +2022,8 @@ export async function createEngine(options) {
   const { gpu, host, x, errors } = await boot({
     ...options,
     onLog: (level, text) => {
-      if (trying && level >= 2) {
+      // A panic is never a refusal: the module is dead, and the error must stay one.
+      if (trying && level >= 2 && !text.startsWith('panic')) {
         onLog(1, `${text}; sending the pixels instead`);
         return;
       }
@@ -2080,6 +2084,8 @@ export async function createEngine(options) {
     try {
       return call(width, height);
     } catch (e) {
+      // A trap left the module unusable; falling back would hide why.
+      if (e instanceof WebAssembly.RuntimeError) throw e;
       onLog(1, `texture from source: ${e.message}; sending the pixels instead`);
       return 0;
     } finally {
@@ -2204,11 +2210,14 @@ export async function createEngine(options) {
     api: gpu.api,
     adapter: gpu.adapterName,
     errors: () => [...errors, ...host.errors.filter((e) => !errors.includes(e))],
-    /** Sizes the canvas to its CSS box times `dpr` (default: the device pixel ratio). */
+    /**
+     * Sizes the canvas to its CSS box times `dpr` (default: the device pixel ratio). It reads the
+     * box itself, once a frame at most: a page may call it from its own resize handler, which can
+     * run before the engine's observer has seen the new size.
+     */
     fitCanvas(dpr = window.devicePixelRatio || 1) {
-      const css = cssSize();
-      const w = Math.max(1, Math.round(css.width * dpr));
-      const h = Math.max(1, Math.round(css.height * dpr));
+      const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
+      const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
       if (canvas.width !== w) canvas.width = w;
       if (canvas.height !== h) canvas.height = h;
     },
