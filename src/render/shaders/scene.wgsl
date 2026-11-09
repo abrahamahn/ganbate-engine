@@ -233,12 +233,19 @@ fn lamp_light(world: vec3f, n: vec3f, frag: vec2f, foliage: bool) -> vec3f {
   let t = tiles[ty * frame.tiles.x + tx];
   var sum = vec3f(0.0);
   for (var k = 0u; k < t.y; k++) {
-    let l = lights[light_index[t.x + k]];
-    let lit = select(level, 1.0, l.cone.y > 0.5);
-    let d = l.pos.xyz - world;
+    // Most of a tile's lights do not reach this pixel: read just the position and range first,
+    // and the rest of the light only for one that does.
+    let index = light_index[t.x + k];
+    let at = lights[index].pos;
+    let d = at.xyz - world;
     let d2 = dot(d, d);
-    let r2 = l.pos.w * l.pos.w;
-    if (d2 >= r2 || lit <= 0.001) {
+    let r2 = at.w * at.w;
+    if (d2 >= r2) {
+      continue;
+    }
+    let l = lights[index];
+    let lit = select(level, 1.0, l.cone.y > 0.5);
+    if (lit <= 0.001) {
       continue;
     }
     let ld = d * inverseSqrt(d2 + 1e-6);
