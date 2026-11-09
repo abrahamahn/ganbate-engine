@@ -71,6 +71,43 @@ struct ReceiverBounds {
     screen: Vec<Option<Rect>>,
 }
 
+impl ReceiverBounds {
+    /// Where each of `draws` lies in `maps` ([`Renderer::prop_shadow_maps`]) and in a `size`
+    /// picture seen through `view_proj`. The water and the draws outside the view (the test
+    /// `draw_world` culls with) get none, which no footprint reaches: the picture holds no
+    /// pixel of them. Indices stay those of `draws`.
+    fn new(
+        key: u64,
+        draws: &[DrawItem],
+        maps: &[(M4, f32, f32); 4],
+        view_proj: &M4,
+        size: (u32, u32),
+    ) -> Self {
+        let none = ([1.0, 1.0, -1.0, -1.0], f32::NEG_INFINITY);
+        let view = Frustum::from_view_proj(view_proj);
+        let (bounds, screen) = draws
+            .iter()
+            .map(|d| {
+                if d.water || !view.intersects_aabb(d.bounds.0, d.bounds.1) {
+                    return ([none; 4], None);
+                }
+                let b = std::array::from_fn(|v| {
+                    let (m, _, grow) = &maps[v];
+                    let grown = (d.bounds.0.map(|x| x - grow), d.bounds.1.map(|x| x + grow));
+                    let (r, _, far) = map_bounds(grown, m);
+                    (r, far)
+                });
+                (b, screen_rect(&corners(d.bounds), view_proj, size, 2.0))
+            })
+            .unzip();
+        Self {
+            key,
+            maps: bounds,
+            screen,
+        }
+    }
+}
+
 /// A box in a shadow map seen through `m`: its clip-space rect, nearest and farthest depth, or
 /// all of it when part lies behind a spot light.
 fn map_bounds(b: (V3, V3), m: &M4) -> ([f32; 4], f32, f32) {
@@ -2178,43 +2215,6 @@ impl Renderer {
         })
     }
 
-    /// Where each world draw lies in the shadow maps and the picture ([`ReceiverBounds`]).
-    fn receiver_bounds(
-        &self,
-        key: u64,
-        eye: &Eye,
-        size: (u32, u32),
-        cas: &Cascades,
-    ) -> ReceiverBounds {
-        let maps = self.prop_shadow_maps(cas);
-        let none = ([1.0, 1.0, -1.0, -1.0], f32::NEG_INFINITY);
-        let (bounds, screen) = self
-            .scene
-            .draws
-            .iter()
-            .map(|d| {
-                if d.water {
-                    return ([none; 4], None);
-                }
-                let b = std::array::from_fn(|v| {
-                    let (m, _, grow) = &maps[v];
-                    let grown = (d.bounds.0.map(|x| x - grow), d.bounds.1.map(|x| x + grow));
-                    let (r, _, far) = map_bounds(grown, m);
-                    (r, far)
-                });
-                (
-                    b,
-                    screen_rect(&corners(d.bounds), &eye.view_proj, size, 2.0),
-                )
-            })
-            .unzip();
-        ReceiverBounds {
-            key,
-            maps: bounds,
-            screen,
-        }
-    }
-
     /// What the GPU needs to shade again the cached picture's pixels that shadows of `moved`
     /// (boxes where props were and are) can reach: each shadow map's footprint of what moved,
     /// which `fs_reshade_mask` tests per pixel; the world's draws a footprint can reach; and the
@@ -3031,7 +3031,14 @@ impl Renderer {
         // The pixels of the picture moved props' shadows can reach, shaded again below.
         let reshade = if cached && !rebuild && !moved.is_empty() {
             if self.receivers.as_ref().is_none_or(|r| r.key != world_key) {
-                self.receivers = Some(self.receiver_bounds(world_key, &eye, size, &cas));
+                let maps = self.prop_shadow_maps(&cas);
+                self.receivers = Some(ReceiverBounds::new(
+                    world_key,
+                    &self.scene.draws,
+                    &maps,
+                    &eye.view_proj,
+                    size,
+                ));
             }
             let key = env.key_intensity > 0.0 && has_prop_shadows;
             self.reshade_plan(&moved, &settled, &eye, size, &cas, key)
@@ -3609,6 +3616,55 @@ mod tests {
     #[test]
     fn grass_spacing_matches_the_shader() {
         assert!(SCENE.contains(&format!("const GRASS_SPACING = {GRASS_SPACING};")));
+    }
+
+    #[test]
+    fn receivers_outside_the_view_get_none() {
+        let view_proj = mul(
+            &perspective(60f32.to_radians(), 4.0 / 3.0, 0.1),
+            &look_at([0.0, 1.0, 5.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+        );
+        let map = ortho(-40.0, 40.0, -40.0, 40.0, -40.0, 40.0);
+        let maps = [
+            (map, 0.1, 0.5),
+            (map, 0.1, 0.5),
+            (map, 0.1, 0.0),
+            (map, 0.1, 0.0),
+        ];
+        let draw = |lo: V3, hi: V3| DrawItem {
+            first_index: 0,
+            count: 6,
+            material: 0,
+            water: false,
+            bounds: (lo, hi),
+            max_extent: 2.0,
+        };
+        let draws = [
+            draw([-1.0, 0.0, -1.0], [1.0, 0.5, 1.0]),
+            draw([30.0, 0.0, -1.0], [32.0, 0.5, 1.0]),
+            draw([-1.0, 0.0, 9.0], [1.0, 0.5, 11.0]),
+        ];
+        let size = (64, 48);
+        let r = ReceiverBounds::new(7, &draws, &maps, &view_proj, size);
+        assert_eq!((r.key, r.maps.len(), r.screen.len()), (7, 3, 3));
+
+        let seen = draws[0].bounds;
+        let before: [([f32; 4], f32); 4] = std::array::from_fn(|v| {
+            let (m, _, grow) = &maps[v];
+            let (b, _, far) = map_bounds((seen.0.map(|x| x - grow), seen.1.map(|x| x + grow)), m);
+            (b, far)
+        });
+        assert_eq!(r.maps[0], before);
+        let screen = screen_rect(&corners(seen), &view_proj, size, 2.0);
+        assert!(screen.is_some());
+        assert_eq!(r.screen[0], screen);
+
+        // Beside the view and behind the eye: the picture holds none of them.
+        let none = ([1.0, 1.0, -1.0, -1.0], f32::NEG_INFINITY);
+        for i in [1, 2] {
+            assert_eq!(r.maps[i], [none; 4], "draw {i}");
+            assert_eq!(r.screen[i], None, "draw {i}");
+        }
     }
 
     #[test]
