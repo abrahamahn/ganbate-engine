@@ -987,11 +987,15 @@ fn grass_site(ii: u32) -> GrassSite {
   o.keep = 0.0;
   o.widen = 1.0;
   let cam = frame.camera.xyz;
-  // The renderer draws side * side instances on a grid centred under the camera.
+  // The grid is side * side cells centred under the camera; the renderer draws the part of it
+  // the view can show (`Renderer::visible_grass`), `columns` cells across from (`x0`, `z0`).
   let side = max(u32(frame.water2.y), 1u);
   let half = i32(side / 2u);
-  let cx = i32(floor(cam.x / GRASS_SPACING)) + i32(ii % side) - half;
-  let cz = i32(floor(cam.z / GRASS_SPACING)) + i32(ii / side) - half;
+  let columns = max(u32(frame.grass_grid.z), 1u);
+  let col = i32(frame.grass_grid.x) + i32(ii % columns);
+  let row = i32(frame.grass_grid.y) + i32(ii / columns);
+  let cx = i32(floor(cam.x / GRASS_SPACING)) + col - half;
+  let cz = i32(floor(cam.z / GRASS_SPACING)) + row - half;
   let seed = hash_u((bitcast<u32>(cx) * 73856093u) ^ hash_u(bitcast<u32>(cz) * 19349663u + 7u));
   o.seed = seed;
   let jx = rand01(seed);

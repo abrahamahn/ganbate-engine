@@ -167,6 +167,8 @@ const WORLD_MAX_REACH: f32 = 560.0;
 /// The grass instance grid is at most GRASS_SIDE x GRASS_SIDE cells of 13 cm around the camera
 /// (see scene.wgsl); `Quality::grass` scales its area.
 const GRASS_SIDE: u32 = 640;
+/// Metres between grass blades' cells (`GRASS_SPACING` in scene.wgsl).
+const GRASS_SPACING: f32 = 0.13;
 const RAIN_BOX: f32 = 16.0;
 const PETAL_BOX: f32 = 14.0;
 const GROUND_FORMAT: Format = Format::Rgba8Unorm;
@@ -446,6 +448,8 @@ pub struct Renderer {
     /// What the cached world was drawn for (view, size, frame inputs, world revision); `None`
     /// until it is drawn and after anything that changes it without changing those.
     world_cache: Option<u64>,
+    /// The part of the grass grid this frame draws ([`Renderer::visible_grass`]).
+    grass_grid: [u32; 4],
     /// The world's draws' bounds for re-shading the cached picture, as of `world_cache`.
     receivers: Option<ReceiverBounds>,
     /// The AO refinement the cached world shows, and the frames since it was drawn.
@@ -1438,6 +1442,7 @@ impl Renderer {
             world,
             world_drawn: false,
             world_cache: None,
+            grass_grid: [0; 4],
             receivers: None,
             cache_ao_revision: 0,
             cache_age: 0,
@@ -2563,16 +2568,107 @@ impl Renderer {
             l.subsurface,
         );
         b.v(l.subsurface_color, l.clearcoat_roughness);
+        let [x, z, w, _] = self.grass_grid;
+        b.f(x as f32, z as f32, w as f32, 0.0);
         bytes.extend_from_slice(&f32_bytes(&b.0));
         debug_assert!(bytes.len() as u64 <= FRAME_BYTES);
         bytes
     }
 
-    /// Grass instances to draw: the instance grid scaled by quality and the Look's density,
-    /// or 0 when no material grows grass.
+    /// Grass instances to draw: the part of the instance grid (scaled by quality and the Look's
+    /// density) the view can show, or 0 when no material grows grass.
     fn grass_instances(&self) -> u32 {
+        self.grass_grid[2] * self.grass_grid[3]
+    }
+
+    /// The part of the grass grid `vs_grass` can show: its cells (offset from the grid's corner,
+    /// then its size) whose blades can pass the view test in `grass_site`. The grid's box, from the
+    /// lowest ground to the tallest blade, clipped to the view widened as that test widens it; the
+    /// blades outside it are dropped by the test anyway, so the picture is the same, without
+    /// running the vertex stage for hundreds of thousands of blades the view cannot show.
+    fn visible_grass(&self, eye: &Eye, ground: &Ground) -> [u32; 4] {
         let side = self.grass_side();
-        side * side
+        if side == 0 {
+            return [0; 4];
+        }
+        let s = f64::from(GRASS_SPACING);
+        let half = i64::from(side / 2);
+        let corner = [
+            (f64::from(eye.pos[0]) / s).floor() as i64 - half,
+            (f64::from(eye.pos[2]) / s).floor() as i64 - half,
+        ];
+        let lo = [
+            corner[0] as f64 * s,
+            f64::from(ground.top - ground.range) - 1.0,
+            corner[1] as f64 * s,
+        ];
+        let hi = [
+            (corner[0] + i64::from(side)) as f64 * s,
+            f64::from(ground.top) + 1.5 * f64::from(self.look.grass.height) + 1.0,
+            (corner[1] + i64::from(side)) as f64 * s,
+        ];
+        // Half-spaces n . p + d <= 0: the box, then the test (|x|, |y| <= 1.15 w + 0.5, w > 0).
+        let m = &eye.view_proj;
+        let row = |k: usize| [m[k], m[4 + k], m[8 + k], m[12 + k]].map(f64::from);
+        let (r0, r1, r3) = (row(0), row(1), row(3));
+        let mut planes: Vec<([f64; 3], f64)> = vec![];
+        for k in 0..3 {
+            let mut n = [0.0; 3];
+            n[k] = -1.0;
+            planes.push((n, lo[k]));
+            n[k] = 1.0;
+            planes.push((n, -hi[k]));
+        }
+        for (r, sign) in [(r0, 1.0), (r0, -1.0), (r1, 1.0), (r1, -1.0)] {
+            let a: [f64; 4] = std::array::from_fn(|i| sign * r[i] - 1.15 * r3[i]);
+            planes.push(([a[0], a[1], a[2]], a[3] - 0.5));
+        }
+        planes.push(([-r3[0], -r3[1], -r3[2]], -r3[3]));
+        // The clipped box's corners: where three planes meet inside all the others.
+        let (mut xz_lo, mut xz_hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
+        for i in 0..planes.len() {
+            for j in i + 1..planes.len() {
+                for k in j + 1..planes.len() {
+                    let (a, b, c) = (planes[i], planes[j], planes[k]);
+                    let det = |x: [f64; 3], y: [f64; 3], z: [f64; 3]| {
+                        x[0] * (y[1] * z[2] - y[2] * z[1]) - x[1] * (y[0] * z[2] - y[2] * z[0])
+                            + x[2] * (y[0] * z[1] - y[1] * z[0])
+                    };
+                    let d = det(a.0, b.0, c.0);
+                    if d.abs() < 1e-12 {
+                        continue;
+                    }
+                    let rhs = [-a.1, -b.1, -c.1];
+                    let col = |q: usize| {
+                        let pick = |p: ([f64; 3], f64), r: f64| {
+                            let mut n = p.0;
+                            n[q] = r;
+                            n
+                        };
+                        det(pick(a, rhs[0]), pick(b, rhs[1]), pick(c, rhs[2])) / d
+                    };
+                    let p = [col(0), col(1), col(2)];
+                    let inside = planes.iter().all(|(n, e)| {
+                        n[0] * p[0] + n[1] * p[1] + n[2] * p[2] + e
+                            <= 1e-6 * (1.0 + n.iter().map(|x| x.abs()).sum::<f64>() * 100.0)
+                    });
+                    if inside {
+                        xz_lo = [xz_lo[0].min(p[0]), xz_lo[1].min(p[2])];
+                        xz_hi = [xz_hi[0].max(p[0]), xz_hi[1].max(p[2])];
+                    }
+                }
+            }
+        }
+        if xz_lo[0] > xz_hi[0] {
+            return [0; 4];
+        }
+        let cells = |v: f64, axis: usize| {
+            ((v / s).floor() as i64 - corner[axis]).clamp(0, i64::from(side)) as u32
+        };
+        let (x0, z0) = (cells(xz_lo[0], 0), cells(xz_lo[1], 1));
+        let (x1, z1) = (cells(xz_hi[0], 0) + 1, cells(xz_hi[1], 1) + 1);
+        let (x1, z1) = (x1.min(side), z1.min(side));
+        [x0, z0, x1.saturating_sub(x0), z1.saturating_sub(z0)]
     }
 
     /// Rows of the grass instance grid this frame (0 when nothing grows grass).
@@ -2812,6 +2908,7 @@ impl Renderer {
         let main_frustum = Frustum::from_view_proj(&eye.view_proj);
         let cas = self.cascades(view, env);
         let ground = self.ground_view(view);
+        self.grass_grid = self.visible_grass(&eye, &ground);
         let lamps_on = env.lamp_level > 0.001;
         let water_visible = self.quality.reflection_scale > 0.0
             && self.look.water_reflection > 0.001
@@ -3508,6 +3605,11 @@ mod tests {
         CompileOptions, ShaderLibrary, SpecValue, compile_glsl_with_options,
         compile_msl_with_options, compile_wgsl_with_options, compile_with_options,
     };
+
+    #[test]
+    fn grass_spacing_matches_the_shader() {
+        assert!(SCENE.contains(&format!("const GRASS_SPACING = {GRASS_SPACING};")));
+    }
 
     #[test]
     fn the_cached_picture_shaders_compile() {

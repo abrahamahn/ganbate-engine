@@ -56,6 +56,7 @@ struct Frame {
   light_shadow: vec4f,  // 1 / texels per side of those maps, unused, unused, unused
   surface_mode: vec4f,  // default SurfaceModel (0..5), clearcoat, sheen, subsurface
   subsurface_color: vec4f, // rgb subsurface scatter tint, w = clearcoat roughness
+  grass_grid: vec4f,    // the part of the grass grid drawn: first column, first row, columns, unused
 };
 
 @group(0) @binding(0) var<uniform> frame: Frame;
