@@ -587,7 +587,10 @@ fn blended(c: vec4f) -> vec4f {
   return c;
 }
 
-@fragment fn fs_main(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> FsOut {
+// The scene's surface shading. `cut` keeps the alpha test and the reflection's clip under the
+// water; without them (`fs_main_opaque`) the shader never discards, so the GPU can reject hidden
+// fragments before shading them (early depth, or a tiler's hidden-surface removal).
+fn shade_scene(in: VsOut, front: bool, frag: vec4f, cut: bool) -> FsOut {
   // Texture fetches and derivatives first, in uniform control flow.
   let bias = frame.style2.x;
   let base_s = textureSampleBias(base_tex, material_sampler, in.uv, bias);
@@ -611,14 +614,14 @@ fn blended(c: vec4f) -> vec4f {
   }
   n = mapped;
 
-  if (reflection_pass && in.world.y < frame.water.x - 0.02) {
+  if (cut && reflection_pass && in.world.y < frame.water.x - 0.02) {
     discard;
   }
   var albedo = draw.base_color * in.tint;
   if (draw.flags.x > 0.5) {
     albedo *= base_s;
   }
-  if (albedo.a < draw.params.x) {
+  if (cut && albedo.a < draw.params.x) {
     discard;
   }
   let shading = i32(draw.params.w + 0.5);
@@ -806,6 +809,15 @@ fn blended(c: vec4f) -> vec4f {
   }
   out.color = blended(vec4f(col, albedo.a));
   return out;
+}
+
+@fragment fn fs_main(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> FsOut {
+  return shade_scene(in, front, frag, true);
+}
+
+// Opaque world surfaces in the main view, drawn nearest first.
+@fragment fn fs_main_opaque(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> FsOut {
+  return shade_scene(in, front, frag, false);
 }
 
 // ---------------------------------------------------------------- grass and flowers

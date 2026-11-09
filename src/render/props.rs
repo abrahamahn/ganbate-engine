@@ -1898,32 +1898,48 @@ impl Renderer {
         if !self.props.batches.iter().any(|b| b.layer == Layer::Opaque) {
             return;
         }
-        enc.set_pipeline(self.pipelines.scene_prop);
-        enc.set_bind_group(0, s.scene[view]);
-        let mut bound = None;
-        for b in self
-            .props
-            .batches
-            .iter()
-            .filter(|b| b.layer == Layer::Opaque)
-        {
-            let (Some(mesh), Some(mat)) = (
-                self.props.meshes.get(b.mesh),
-                self.props.materials.get(b.material),
-            ) else {
-                continue;
-            };
-            if view == 1 && mat.data.params[3] == 2.0 {
-                continue;
+        // In the main view, materials without an alpha test take the pipeline that never
+        // discards (so hidden fragments are dropped before shading); the reflection keeps the
+        // clip under the water, so it draws everything with the cutting one.
+        let groups: Vec<(crate::gpu::PipelineId, Option<bool>)> = if view == 0 {
+            vec![
+                (self.pipelines.scene_prop_opaque, Some(true)),
+                (self.pipelines.scene_prop, Some(false)),
+            ]
+        } else {
+            vec![(self.pipelines.scene_prop, None)]
+        };
+        for (pipeline, opaque) in groups {
+            enc.set_pipeline(pipeline);
+            enc.set_bind_group(0, s.scene[view]);
+            let mut bound = None;
+            for b in self
+                .props
+                .batches
+                .iter()
+                .filter(|b| b.layer == Layer::Opaque)
+            {
+                let (Some(mesh), Some(mat)) = (
+                    self.props.meshes.get(b.mesh),
+                    self.props.materials.get(b.material),
+                ) else {
+                    continue;
+                };
+                if opaque.is_some_and(|o| o != (mat.data.params[0] < 0.0)) {
+                    continue;
+                }
+                if view == 1 && mat.data.params[3] == 2.0 {
+                    continue;
+                }
+                if bound != Some(b.material) {
+                    enc.set_bind_group(1, mat.group);
+                    bound = Some(b.material);
+                }
+                enc.push_constants(&f32_bytes(&Self::prop_push(mat, b.first, false)));
+                enc.set_vertex_buffer(mesh.vertices, 0);
+                enc.set_index_buffer(mesh.indices, 0);
+                enc.draw_indexed(mesh.index_count, b.count, 0, 0, 0);
             }
-            if bound != Some(b.material) {
-                enc.set_bind_group(1, mat.group);
-                bound = Some(b.material);
-            }
-            enc.push_constants(&f32_bytes(&Self::prop_push(mat, b.first, false)));
-            enc.set_vertex_buffer(mesh.vertices, 0);
-            enc.set_index_buffer(mesh.indices, 0);
-            enc.draw_indexed(mesh.index_count, b.count, 0, 0, 0);
         }
     }
 

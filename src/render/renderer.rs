@@ -19,7 +19,7 @@ use super::math::{
     self, Frustum, M4, V3, aabb_distance, add, cross, invert, look_at, mul, normalize, ortho,
     perspective, reflect_y, scale, sub, transform,
 };
-use super::scene::GpuScene;
+use super::scene::{DrawItem, GpuScene};
 use super::sky::Environment;
 
 const COMMON: &str = include_str!("shaders/common.wgsl");
@@ -197,10 +197,25 @@ pub enum Output {
     Surface(Format),
 }
 
+/// Which of the world's draws one `draw_world` call makes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WorldPart {
+    All,
+    /// Opaque draws, nearest first (the main view, with the pipeline that never discards).
+    Opaque,
+    /// The alpha-tested and water draws, in scene order.
+    Rest,
+}
+
 pub(super) struct Pipelines {
     pub(super) scene: PipelineId,
+    /// The scene shading without the alpha test, for opaque world surfaces in the main view: a
+    /// shader that never discards lets the GPU drop hidden fragments before shading them.
+    scene_opaque: PipelineId,
     /// The scene shading for props (model-space vertices placed per instance).
     pub(super) scene_prop: PipelineId,
+    /// The same without the alpha test, for opaque prop materials in the main view.
+    pub(super) scene_prop_opaque: PipelineId,
     /// The same, blended over the scene without writing depth: alpha, additive.
     pub(super) scene_prop_blend: [PipelineId; 2],
     /// Props over the finished image: [opaque, alpha, additive][without the scene's depth, testing
@@ -492,6 +507,17 @@ impl Pipelines {
         let scene = device.create_render_pipeline(&RenderPipelineDesc {
             vertex: &vs,
             fragment: Some(&fs),
+            vertex_layout: Some(world_layout.clone()),
+            topology: Topology::TriangleList,
+            cull: Cull::None,
+            front_ccw: true,
+            depth: Some(reverse_depth(Compare::Greater, true)),
+            colors: mrt(),
+        })?;
+        let opaque_fs = compile(SCENE, Stage::Fragment, "fs_main_opaque")?;
+        let scene_opaque = device.create_render_pipeline(&RenderPipelineDesc {
+            vertex: &vs,
+            fragment: Some(&opaque_fs),
             vertex_layout: Some(world_layout),
             topology: Topology::TriangleList,
             cull: Cull::None,
@@ -504,6 +530,16 @@ impl Pipelines {
         let scene_prop = device.create_render_pipeline(&RenderPipelineDesc {
             vertex: &vs,
             fragment: Some(&fs),
+            vertex_layout: Some(layout.clone()),
+            topology: Topology::TriangleList,
+            cull: Cull::None,
+            front_ccw: true,
+            depth: Some(reverse_depth(Compare::Greater, true)),
+            colors: mrt(),
+        })?;
+        let scene_prop_opaque = device.create_render_pipeline(&RenderPipelineDesc {
+            vertex: &vs,
+            fragment: Some(&opaque_fs),
             vertex_layout: Some(layout.clone()),
             topology: Topology::TriangleList,
             cull: Cull::None,
@@ -727,7 +763,9 @@ impl Pipelines {
         let fsvs = compile(POST, Stage::Vertex, "vs_fullscreen")?;
         Ok(Self {
             scene,
+            scene_opaque,
             scene_prop,
+            scene_prop_opaque,
             scene_prop_blend,
             overlay,
             output_format: output,
@@ -2077,22 +2115,34 @@ impl Renderer {
     }
 
     /// Draws visible static world chunks against `eye`, returning `(total, submitted)` chunk counts.
+    /// Draws the visible world draws of `part`: all of them in scene order, or (for the main view)
+    /// the opaque ones nearest first and then the rest. The caller binds the pipeline and frame
+    /// group for the part.
     fn draw_world(
         &self,
         enc: &mut Encoder,
         model_push: &mut [f32; 32],
         eye: &Eye,
         water: bool,
+        part: WorldPart,
     ) -> (u32, u32) {
         enc.set_vertex_buffer(self.scene.vertices, 0);
         enc.set_index_buffer(self.scene.indices, 0);
         let frustum = Frustum::from_view_proj(&eye.view_proj);
         let hybrid = self.quality.ao_samples == 0 && !self.quality.painterly;
-        let mut bound = usize::MAX;
         let (mut total, mut submitted) = (0u32, 0u32);
-        for d in &self.scene.draws {
+        let mut nearest: Vec<(f32, usize)> = vec![];
+        let mut bound = usize::MAX;
+        for (i, d) in self.scene.draws.iter().enumerate() {
             if d.water && !water {
                 continue;
+            }
+            // Without an alpha test and off the water, a draw is opaque.
+            let opaque = !d.water && self.scene.materials[d.material].params[0] < 0.0;
+            match part {
+                WorldPart::Opaque if !opaque => continue,
+                WorldPart::Rest if opaque => continue,
+                _ => {}
             }
             total += 1;
             if !frustum.intersects_aabb(d.bounds.0, d.bounds.1) {
@@ -2105,27 +2155,46 @@ impl Renderer {
                 }
             }
             submitted += 1;
-            if bound != d.material {
-                enc.set_bind_group(1, self.materials[d.material]);
-                bound = d.material;
+            if part == WorldPart::Opaque {
+                nearest.push((aabb_distance(eye.pos, d.bounds.0, d.bounds.1), i));
+            } else {
+                self.draw_item(enc, model_push, d, &mut bound);
             }
-            let m = &self.scene.materials[d.material];
-            let detail = &self.details[d.material];
-            model_push[..16].copy_from_slice(detail);
-            // A colour-only rule (preset `none`) recolours the material whatever its shading,
-            // foliage included; patterned presets take the colour in their own way.
-            let mut base = m.base_color;
-            if detail[0] == 0.0 && detail[8] > 0.5 {
-                base[..3].copy_from_slice(&detail[5..8]);
-            }
-            model_push[16..20].copy_from_slice(&base);
-            model_push[20..24].copy_from_slice(&m.emissive);
-            model_push[24..28].copy_from_slice(&m.params);
-            model_push[28..32].copy_from_slice(&m.flags);
-            enc.push_constants(&f32_bytes(model_push));
-            enc.draw_indexed(d.count, 1, d.first_index, 0, 0);
+        }
+        // Nearest first: what stands behind then fails the depth test before it is shaded.
+        nearest.sort_by(|a, b| a.0.total_cmp(&b.0));
+        for (_, i) in nearest {
+            self.draw_item(enc, model_push, &self.scene.draws[i], &mut bound);
         }
         (total, submitted)
+    }
+
+    fn draw_item(
+        &self,
+        enc: &mut Encoder,
+        model_push: &mut [f32; 32],
+        d: &DrawItem,
+        bound: &mut usize,
+    ) {
+        if *bound != d.material {
+            enc.set_bind_group(1, self.materials[d.material]);
+            *bound = d.material;
+        }
+        let m = &self.scene.materials[d.material];
+        let detail = &self.details[d.material];
+        model_push[..16].copy_from_slice(detail);
+        // A colour-only rule (preset `none`) recolours the material whatever its shading,
+        // foliage included; patterned presets take the colour in their own way.
+        let mut base = m.base_color;
+        if detail[0] == 0.0 && detail[8] > 0.5 {
+            base[..3].copy_from_slice(&detail[5..8]);
+        }
+        model_push[16..20].copy_from_slice(&base);
+        model_push[20..24].copy_from_slice(&m.emissive);
+        model_push[24..28].copy_from_slice(&m.params);
+        model_push[28..32].copy_from_slice(&m.flags);
+        enc.push_constants(&f32_bytes(model_push));
+        enc.draw_indexed(d.count, 1, d.first_index, 0, 0);
     }
 
     fn post_pass(
@@ -2313,8 +2382,7 @@ impl Renderer {
                     enc.set_vertex_buffer(self.scene.vertices, 0);
                     enc.set_index_buffer(self.scene.indices, 0);
                     enc.push_constants(&f32_bytes(m));
-                    let masked =
-                        |d: &&super::scene::DrawItem| self.shadow_materials[d.material].is_some();
+                    let masked = |d: &&DrawItem| self.shadow_materials[d.material].is_some();
                     for d in self.scene.draws.iter().filter(|d| {
                         !d.water
                             && !masked(d)
@@ -2446,7 +2514,7 @@ impl Renderer {
             });
             enc.set_pipeline(self.pipelines.scene);
             enc.set_bind_group(0, self.slots[slot_index].scene[1]);
-            self.draw_world(enc, &mut push, re, false);
+            self.draw_world(enc, &mut push, re, false, WorldPart::All);
             self.draw_props(enc, slot_index, 1);
             enc.set_pipeline(self.pipelines.sky);
             enc.set_bind_group(0, self.slots[slot_index].sky[1]);
@@ -2478,13 +2546,22 @@ impl Renderer {
             ],
             depth: Some(Attachment::clear(t.depth, clear)),
         });
+        // The game's props first: the table and its players stand nearest and cover most of
+        // the screen, so the world behind them fails the depth test before it is shaded.
+        self.draw_props(enc, slot_index, 0);
+        enc.set_pipeline(p.scene_opaque);
+        enc.set_bind_group(0, slot.scene[0]);
+        let (opaque_total, opaque_submitted) =
+            self.draw_world(enc, &mut push, &eye, true, WorldPart::Opaque);
         enc.set_pipeline(p.scene);
         enc.set_bind_group(0, slot.scene[0]);
-        let (total_draws, submitted_draws) = self.draw_world(enc, &mut push, &eye, true);
+        let (rest_total, rest_submitted) =
+            self.draw_world(enc, &mut push, &eye, true, WorldPart::Rest);
+        let (total_draws, submitted_draws) =
+            (opaque_total + rest_total, opaque_submitted + rest_submitted);
         stats.world_draws_total = total_draws;
         stats.world_draws_submitted = submitted_draws;
         stats.world_draws_culled = total_draws.saturating_sub(submitted_draws);
-        self.draw_props(enc, slot_index, 0);
         let blades = self.grass_instances();
         if blades > 0 {
             enc.set_pipeline(p.grass);
