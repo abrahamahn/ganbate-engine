@@ -317,6 +317,9 @@ pub(super) struct Slot {
     pub(super) frame: [BufferId; 2],
     pub(super) tiles: [BufferId; 2],
     pub(super) index: [BufferId; 2],
+    /// What each view's light tiles were last binned for ([`Renderer::tile_key`]): while that
+    /// holds they are neither binned nor written again.
+    tiles_for: [Option<u64>; 2],
     scene: [BindGroupId; 2],
     sky: [BindGroupId; 2],
     grass: BindGroupId,
@@ -1546,6 +1549,7 @@ impl Renderer {
             frame,
             tiles,
             index,
+            tiles_for: [None; 2],
             scene,
             sky,
             grass,
@@ -1909,6 +1913,24 @@ impl Renderer {
 
     /// Light lists per screen tile for one camera. Lights are sorted nearest first so a full
     /// tile keeps the lights that matter most.
+    /// What a view's light tiles ([`Renderer::tile_lights`]) depend on: the eye, the picture and
+    /// tile sizes, whether the lamps are lit, and where the world's lamps and the game's lights
+    /// stand.
+    fn tile_key(&self, eye: &Eye, size: (u32, u32), tiles: (u32, u32), on: bool) -> u64 {
+        let mut key = Fnv::new();
+        key.write(&f32_bytes(&eye.view_proj));
+        key.write(&f32_bytes(&[eye.pos[0], eye.pos[1], eye.pos[2], eye.near]));
+        for n in [size.0, size.1, tiles.0, tiles.1, u32::from(on)] {
+            key.write(&n.to_le_bytes());
+        }
+        key.write(&self.quality.tile_size.to_le_bytes());
+        key.write(&self.scene.revision.to_le_bytes());
+        for record in self.game_lights.records() {
+            key.write(&f32_bytes(record));
+        }
+        key.finish()
+    }
+
     fn tile_lights(
         &self,
         eye: &Eye,
@@ -2423,9 +2445,16 @@ impl Renderer {
             let tiles_dim = self.targets.tiles;
             let refl_size = self.targets.refl;
             let slot = &self.slots[slot_index];
-            let (tiles, index) = self.tile_lights(&eye, size, tiles_dim[0], lamps_on);
-            device.write_buffer(slot.tiles[0], 0, &crate::gpu::u32_bytes(&tiles))?;
-            device.write_buffer(slot.index[0], 0, &crate::gpu::u32_bytes(&index))?;
+            let (frame_buffers, tile_buffers, index_buffers) = (slot.frame, slot.tiles, slot.index);
+            // The lamps binned to screen tiles (617 of them in the Harbor): only when the view
+            // or the lights changed, so a held camera does not bin them again every frame.
+            let tiles_key = self.tile_key(&eye, size, tiles_dim[0], lamps_on);
+            if self.slots[slot_index].tiles_for[0] != Some(tiles_key) {
+                let (tiles, index) = self.tile_lights(&eye, size, tiles_dim[0], lamps_on);
+                device.write_buffer(tile_buffers[0], 0, &crate::gpu::u32_bytes(&tiles))?;
+                device.write_buffer(index_buffers[0], 0, &crate::gpu::u32_bytes(&index))?;
+                self.slots[slot_index].tiles_for[0] = Some(tiles_key);
+            }
             let block = self.frame_block(
                 &eye,
                 env,
@@ -2438,7 +2467,7 @@ impl Renderer {
                 has_reflection,
                 seed,
             );
-            device.write_buffer(slot.frame[0], 0, &block)?;
+            device.write_buffer(frame_buffers[0], 0, &block)?;
             // What the world's picture depends on: this view's frame inputs (but the clock,
             // which moves only what the cached world leaves out), the world and the lights.
             let mut key = Fnv::new();
@@ -2450,9 +2479,13 @@ impl Renderer {
             }
             world_key = key.finish();
             if let Some(re) = &refl_eye {
-                let (tiles, index) = self.tile_lights(re, refl_size, tiles_dim[1], lamps_on);
-                device.write_buffer(slot.tiles[1], 0, &crate::gpu::u32_bytes(&tiles))?;
-                device.write_buffer(slot.index[1], 0, &crate::gpu::u32_bytes(&index))?;
+                let tiles_key = self.tile_key(re, refl_size, tiles_dim[1], lamps_on);
+                if self.slots[slot_index].tiles_for[1] != Some(tiles_key) {
+                    let (tiles, index) = self.tile_lights(re, refl_size, tiles_dim[1], lamps_on);
+                    device.write_buffer(tile_buffers[1], 0, &crate::gpu::u32_bytes(&tiles))?;
+                    device.write_buffer(index_buffers[1], 0, &crate::gpu::u32_bytes(&index))?;
+                    self.slots[slot_index].tiles_for[1] = Some(tiles_key);
+                }
                 let block = self.frame_block(
                     re,
                     env,
@@ -2465,7 +2498,7 @@ impl Renderer {
                     has_reflection,
                     seed,
                 );
-                device.write_buffer(slot.frame[1], 0, &block)?;
+                device.write_buffer(frame_buffers[1], 0, &block)?;
             }
         }
         // A presented view draws the world's part of the main pass, and the water's reflection,
