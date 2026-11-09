@@ -526,6 +526,22 @@ pub extern "C" fn ganbate_rt_finish_ao() -> u32 {
     })
 }
 
+/// Loads the world's baked ambient occlusion from a sidecar `ganbate-build bake-ao` made for it
+/// (`len` bytes at `ptr`), so frames bake only around what moves. Returns 1, or 0 (and reports
+/// why) when it was baked for another world: the AO is then baked live as before.
+///
+/// # Safety
+/// `ptr` must address `len` readable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ganbate_rt_ao_import(ptr: *const u8, len: usize) -> u32 {
+    // SAFETY: the caller passes a readable range.
+    let data = unsafe { bytes(ptr, len) };
+    with(0, |rt| {
+        rt.renderer.import_ao(&mut rt.device, data)?;
+        Ok(1)
+    })
+}
+
 /// Does up to `samples` vertices' worth of the world's AO bake between frames (occluders first,
 /// then samples nearest the camera), so the page can spend its idle time, measured by its own
 /// clock, instead of waiting for frames. Returns 1 when it did work, 0 when there was none

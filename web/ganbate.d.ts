@@ -17,6 +17,11 @@ export interface CreateEngineOptions {
   readonly api?: GanbateApi;
   /** A cooked `.gbew` world: URL or bytes. Omit for a scene of props only. */
   readonly world?: string | ArrayBuffer | Uint8Array;
+  /**
+   * The world's baked ambient occlusion (`ganbate-build bake-ao`): URL or bytes. Loaded instead
+   * of baking it live; a missing file, or one baked for another world, leaves the live bake.
+   */
+  readonly ao?: string | ArrayBuffer | Uint8Array;
   /** A Look file, as an object or JSON text. */
   readonly look?: object | string;
   /** Rendering quality preset (`'realtime' | 'still' | 'hybrid' | 'low-cost'`) or boolean (`true` = `'still'`). */

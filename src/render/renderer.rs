@@ -1291,6 +1291,15 @@ impl Renderer {
         Ok(true)
     }
 
+    /// Takes the world's baked vertex AO from a sidecar baked for it (`ganbate-build bake-ao`),
+    /// so frames bake only around what moves. Fails, changing nothing, when the sidecar was
+    /// baked for another world.
+    pub fn import_ao(&mut self, device: &mut Device<'_>, data: &[u8]) -> Result<()> {
+        self.scene.import_ao(device, data)?;
+        self.world_cache = None;
+        Ok(())
+    }
+
     /// Completes the baked vertex AO now (a capture that must not depend on frame count).
     pub fn finish_ao(&mut self, device: &mut Device<'_>) -> Result<()> {
         self.scene.finish_ao(device).map(|_| ())

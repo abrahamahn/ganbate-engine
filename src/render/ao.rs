@@ -11,6 +11,77 @@ use std::collections::{HashMap, VecDeque};
 
 use crate::world::{AlphaMode, Shading, World};
 
+/// A cooked world's baked AO as a file (`ganbate-build bake-ao`): "GBAO", the version, the
+/// [`fingerprint`] of the world it was baked for, the instance count, then per instance its
+/// vertex count (0: none baked) and each vertex's AO in 65535ths, all little-endian.
+const SIDECAR_MAGIC: &[u8; 4] = b"GBAO";
+const SIDECAR_VERSION: u32 = 1;
+
+/// What a sidecar must have been baked for: each instance's mesh with its vertex count and
+/// bounds, where the instance stands, and whether it is shown and drawn (FNV-1a).
+fn fingerprint(edit: &WorldEdit) -> u64 {
+    fn put(h: &mut u64, bytes: &[u8]) {
+        for b in bytes {
+            *h = (*h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    let mut h = 0xcbf2_9ce4_8422_2325;
+    put(&mut h, &(edit.instances.len() as u32).to_le_bytes());
+    for inst in &edit.instances {
+        let mesh = &edit.meshes[inst.mesh as usize];
+        put(&mut h, &inst.mesh.to_le_bytes());
+        put(&mut h, &(mesh.positions.len() as u32).to_le_bytes());
+        let (lo, hi) = mesh.bounds;
+        for v in lo.iter().chain(&hi).chain(&inst.transform) {
+            put(&mut h, &v.to_le_bytes());
+        }
+        put(
+            &mut h,
+            &[
+                u8::from(inst.visible),
+                u8::from(inst.first_vertex.is_some()),
+            ],
+        );
+    }
+    h
+}
+
+/// Reads a sidecar front to back.
+struct Reader<'a>(&'a [u8]);
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], String> {
+        if self.0.len() < n {
+            return Err("baked AO: the file ends early".into());
+        }
+        let (head, rest) = self.0.split_at(n);
+        self.0 = rest;
+        Ok(head)
+    }
+    fn u32(&mut self) -> Result<u32, String> {
+        Ok(u32::from_le_bytes(
+            self.take(4)?.try_into().unwrap_or_default(),
+        ))
+    }
+    fn u64(&mut self) -> Result<u64, String> {
+        Ok(u64::from_le_bytes(
+            self.take(8)?.try_into().unwrap_or_default(),
+        ))
+    }
+}
+
+/// Bakes `world`'s vertex AO on the CPU to the end, as a live view converges to it, and returns
+/// it as a sidecar ([`AoBake::export`]) a runtime loads instead of baking it again.
+pub fn bake_world(world: &World) -> Result<Vec<u8>, String> {
+    let edit = super::scene::cpu_edit(world)?;
+    let mut bake = AoBake::new(&edit, AoConfig::default());
+    while !bake.is_idle() {
+        bake.step(&edit, usize::MAX / 128, None);
+    }
+    bake.export(&edit)
+        .ok_or_else(|| "baked AO: the bake did not finish".into())
+}
+
 use super::math::{V3, normalize, transform_point};
 use super::scene::WorldEdit;
 
@@ -882,6 +953,73 @@ impl AoBake {
         self.queue.is_empty()
     }
 
+    /// The finished bake as a sidecar for this world (see [`SIDECAR_MAGIC`]), or `None` while
+    /// it is under way.
+    pub fn export(&self, edit: &WorldEdit) -> Option<Vec<u8>> {
+        if !self.is_idle() {
+            return None;
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(SIDECAR_MAGIC);
+        out.extend_from_slice(&SIDECAR_VERSION.to_le_bytes());
+        out.extend_from_slice(&fingerprint(edit).to_le_bytes());
+        out.extend_from_slice(&(edit.instances.len() as u32).to_le_bytes());
+        for index in 0..edit.instances.len() {
+            let values = self.values(index).unwrap_or_default();
+            out.extend_from_slice(&(values.len() as u32).to_le_bytes());
+            for v in values {
+                let q = (v.clamp(0.0, 1.0) * 65535.0).round() as u16;
+                out.extend_from_slice(&q.to_le_bytes());
+            }
+        }
+        Some(out)
+    }
+
+    /// Takes a finished bake from a sidecar [`AoBake::export`] made for this world: nothing is
+    /// left to bake (later edits re-queue what they reach, as usual). Fails, changing nothing,
+    /// when it was baked for another world or this one has changed since it loaded.
+    pub fn import(&mut self, edit: &WorldEdit, data: &[u8]) -> Result<(), String> {
+        let mut r = Reader(data);
+        if r.take(4)? != SIDECAR_MAGIC {
+            return Err("baked AO: not a baked-AO file".into());
+        }
+        let version = r.u32()?;
+        if version != SIDECAR_VERSION {
+            return Err(format!(
+                "baked AO: version {version}, not {SIDECAR_VERSION}"
+            ));
+        }
+        if r.u64()? != fingerprint(edit) || r.u32()? as usize != edit.instances.len() {
+            return Err("baked AO: baked for another world".into());
+        }
+        let mut values = Vec::with_capacity(edit.instances.len());
+        for inst in &edit.instances {
+            let n = r.u32()? as usize;
+            if n != 0 && n != edit.meshes[inst.mesh as usize].positions.len() {
+                return Err("baked AO: baked for another world".into());
+            }
+            let v: Vec<f32> = r
+                .take(n * 2)?
+                .chunks_exact(2)
+                .map(|b| f32::from(u16::from_le_bytes([b[0], b[1]])) / 65535.0)
+                .collect();
+            values.push(v);
+        }
+        if !r.0.is_empty() {
+            return Err("baked AO: bytes after the last instance".into());
+        }
+        self.values = values;
+        self.queue.clear();
+        self.cursor = 0;
+        self.scope = None;
+        self.occluders = None;
+        self.cache = HashMap::new();
+        self.unordered = false;
+        self.queued_vertices = 0;
+        self.cycle_vertices = 0;
+        Ok(())
+    }
+
     /// Fraction of the current bake done, in `[0, 1]` (1 when idle).
     pub fn progress(&self) -> f32 {
         if self.queue.is_empty() || self.cycle_vertices == 0 {
@@ -1217,6 +1355,35 @@ mod tests {
             lights: Vec::new(),
             draw_sources: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_sidecar_carries_a_finished_bake_to_the_same_world_only() {
+        let edit = floor_and_wall(0.0);
+        let baked = bake_all(&edit, usize::MAX / 128);
+        let file = baked.export(&edit).expect("a finished bake exports");
+        assert!(
+            AoBake::new(&edit, AoConfig::default())
+                .export(&edit)
+                .is_none()
+        );
+
+        let mut loaded = AoBake::new(&edit, AoConfig::default());
+        loaded
+            .import(&edit, &file)
+            .expect("the same world loads it");
+        assert!(loaded.is_idle());
+        for i in 0..edit.instances.len() {
+            let (a, b) = (baked.values(i).unwrap(), loaded.values(i).unwrap());
+            assert!(a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 1.0 / 65535.0));
+        }
+
+        // The wall moved: the file no longer fits, and nothing changes.
+        let moved = floor_and_wall(1.0);
+        let mut other = AoBake::new(&moved, AoConfig::default());
+        assert!(other.import(&moved, &file).is_err());
+        assert!(!other.is_idle() && other.values(0).is_none());
+        assert!(other.import(&moved, &file[..file.len() - 1]).is_err());
     }
 
     fn bake_all(edit: &WorldEdit, budget: usize) -> AoBake {

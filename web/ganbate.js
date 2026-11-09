@@ -2031,6 +2031,10 @@ export async function createEngine(options) {
     };
   };
 
+  // The world's baked AO (a `ganbate-build bake-ao` sidecar), fetched while the world loads.
+  const bakedAo = typeof options.ao === 'string'
+    ? fetch(options.ao).then((r) => (r.ok ? r.arrayBuffer() : null), () => null)
+    : Promise.resolve(options.ao ?? null);
   // The world (decoded, its images decoded by the browser) and the Look.
   let world = null;
   if (typeof options.world === 'string') {
@@ -2053,6 +2057,12 @@ export async function createEngine(options) {
   const [lookPtr] = place(lookBytes);
   (options.onPhase || (() => {}))('Compiling shaders and uploading', 1);
   ok('start', x.ganbate_rt_start(0, 0, lookPtr, lookBytes.length, resolveQualityCode(options.quality, options.still)));
+  const ao = world ? await bakedAo : null;
+  if (ao) {
+    const bytes = ao instanceof Uint8Array ? ao : new Uint8Array(ao);
+    const [p] = place(bytes);
+    if (!x.ganbate_rt_ao_import(p, bytes.length)) onLog(1, 'The baked AO does not fit this world; baking it live');
+  }
 
   let inFlight = 0;
   let stopped = false;

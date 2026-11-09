@@ -225,6 +225,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             p.write_document_with(&rel, Kind::Scene, &doc, force)?;
             println!("{rel}: {} entities from {}", nodes.nodes.len(), entry.path);
         }
+        [cmd, file, out] if cmd == "bake-ao" => {
+            // The world's vertex AO, baked here once so runtimes load it instead of baking it.
+            let data = read_asset(Path::new(file))?;
+            let (w, _) = cooked::decode_scene(&data)?;
+            let started = std::time::Instant::now();
+            let baked = ganbate_engine::render::ao::bake_world(&w)?;
+            std::fs::write(out, &baked)?;
+            println!(
+                "{}: baked AO in {:.1} s, {} bytes",
+                Path::new(out).display(),
+                started.elapsed().as_secs_f32(),
+                baked.len()
+            );
+        }
         [cmd, file] if cmd == "inspect" => {
             let data = read_asset(Path::new(file))?;
             let (w, table) = cooked::decode_scene(&data)?;
@@ -278,7 +292,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "usage: ganbate-build cook [--compact] [--keep-images] source.glb output.gbew \
                         | cook-scene [--compact] [--keep-images] [--force] PROJECT SCENE output.gbew \
                         | import [--force] PROJECT content/model.glb content/new.scene.json \
-                        | inspect file.gbew | model file.glb | simulate file.gbew STEPS"
+                        | inspect file.gbew | bake-ao file.gbew output.gbao | model file.glb \
+                        | simulate file.gbew STEPS"
+
                     .into(),
             );
         }

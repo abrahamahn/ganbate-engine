@@ -180,6 +180,81 @@ fn write_vertices(
     }
 }
 
+/// What the CPU keeps of `world` (as [`GpuScene::upload`] reads it, before its vertices are laid
+/// out).
+fn world_edit(world: &World) -> WorldEdit {
+    WorldEdit {
+        meshes: world
+            .meshes
+            .iter()
+            .map(|m| {
+                let positions: Vec<V3> = m.positions.iter().map(|p| [p.0, p.1, p.2]).collect();
+                let bounds = super::props::bounds(&positions);
+                EditMesh {
+                    positions,
+                    normals: m.normals.iter().map(|n| [n.0, n.1, n.2]).collect(),
+                    uvs: m.uvs.clone(),
+                    indices: m.indices.clone(),
+                    bounds,
+                }
+            })
+            .collect(),
+        instances: world
+            .instances
+            .iter()
+            .map(|i| EditInstance {
+                mesh: i.mesh,
+                transform: i.transform.0,
+                first_vertex: None,
+                visible: true,
+            })
+            .collect(),
+        lights: world.lights.clone(),
+        water_meshes: world
+            .meshes
+            .iter()
+            .map(|m| {
+                m.material
+                    .is_some_and(|k| world.materials[k as usize].shading == Shading::Water)
+            })
+            .collect(),
+        occluder_meshes: world
+            .meshes
+            .iter()
+            .map(|m| match m.material {
+                Some(k) => {
+                    let mat = &world.materials[k as usize];
+                    mat.shading == Shading::Standard && mat.alpha == AlphaMode::Opaque
+                }
+                None => true,
+            })
+            .collect(),
+        receiver_meshes: world
+            .meshes
+            .iter()
+            .map(|m| match m.material {
+                Some(k) => world.materials[k as usize].shading == Shading::Standard,
+                None => true,
+            })
+            .collect(),
+        draw_sources: Vec::new(),
+        vertex_count: 0,
+    }
+}
+
+/// The CPU's copy of `world` the AO bake reads, laid out as [`GpuScene::upload`] does, without
+/// a GPU (`ganbate-build bake-ao`).
+pub(super) fn cpu_edit(world: &World) -> Result<WorldEdit> {
+    world.validate()?;
+    let mut edit = world_edit(world);
+    for inst in &mut edit.instances {
+        if !edit.meshes[inst.mesh as usize].indices.is_empty() {
+            inst.first_vertex = Some(0);
+        }
+    }
+    Ok(edit)
+}
+
 impl GpuScene {
     pub fn upload(device: &mut Device<'_>, world: &World) -> Result<Self> {
         world.validate()?;
@@ -237,63 +312,7 @@ impl GpuScene {
         let mut names: Vec<String> = world.materials.iter().map(|m| m.name.clone()).collect();
         let mut flat_materials = std::collections::HashMap::new();
 
-        let mut edit = WorldEdit {
-            meshes: world
-                .meshes
-                .iter()
-                .map(|m| {
-                    let positions: Vec<V3> = m.positions.iter().map(|p| [p.0, p.1, p.2]).collect();
-                    let bounds = super::props::bounds(&positions);
-                    EditMesh {
-                        positions,
-                        normals: m.normals.iter().map(|n| [n.0, n.1, n.2]).collect(),
-                        uvs: m.uvs.clone(),
-                        indices: m.indices.clone(),
-                        bounds,
-                    }
-                })
-                .collect(),
-            instances: world
-                .instances
-                .iter()
-                .map(|i| EditInstance {
-                    mesh: i.mesh,
-                    transform: i.transform.0,
-                    first_vertex: None,
-                    visible: true,
-                })
-                .collect(),
-            lights: world.lights.clone(),
-            water_meshes: world
-                .meshes
-                .iter()
-                .map(|m| {
-                    m.material
-                        .is_some_and(|k| world.materials[k as usize].shading == Shading::Water)
-                })
-                .collect(),
-            occluder_meshes: world
-                .meshes
-                .iter()
-                .map(|m| match m.material {
-                    Some(k) => {
-                        let mat = &world.materials[k as usize];
-                        mat.shading == Shading::Standard && mat.alpha == AlphaMode::Opaque
-                    }
-                    None => true,
-                })
-                .collect(),
-            receiver_meshes: world
-                .meshes
-                .iter()
-                .map(|m| match m.material {
-                    Some(k) => world.materials[k as usize].shading == Shading::Standard,
-                    None => true,
-                })
-                .collect(),
-            draw_sources: Vec::new(),
-            vertex_count: 0,
-        };
+        let mut edit = world_edit(world);
 
         let inst_bounds: Vec<(V3, V3)> = world
             .instances
@@ -714,6 +733,20 @@ impl GpuScene {
             self.ao_revision += 1;
         }
         Ok(!updated.is_empty())
+    }
+
+    /// Takes the world's AO from a sidecar baked for it (`ganbate-build bake-ao`) and writes it
+    /// into the vertices: nothing is left to bake. Fails, changing nothing, when the sidecar
+    /// was baked for another world.
+    pub fn import_ao(&mut self, device: &mut Device<'_>, data: &[u8]) -> Result<()> {
+        self.ao.import(&self.edit, data)?;
+        for index in 0..self.edit.instances.len() {
+            if let Some(n) = self.ao.values(index).map(<[f32]>::len) {
+                self.write_instance_range(device, index, 0..n)?;
+            }
+        }
+        self.ao_revision += 1;
+        Ok(())
     }
 
     /// Completes the AO bake now (stills, which must not depend on how many frames ran).
