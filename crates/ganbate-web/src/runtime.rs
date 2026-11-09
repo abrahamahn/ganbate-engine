@@ -1870,6 +1870,7 @@ mod tests {
             reflection_drawn: false,
             ssao_drawn: true,
             fused_tonemap: true,
+            world_cached: false,
         };
         assert_eq!(frame_stats_words(stats), [42, 27, 15, 1, 11, 0, 0, 1, 1]);
     }

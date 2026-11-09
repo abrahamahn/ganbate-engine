@@ -46,6 +46,23 @@ fn linear_depth(d: f32) -> f32 {
   return frame.cascades.w / max(d, 1e-7);
 }
 
+struct Restored {
+  @location(0) color: vec4f,
+  @location(1) aux: vec4f,
+  @builtin(frag_depth) depth: f32,
+};
+
+// The cached world (`Renderer::world_cache`) back into the frame's colour, aux and depth, pixel
+// for pixel, before the props, water, sky and weather are drawn over it.
+@fragment fn fs_restore(in: Screen) -> Restored {
+  let p = vec2i(in.clip.xy);
+  var o: Restored;
+  o.color = textureLoad(src_tex, p, 0);
+  o.aux = textureLoad(aux_tex, p, 0);
+  o.depth = textureLoad(depth_tex, p, 0);
+  return o;
+}
+
 const KERNEL = array<vec3f, 16>(
   vec3f(0.5381, 0.1856, 0.4319), vec3f(0.1379, 0.2486, 0.4430), vec3f(0.3371, 0.5679, 0.0057),
   vec3f(-0.6999, -0.0451, 0.0019), vec3f(0.0689, -0.1598, 0.8547), vec3f(0.0560, 0.0069, 0.1843),

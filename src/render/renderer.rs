@@ -31,6 +31,26 @@ const PROP_SHADER: &str = include_str!("shaders/prop_shader.wgsl");
 const HDR: Format = Format::Rgba16Float;
 const LUT_SIZE: u32 = 16;
 const MAX_LIGHTS_PER_TILE: usize = 96;
+/// Frames a cached world may lag the converging AO by (a quarter second at 60 frames a second).
+const AO_CACHE_REFRESH_FRAMES: u32 = 15;
+/// Byte offset of `camera.w` (the clock's seconds) in the frame block: after five matrices.
+const CAMERA_SECONDS: usize = 5 * 64 + 12;
+
+/// FNV-1a over bytes: a fingerprint of what the cached world was drawn for.
+struct Fnv(u64);
+impl Fnv {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for b in bytes {
+            self.0 = (self.0 ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
 /// Vertex AO samples a live frame may bake (each casts `AoConfig::rays` rays): about 3 ms in
 /// wasm, inside a 120 Hz frame. Nearest the camera first, so what is in view settles first.
 const AO_FRAME_SAMPLES: usize = 400;
@@ -187,6 +207,8 @@ pub struct FrameStats {
     pub reflection_drawn: bool,
     pub ssao_drawn: bool,
     pub fused_tonemap: bool,
+    /// The frame started from the cached world rather than drawing it.
+    pub world_cached: bool,
 }
 
 /// Where the final pass writes.
@@ -205,8 +227,10 @@ enum WorldPart {
     All,
     /// Opaque draws, nearest first (the main view, with the pipeline that never discards).
     Opaque,
-    /// The alpha-tested and water draws, in scene order.
-    Rest,
+    /// The alpha-tested draws, in scene order.
+    Masked,
+    /// The water, in scene order (its surface moves, so a cached world leaves it out).
+    Water,
 }
 
 pub(super) struct Pipelines {
@@ -233,6 +257,8 @@ pub(super) struct Pipelines {
     pub(super) prop_shader_bindings: Vec<ganbate_shader::Binding>,
     /// The props' vertex stage (`vs_prop`): every prop shader's, which never calls `shade`.
     pub(super) prop_vs: Compiled,
+    /// Copies the cached world back into the frame's colour, aux and depth targets.
+    restore: PipelineId,
     shadow: PipelineId,
     shadow_masked: PipelineId,
     pub(super) shadow_prop: PipelineId,
@@ -258,6 +284,10 @@ pub(super) struct Targets {
     hdr: TextureId,
     aux: TextureId,
     depth: TextureId,
+    /// The world's part of the main pass as last drawn ([`Renderer::world_cache`]).
+    cache_hdr: TextureId,
+    cache_aux: TextureId,
+    cache_depth: TextureId,
     refl: (u32, u32),
     pub(super) refl_hdr: TextureId,
     refl_aux: TextureId,
@@ -287,6 +317,7 @@ pub(super) struct Slot {
     grass: BindGroupId,
     flower: BindGroupId,
     particle: BindGroupId,
+    restore: BindGroupId,
     ssao: BindGroupId,
     air: BindGroupId,
     down: Vec<BindGroupId>,
@@ -298,6 +329,12 @@ pub(super) struct Slot {
 }
 
 pub struct Renderer {
+    /// What the cached world was drawn for (view, size, frame inputs, world revision); `None`
+    /// until it is drawn and after anything that changes it without changing those.
+    world_cache: Option<u64>,
+    /// The AO refinement the cached world shows, and the frames since it was drawn.
+    cache_ao_revision: u64,
+    cache_age: u32,
     pub(super) scene: GpuScene,
     pub(super) pipelines: Pipelines,
     pub(super) quality: Quality,
@@ -783,6 +820,23 @@ impl Pipelines {
             flower,
             sky,
             particle,
+            restore: device.create_render_pipeline(&RenderPipelineDesc {
+                vertex: &fsvs,
+                fragment: Some(&compile(POST, Stage::Fragment, "fs_restore")?),
+                vertex_layout: None,
+                topology: Topology::TriangleList,
+                cull: Cull::None,
+                front_ccw: true,
+                depth: Some(DepthState {
+                    format: Format::Depth32Float,
+                    compare: Compare::Always,
+                    write: true,
+                    bias_constant: 0.0,
+                    bias_slope: 0.0,
+                    clamp: false,
+                }),
+                colors: vec![color(HDR, Blend::Replace), color(HDR, Blend::Replace)],
+            })?,
             ssao: fullscreen(device, &fsvs, "fs_ssao", Format::R16Float, Blend::Replace)?,
             air: fullscreen(device, &fsvs, "fs_air", HDR, Blend::Replace)?,
             bloom_down: fullscreen(device, &fsvs, "fs_bloom_down", HDR, Blend::Replace)?,
@@ -1169,6 +1223,9 @@ impl Renderer {
             world_mask,
             world,
             world_drawn: false,
+            world_cache: None,
+            cache_ao_revision: 0,
+            cache_age: 0,
             world_moved: false,
             ao_quiet_frames: AO_SETTLE_FRAMES,
             details,
@@ -1204,6 +1261,7 @@ impl Renderer {
         (self.details, self.grassy) = material_details(&look, &self.scene);
         self.look = look;
         self.world_drawn = false;
+        self.world_cache = None;
         self.ground_cached_vp = None;
         self.lut_dirty = true;
         self.restyle_props();
@@ -1282,6 +1340,9 @@ impl Renderer {
             hdr: tex(device, width, height, HDR, rt)?,
             aux: tex(device, width, height, HDR, rt)?,
             depth: tex(device, width, height, Format::Depth32Float, depth_usage)?,
+            cache_hdr: tex(device, width, height, HDR, rt)?,
+            cache_aux: tex(device, width, height, HDR, rt)?,
+            cache_depth: tex(device, width, height, Format::Depth32Float, depth_usage)?,
             refl,
             refl_hdr: tex(device, refl.0, refl.1, HDR, rt)?,
             refl_aux: tex(device, refl.0, refl.1, HDR, rt)?,
@@ -1404,6 +1465,18 @@ impl Renderer {
             )
         };
         let none = Resource::Texture(self.dummy);
+        let restore = device.create_bind_group(
+            p.restore,
+            0,
+            &[
+                (0, buf(frame[0])),
+                (1, Resource::Texture(t.cache_depth)),
+                (2, Resource::Texture(t.cache_aux)),
+                (3, Resource::Texture(t.cache_hdr)),
+                (4, none),
+                (5, Resource::Sampler(self.linear_clamp)),
+            ],
+        )?;
         let ssao = post(device, p.ssao, none, none)?;
         let air = post(
             device,
@@ -1464,6 +1537,7 @@ impl Renderer {
             grass,
             flower,
             particle,
+            restore,
             ssao,
             air,
             down,
@@ -1481,7 +1555,7 @@ impl Renderer {
                 .scene
                 .into_iter()
                 .chain(s.sky)
-                .chain([s.grass, s.flower, s.particle, s.ssao, s.air])
+                .chain([s.grass, s.flower, s.particle, s.restore, s.ssao, s.air])
                 .chain([s.tonemap, s.tonemap_final, s.paint, s.output])
             {
                 device.destroy_bind_group(g);
@@ -1500,6 +1574,9 @@ impl Renderer {
             old.hdr,
             old.aux,
             old.depth,
+            old.cache_hdr,
+            old.cache_aux,
+            old.cache_depth,
             old.refl_hdr,
             old.refl_aux,
             old.refl_depth,
@@ -1525,6 +1602,7 @@ impl Renderer {
             return Ok(());
         }
         let new_targets = Self::create_targets(device, &self.quality, self.output, size)?;
+        self.world_cache = None;
         self.reset_prop_slots(device);
         Self::destroy_slots(device, std::mem::take(&mut self.slots));
         let old = std::mem::replace(&mut self.targets, new_targets);
@@ -1548,6 +1626,7 @@ impl Renderer {
         }
         let size = (self.targets.width, self.targets.height);
         let new_targets = Self::create_targets(device, &quality, self.output, size)?;
+        self.world_cache = None;
 
         let old_shadow_size = self.quality.shadow_size.max(16);
         let new_shadow_size = quality.shadow_size.max(16);
@@ -2143,7 +2222,8 @@ impl Renderer {
             let opaque = !d.water && self.scene.materials[d.material].params[0] < 0.0;
             match part {
                 WorldPart::Opaque if !opaque => continue,
-                WorldPart::Rest if opaque => continue,
+                WorldPart::Masked if opaque || d.water => continue,
+                WorldPart::Water if !d.water => continue,
                 _ => {}
             }
             total += 1;
@@ -2322,6 +2402,7 @@ impl Renderer {
             }
         });
         let has_reflection = refl_eye.is_some();
+        let world_key;
         {
             let tiles_dim = self.targets.tiles;
             let refl_size = self.targets.refl;
@@ -2342,6 +2423,16 @@ impl Renderer {
                 seed,
             );
             device.write_buffer(slot.frame[0], 0, &block)?;
+            // What the world's picture depends on: this view's frame inputs (but the clock,
+            // which moves only what the cached world leaves out), the world and the lights.
+            let mut key = Fnv::new();
+            key.write(&block[..CAMERA_SECONDS]);
+            key.write(&block[CAMERA_SECONDS + 4..]);
+            key.write(&self.scene.revision.to_le_bytes());
+            for record in self.game_lights.records() {
+                key.write(&f32_bytes(record));
+            }
+            world_key = key.finish();
             if let Some(re) = &refl_eye {
                 let (tiles, index) = self.tile_lights(re, refl_size, tiles_dim[1], lamps_on);
                 device.write_buffer(slot.tiles[1], 0, &crate::gpu::u32_bytes(&tiles))?;
@@ -2360,6 +2451,22 @@ impl Renderer {
                 );
                 device.write_buffer(slot.frame[1], 0, &block)?;
             }
+        }
+        // A presented view draws the world's part of the main pass, and the water's reflection,
+        // only when what they show changed; otherwise the frame starts from those pictures. A
+        // still draws everything.
+        let cached = self.output != Output::Still;
+        // While the baked AO converges (a minute or so after start or an edit), the picture
+        // follows it every few frames rather than being drawn again every frame.
+        let ao_due = self.scene.ao_revision != self.cache_ao_revision
+            && (self.cache_age >= AO_CACHE_REFRESH_FRAMES || self.scene.ao.is_idle());
+        let rebuild = cached && (self.world_cache != Some(world_key) || ao_due);
+        if rebuild {
+            self.world_cache = Some(world_key);
+            self.cache_ao_revision = self.scene.ao_revision;
+            self.cache_age = 0;
+        } else {
+            self.cache_age = self.cache_age.saturating_add(1);
         }
         let mut stats = FrameStats::default();
 
@@ -2498,8 +2605,9 @@ impl Renderer {
 
         let mut push = [0.0f32; 32];
         let clear = [0.0, 0.0, 0.0, 0.0];
-        // Water reflection.
-        if let Some(re) = &refl_eye {
+        // Water reflection (kept from the frame that last drew it while the world's picture holds;
+        // the props it mirrors stand far from the water).
+        if let Some(re) = refl_eye.as_ref().filter(|_| !cached || rebuild) {
             stats.reflection_drawn = true;
             self.targets.refl_cleared = true;
             let (refl_hdr, refl_aux, refl_depth) = (
@@ -2539,6 +2647,27 @@ impl Renderer {
         let slot = &self.slots[slot_index];
         let t = &self.targets;
         let p = &self.pipelines;
+        let (mut total_draws, mut submitted_draws) = (0, 0);
+        let mut count = |(total, submitted): (u32, u32)| {
+            total_draws += total;
+            submitted_draws += submitted;
+        };
+        if rebuild {
+            enc.begin_pass(PassDesc {
+                colors: vec![
+                    Attachment::clear(t.cache_hdr, clear),
+                    Attachment::clear(t.cache_aux, clear),
+                ],
+                depth: Some(Attachment::clear(t.cache_depth, clear)),
+            });
+            enc.set_pipeline(p.scene_opaque);
+            enc.set_bind_group(0, slot.scene[0]);
+            count(self.draw_world(enc, &mut push, &eye, true, WorldPart::Opaque));
+            enc.set_pipeline(p.scene);
+            enc.set_bind_group(0, slot.scene[0]);
+            count(self.draw_world(enc, &mut push, &eye, true, WorldPart::Masked));
+            enc.end_pass();
+        }
 
         // Main pass: world, sky, weather.
         enc.begin_pass(PassDesc {
@@ -2548,19 +2677,28 @@ impl Renderer {
             ],
             depth: Some(Attachment::clear(t.depth, clear)),
         });
-        // The game's props first: the table and its players stand nearest and cover most of
-        // the screen, so the world behind them fails the depth test before it is shaded.
-        self.draw_props(enc, slot_index, 0);
-        enc.set_pipeline(p.scene_opaque);
-        enc.set_bind_group(0, slot.scene[0]);
-        let (opaque_total, opaque_submitted) =
-            self.draw_world(enc, &mut push, &eye, true, WorldPart::Opaque);
+        if cached {
+            // The cached world (colour, aux and depth), then the props over it.
+            enc.set_pipeline(p.restore);
+            enc.set_bind_group(0, slot.restore);
+            enc.draw(3, 1, 0, 0);
+            self.draw_props(enc, slot_index, 0);
+        } else {
+            // The game's props first: the table and its players stand nearest and cover most
+            // of the screen, so the world behind them fails the depth test before it is shaded.
+            self.draw_props(enc, slot_index, 0);
+            enc.set_pipeline(p.scene_opaque);
+            enc.set_bind_group(0, slot.scene[0]);
+            count(self.draw_world(enc, &mut push, &eye, true, WorldPart::Opaque));
+            enc.set_pipeline(p.scene);
+            enc.set_bind_group(0, slot.scene[0]);
+            count(self.draw_world(enc, &mut push, &eye, true, WorldPart::Masked));
+        }
+        // The water moves with the clock, so it is drawn every frame.
         enc.set_pipeline(p.scene);
         enc.set_bind_group(0, slot.scene[0]);
-        let (rest_total, rest_submitted) =
-            self.draw_world(enc, &mut push, &eye, true, WorldPart::Rest);
-        let (total_draws, submitted_draws) =
-            (opaque_total + rest_total, opaque_submitted + rest_submitted);
+        count(self.draw_world(enc, &mut push, &eye, true, WorldPart::Water));
+        stats.world_cached = cached && !rebuild;
         stats.world_draws_total = total_draws;
         stats.world_draws_submitted = submitted_draws;
         stats.world_draws_culled = total_draws.saturating_sub(submitted_draws);

@@ -41,6 +41,11 @@ pub(super) struct MaterialData {
 }
 
 pub(super) struct GpuScene {
+    /// Counts every change to what the world draws (instances, lamps, bounds), so a cached
+    /// picture of the world knows it is stale.
+    pub revision: u64,
+    /// Counts the baked AO's refinements, which a cached picture follows at its own pace.
+    pub ao_revision: u64,
     pub vertices: BufferId,
     pub indices: BufferId,
     pub draws: Vec<DrawItem>,
@@ -594,6 +599,8 @@ impl GpuScene {
         }
 
         Ok(Self {
+            revision: 0,
+            ao_revision: 0,
             vertices: vb,
             indices: ib,
             draws,
@@ -650,6 +657,7 @@ impl GpuScene {
             [0, 1, 2].map(|k| before.1[k].max(after.1[k])),
         );
         self.ao.invalidate_region(&self.edit, changed);
+        self.revision += 1;
         self.write_instance(device, index)
     }
 
@@ -702,6 +710,9 @@ impl GpuScene {
         for (index, range) in &updated {
             self.write_instance_range(device, *index, range.clone())?;
         }
+        if !updated.is_empty() {
+            self.ao_revision += 1;
+        }
         Ok(!updated.is_empty())
     }
 
@@ -728,12 +739,14 @@ impl GpuScene {
         let range = if l.range > 0.0 { l.range } else { 1.0e4 };
         let record = super::lights::lamp_record(position, range, l.color, l.intensity);
         self.lights[index] = record;
+        self.revision += 1;
         device.write_buffer(self.light_buffer, index as u64 * 64, &f32_bytes(&record))
     }
 
     /// Recomputes world bounds, per-chunk bounds and water level after one or more world
     /// instances moved or changed visibility (their AO follows through `step_ao`).
     pub fn refresh_world(&mut self) {
+        self.revision += 1;
         self.refresh_bounds();
         for (d, src) in self.draws.iter_mut().zip(&self.edit.draw_sources) {
             let mut lo = [f32::INFINITY; 3];
