@@ -73,6 +73,16 @@ export interface GanbateFrameStats {
   readonly fusedTonemap: boolean;
 }
 
+/** What a frame did with the room's cached picture (`GanbateEngine.cacheStats`). */
+export interface GanbateCacheStats {
+  /** It started from the picture as it was (false: it drew the picture whole). */
+  readonly worldCached: boolean;
+  /** Regions of the picture emptied and drawn again (props entering or leaving it). */
+  readonly regions: number;
+  /** Pixels of it that moved props' shadows reach were shaded again. */
+  readonly reshaded: boolean;
+}
+
 export interface GanbateStereoViews {
   readonly left: { readonly eye: [number, number, number]; readonly target: [number, number, number] };
   readonly right: { readonly eye: [number, number, number]; readonly target: [number, number, number] };
@@ -249,6 +259,7 @@ export interface GanbateEngine {
   setQuality(mode: GanbateQualityMode): boolean;
   /** Latest per-frame draw, cull, cache, and pass-skip telemetry, or `null` if unavailable. */
   frameStats(): GanbateFrameStats | null;
+  cacheStats(): GanbateCacheStats | null;
   /** Selects stereo XR eye (`'mono' | 'left' | 'right'` or `-1 | 0 | 1`) with IPD in metres (`0.050..=0.078`, default `0.063`). */
   setStereoEye(eye?: GanbateStereoEyeName | GanbateStereoEye, ipdMetres?: number): boolean;
   /** Parallel-axis left/right stereo view pair derived from the current camera and IPD, or `null` if unavailable. */

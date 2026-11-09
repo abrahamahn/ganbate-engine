@@ -605,6 +605,34 @@ pub unsafe extern "C" fn ganbate_rt_frame_stats(out: *mut u8) -> u32 {
     })
 }
 
+/// Writes what the last frame did with the room's cached picture as three words at `out`: 1 when
+/// it started from the picture as it was (0: drew it whole), the regions of it drawn again, and 1
+/// when pixels of it that moved props' shadows reach were shaded again.
+///
+/// # Safety
+/// `out` must address 12 writable bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn ganbate_rt_cache_stats(out: *mut u8) -> u32 {
+    with(0, |rt| {
+        if out.is_null() {
+            return Err("cache_stats: null output buffer".into());
+        }
+        let s = rt.renderer.last_frame_stats();
+        let words = [
+            u32::from(s.world_cached),
+            s.cache_regions,
+            u32::from(s.reshaded),
+        ];
+        let mut buf = [0u8; 12];
+        for (i, w) in words.iter().enumerate() {
+            buf[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+        }
+        // SAFETY: the caller passes 12 writable bytes.
+        unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), out, 12) };
+        Ok(1)
+    })
+}
+
 /// Writes the size the renderer draws at (device pixels) as two words at `out`.
 ///
 /// # Safety
