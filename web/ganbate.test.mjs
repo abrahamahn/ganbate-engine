@@ -191,6 +191,110 @@ test('pickRay and pickWorldRay degrade gracefully to null when WASM omits ray ex
   assert.equal(engine.pickWorldRay([0, 1.6, 3], [0, 0, -1]), null);
 });
 
+/** A canvas whose CSS box counts its reads, and a mock engine that projects to (100, 50). */
+async function makeLayoutProbe() {
+  const { canvas } = makeRecordingWebGl2Canvas(640, 360);
+  const probe = { reads: 0, box: [320, 180], sizeCalls: 0, picks: [] };
+  Object.defineProperty(canvas, 'clientWidth', { get() { probe.reads++; return probe.box[0]; } });
+  Object.defineProperty(canvas, 'clientHeight', { get() { probe.reads++; return probe.box[1]; } });
+  const mock = makeMockWasm({
+    ganbate_rt_size(outPtr) {
+      probe.sizeCalls++;
+      new Uint32Array(mock.memory.buffer, outPtr >>> 0, 2).set([640, 360]);
+      return 1;
+    },
+    ganbate_rt_project(_x, _y, _z, outPtr) {
+      new Float32Array(mock.memory.buffer, outPtr >>> 0, 3).set([100, 50, 2]);
+      return 1;
+    },
+    ganbate_rt_pick(x, y) {
+      probe.picks.push([x, y]);
+      return 0;
+    },
+    ganbate_rt_pick_world(x, y) {
+      probe.picks.push([x, y]);
+      return 0;
+    },
+    ganbate_rt_render() { return 2; },
+  });
+  const engine = await createEngine({ canvas, wasm: mock.instance, api: 'webgl2' });
+  probe.reads = 0;
+  return { canvas, engine, probe };
+}
+
+test('project, pick and fitCanvas use the observed CSS box and read the drawn size once a frame', async () => {
+  const saved = { ResizeObserver: globalThis.ResizeObserver, getComputedStyle: globalThis.getComputedStyle };
+  const observers = [];
+  globalThis.ResizeObserver = class {
+    constructor(callback) { this.callback = callback; observers.push(this); }
+    observe(target) { this.target = target; }
+    disconnect() { this.target = null; }
+  };
+  let writingMode = 'horizontal-tb';
+  globalThis.getComputedStyle = () => ({ writingMode });
+  try {
+    const { canvas, engine, probe } = await makeLayoutProbe();
+    assert.equal(observers.length, 1);
+    assert.equal(observers[0].target, canvas);
+
+    // The box read at start: 320x180 CSS pixels over 640x360 drawn, so half a CSS pixel each.
+    assert.deepEqual(engine.project([0, 0, 0]), { x: 50, y: 25, depth: 2 });
+    engine.pick(10, 20);
+    engine.pickWorld(10, 20);
+    engine.project([1, 2, 3]);
+    assert.deepEqual(probe.picks, [[20, 40], [20, 40]]);
+    engine.fitCanvas(3);
+    assert.deepEqual([canvas.width, canvas.height], [960, 540]);
+    assert.equal(probe.reads, 0, 'no layout reads after start');
+    assert.equal(probe.sizeCalls, 1, 'the drawn size is read once until the next frame');
+
+    // Resizes arrive through the observer, rounded to whole CSS pixels like clientWidth.
+    probe.box = [1, 1];
+    const resize = (entry) => observers[0].callback([entry]);
+    resize({ contentBoxSize: [{ inlineSize: 480.4, blockSize: 270 }], contentRect: { width: 480.4, height: 270 } });
+    assert.deepEqual(engine.project([0, 0, 0]), { x: 75, y: 37.5, depth: 2 });
+    writingMode = 'vertical-rl';
+    resize({ contentBoxSize: [{ inlineSize: 180, blockSize: 320 }], contentRect: { width: 320, height: 180 } });
+    assert.deepEqual(engine.project([0, 0, 0]), { x: 50, y: 25, depth: 2 });
+    writingMode = 'horizontal-tb';
+    resize({ contentBoxSize: { inlineSize: 640, blockSize: 360 } });
+    assert.deepEqual(engine.project([0, 0, 0]), { x: 100, y: 50, depth: 2 });
+    resize({ contentRect: { width: 160, height: 90 } });
+    engine.fitCanvas(2);
+    assert.deepEqual([canvas.width, canvas.height], [320, 180]);
+    assert.equal(probe.reads, 0);
+
+    // A frame may resize the drawing, so the next call reads the size again.
+    assert.equal(probe.sizeCalls, 1);
+    engine.render();
+    engine.project([0, 0, 0]);
+    engine.project([0, 0, 0]);
+    assert.equal(probe.sizeCalls, 2);
+    const s = engine.size();
+    s.width = 1;
+    assert.deepEqual(engine.size(), { width: 640, height: 360 });
+
+    engine.destroy();
+    assert.equal(observers[0].target, null);
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete globalThis[k];
+      else globalThis[k] = v;
+    }
+  }
+});
+
+test('without ResizeObserver, project and fitCanvas read the CSS box on every call', async () => {
+  assert.equal(typeof globalThis.ResizeObserver, 'undefined');
+  const { canvas, engine, probe } = await makeLayoutProbe();
+  assert.deepEqual(engine.project([0, 0, 0]), { x: 50, y: 25, depth: 2 });
+  probe.box = [640, 360];
+  assert.deepEqual(engine.project([0, 0, 0]), { x: 100, y: 50, depth: 2 });
+  engine.fitCanvas(1);
+  assert.deepEqual([canvas.width, canvas.height], [640, 360]);
+  assert.equal(probe.reads, 6);
+});
+
 test('glContext and setXrTarget support WebXR stereo eye framebuffer blits on WebGL 2 and restore canvas blit', async () => {
   const { canvas, gl, recorded, constants } = makeRecordingWebGl2Canvas(640, 360);
   let glSubmit = null;

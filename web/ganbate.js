@@ -2066,16 +2066,51 @@ export async function createEngine(options) {
 
   let inFlight = 0;
   let stopped = false;
-  const size = () => {
-    const p = reserve(8);
-    ok('size', x.ganbate_rt_size(p));
-    const s = new Uint32Array(x.memory.buffer, p, 2);
-    return { width: s[0], height: s[1] };
+  // The size frames are drawn at changes only inside ganbate_rt_render (a resize), so it is
+  // read once after each render() call, not on every project or pick.
+  let drawn = null;
+  const drawnSize = () => {
+    if (!drawn) {
+      const p = reserve(8);
+      ok('size', x.ganbate_rt_size(p));
+      const s = new Uint32Array(x.memory.buffer, p, 2);
+      drawn = { width: s[0], height: s[1] };
+    }
+    return drawn;
   };
+  const size = () => ({ ...drawnSize() });
+  // The canvas's CSS box, kept by a ResizeObserver: reading clientWidth or clientHeight forces
+  // a layout whenever styles changed, and fitCanvas, project and pick run every frame or many
+  // times per action. The observed box follows a CSS resize one frame late. Without
+  // ResizeObserver every call reads the box, as before.
+  let cssBox = null;
+  let observer = null;
+  const cssSize = () => cssBox || { width: canvas.clientWidth, height: canvas.clientHeight };
+  /** The observed content box as [width, height]: contentBoxSize is logical (inline, block). */
+  const observedBox = (entry) => {
+    const b = entry.contentBoxSize?.[0] ?? entry.contentBoxSize;
+    if (!b) return [entry.contentRect.width, entry.contentRect.height];
+    const vertical = /^(vertical|sideways)/.test(getComputedStyle(canvas).writingMode);
+    return vertical ? [b.blockSize, b.inlineSize] : [b.inlineSize, b.blockSize];
+  };
+  if (typeof ResizeObserver === 'function') {
+    try {
+      observer = new ResizeObserver((entries) => {
+        // Whole CSS pixels, as clientWidth and clientHeight give them.
+        const [w, h] = observedBox(entries[entries.length - 1]);
+        cssBox = { width: Math.round(w), height: Math.round(h) };
+      });
+      observer.observe(canvas);
+      cssBox = { width: canvas.clientWidth, height: canvas.clientHeight };
+    } catch (_) {
+      observer = null; // Not an element (an OffscreenCanvas): read the box per call.
+    }
+  }
   /** CSS pixels per rendered pixel along x and y. */
   const cssScale = () => {
-    const s = size();
-    return { sx: (canvas.clientWidth || s.width) / s.width, sy: (canvas.clientHeight || s.height) / s.height };
+    const s = drawnSize();
+    const css = cssSize();
+    return { sx: (css.width || s.width) / s.width, sy: (css.height || s.height) / s.height };
   };
 
   const engine = {
@@ -2084,8 +2119,9 @@ export async function createEngine(options) {
     errors: () => [...errors, ...host.errors.filter((e) => !errors.includes(e))],
     /** Sizes the canvas to its CSS box times `dpr` (default: the device pixel ratio). */
     fitCanvas(dpr = window.devicePixelRatio || 1) {
-      const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
-      const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+      const css = cssSize();
+      const w = Math.max(1, Math.round(css.width * dpr));
+      const h = Math.max(1, Math.round(css.height * dpr));
       if (canvas.width !== w) canvas.width = w;
       if (canvas.height !== h) canvas.height = h;
     },
@@ -2224,6 +2260,7 @@ export async function createEngine(options) {
       if (stopped) return false;
       if (gpu.device && inFlight >= 2) return false;
       host.nextFrame();
+      drawn = null;
       const r = x.ganbate_rt_render();
       if (!r) throw fail('render');
       if (r !== 1) return false;
@@ -2607,6 +2644,8 @@ export async function createEngine(options) {
       if (stopped) return;
       stopped = true;
       x.ganbate_rt_stop();
+      observer?.disconnect();
+      drawn = null;
       if (scratch) x.ganbate_free(scratch, scratchCap);
       scratch = 0;
       scratchCap = 0;
