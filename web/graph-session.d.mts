@@ -47,6 +47,8 @@ export declare function createGraphSession(options: {
   readonly channel?: GanbateGraphChannel | false;
   readonly mode?: 'project' | 'reject';
   readonly historyLimit?: number;
+  /** The game's own rules: throw to refuse a graph. */
+  readonly validate?: (graph: GanbateGraph) => void;
 }): GanbateGraphSession;
 
 /** A channel over postMessage to `target` at `origin` (a frame, or the page embedding this one). */

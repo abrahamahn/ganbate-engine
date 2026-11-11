@@ -21,6 +21,8 @@ export const GRAPH_CHANNEL_PREFIX = 'ganbate-graph:';
  * `engine` needs `graphCommit(graph, patch, mode)` and `graphCheck(graph, previous, mode)`, as the
  * engine and `createGraphSolver` provide.
  * `mode` 'project' repairs what breaks the rules and reports it; 'reject' refuses the change.
+ * `validate(graph)` adds the game's own rules (a node it needs, a value it allows): it throws to
+ * refuse a graph, which then neither becomes this session's nor is taken from another participant.
  * `channel`: false for a page-local session, an object as above, or omitted for the default.
  */
 export function createGraphSession({
@@ -30,8 +32,13 @@ export function createGraphSession({
   channel,
   mode = 'project',
   historyLimit = 64,
+  validate = () => {},
 }) {
-  const opened = graph == null ? null : engine.graphCheck(graph, null, mode);
+  const solved = (result) => {
+    validate(result.graph);
+    return result;
+  };
+  const opened = graph == null ? null : solved(engine.graphCheck(graph, null, mode));
   let current = opened && { graph: opened.graph, digest: opened.digest };
   let joined = () => {};
   const ready = new Promise((resolve) => {
@@ -91,7 +98,7 @@ export function createGraphSession({
         return;
       }
       try {
-        adopt(engine.graphCheck(message.graph, null, 'reject'), message.source ?? 'remote', [], true);
+        adopt(solved(engine.graphCheck(message.graph, null, 'reject')), message.source ?? 'remote', [], true);
         settled = true;
       } catch {
         // A graph the rules refuse is not adopted; the sender keeps its own.
@@ -129,11 +136,11 @@ export function createGraphSession({
     },
     /** Applies graph operations; returns `{graph, digest, repairs}` or throws why they were refused. */
     commit(patch, { source = 'local' } = {}) {
-      return change(engine.graphCommit(joinedState().graph, patch, mode), source);
+      return change(solved(engine.graphCommit(joinedState().graph, patch, mode)), source);
     },
     /** Takes a whole graph written as code; changed relations place nodes, moved nodes relate anew. */
     replace(graph, { source = 'code' } = {}) {
-      return change(engine.graphCheck(graph, joinedState().graph, mode), source);
+      return change(solved(engine.graphCheck(graph, joinedState().graph, mode)), source);
     },
     undo({ source = 'local' } = {}) {
       return step(past, future, source);

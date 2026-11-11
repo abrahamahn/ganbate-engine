@@ -109,3 +109,22 @@ test('a page joins the graph of the frame it embeds over postMessage, and nobody
   table.close();
   page.close();
 });
+
+test("the game's own rules refuse a graph here and from other participants", async () => {
+  const name = `test-${Math.random()}`;
+  const validate = (graph) => {
+    if (!graph.nodes.some((n) => n.id === 'desk')) throw new Error('the desk stays');
+  };
+  const strict = createGraphSession({ engine, graph: ROOM, name, validate });
+  const loose = createGraphSession({ engine, graph: ROOM, name });
+  try {
+    assert.throws(() => strict.replace({ ...ROOM, nodes: [] }), /the desk stays/);
+    loose.replace({ ...ROOM, nodes: [] });
+    await settle();
+    assert.equal(strict.graph.nodes.length, 1);
+  } finally {
+    strict.close();
+    loose.close();
+  }
+});
+
