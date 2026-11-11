@@ -36,6 +36,78 @@ struct Out { @builtin(position) pos: vec4f, @location(0) uv: vec2f };
 @fragment fn fs(i: Out) -> @location(0) vec4f { return textureSampleLevel(src, smp, i.uv, 0.0); }
 `;
 
+/**
+ * Each pass's GPU time on a device no profiler reaches (an iPhone; 2026-11-12). While it is on, the
+ * engine draws one frame at a time (`busy`), so every frame starts on an idle GPU, and a host marks
+ * each pass (`mark`) with when it started (`sent`) and finished (`done`): WebGL 2 sends the passes
+ * one at a time, each followed by a fence; WebGPU writes timestamps where the GPU has them, and
+ * otherwise marks the whole frame. A pass took from the later of its start and the mark before it
+ * to its finish, so the time the GPU waited for the page is left out.
+ */
+function createPassTiming() {
+  let on = false;
+  let generation = 0;
+  let marks = [];
+  let pending = 0;
+  let frames = 0;
+  let busyMs = 0;
+  let wallMs = 0;
+  const sums = new Map();
+  return {
+    on: () => on,
+    set(value) {
+      on = !!value;
+      generation++;
+      marks = [];
+      pending = 0;
+      frames = 0;
+      busyMs = 0;
+      wallMs = 0;
+      sums.clear();
+    },
+    busy: () => pending > 0,
+    /** A marker after the work sent so far; the host sets its `done` when the GPU finished it. */
+    mark(label) {
+      const m = { label, sent: performance.now(), done: 0 };
+      marks.push(m);
+      return m;
+    },
+    /** The frame's markers and `finish`, which books them once every `done` is set. */
+    take() {
+      const taken = marks;
+      marks = [];
+      if (!taken.length) return null;
+      pending++;
+      const g = generation;
+      return {
+        marks: taken,
+        finish() {
+          if (g !== generation) return;
+          pending--;
+          let prev = taken[0].sent;
+          for (const m of taken) {
+            const ms = Math.max(0, m.done - Math.max(prev, m.sent));
+            sums.set(m.label, (sums.get(m.label) || 0) + ms);
+            busyMs += ms;
+            prev = Math.max(prev, m.done);
+          }
+          wallMs += prev - taken[0].sent;
+          frames++;
+        },
+      };
+    },
+    report() {
+      const n = Math.max(1, frames);
+      return {
+        frames,
+        gpuMs: busyMs / n,
+        wallMs: wallMs / n,
+        passes: [...sums].map(([label, ms]) => ({ label, ms: ms / n })),
+      };
+    },
+  };
+}
+
 /** Creates the WebGPU device and, if `canvas` is given, configures its context. */
 export async function createGpu(canvas) {
   if (!navigator.gpu) {
@@ -45,7 +117,7 @@ export async function createGpu(canvas) {
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) throw new Error('WebGPU is available but no adapter was found.');
   const wanted = ['depth-clip-control', 'float32-filterable', 'float32-blendable',
-    'texture-compression-bc', 'texture-compression-astc'];
+    'texture-compression-bc', 'texture-compression-astc', 'timestamp-query'];
   const requiredFeatures = wanted.filter((f) => adapter.features.has(f));
   const A = adapter.limits;
   const device = await adapter.requestDevice({
@@ -243,6 +315,25 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
   };
 
   const canBundle = typeof device.createRenderBundleEncoder === 'function';
+  // While passes are timed (`timing`): each pass's own begin and end where the GPU has timestamps,
+  // otherwise the frame's submission to its completion.
+  const timing = createPassTiming();
+  let stampable = null;
+  const STAMPED_PASSES = 128;
+  let stamps = null;
+  let stampLabels = [];
+  let frameSent = 0;
+  const stampWrites = (k) => {
+    if (!stamps) {
+      const size = STAMPED_PASSES * 16;
+      stamps = {
+        set: device.createQuerySet({ type: 'timestamp', count: STAMPED_PASSES * 2 }),
+        resolve: device.createBuffer({ size, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC }),
+        read: device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
+      };
+    }
+    return { querySet: stamps.set, beginningOfPassWriteIndex: 2 * k, endOfPassWriteIndex: 2 * k + 1 };
+  };
   const wordsEqual = (saved, c, start, len) => {
     for (let k = 0; k < len; k++) {
       if (saved[k] !== c[start + k]) return false;
@@ -283,6 +374,11 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
     const enc = device.createCommandEncoder();
     let pass = null;
     const u64 = (idx) => c[idx] + c[idx + 1] * 4294967296;
+    const timed = timing.on();
+    if (timed && stampable === null) stampable = device.features.has('timestamp-query');
+    let passLabel = '';
+    let passSize = '';
+    let stamp = -1;
     let i = 0;
     while (i < c.length) {
       const op = c[i++];
@@ -290,6 +386,12 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
         case 1: { // BEGIN_RENDER
           const colors = c[i++];
           const hasDepth = c[i++];
+          if (timed) {
+            const t = texture(c[i]).texture;
+            passLabel = '';
+            passSize = `${Math.max(1, t.width >> c[i + 1])}x${Math.max(1, t.height >> c[i + 1])}`;
+            stamp = stampable && stampLabels.length < STAMPED_PASSES ? stampLabels.push('') - 1 : -1;
+          }
           const colorAttachments = [];
           const colorFormats = canBundle ? [] : null;
           let h = (2166136261 ^ colors) >>> 0;
@@ -317,7 +419,7 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
             };
             i += 6;
           }
-          if (canBundle) {
+          if (canBundle && !timed) {
             const bodyStart = i;
             let scan = i;
             let eligible = true;
@@ -386,11 +488,25 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
               bundleEntries++;
             }
           }
-          pass = enc.beginRenderPass({ colorAttachments, depthStencilAttachment });
+          pass = enc.beginRenderPass({
+            colorAttachments,
+            depthStencilAttachment,
+            ...(stamp >= 0 ? { timestampWrites: stampWrites(stamp) } : {}),
+          });
           break;
         }
-        case 2: pass.end(); pass = null; break;
-        case 3: pass.setPipeline(objects[c[i++]]); break;
+        case 2:
+          pass.end();
+          pass = null;
+          if (stamp >= 0) stampLabels[stamp] = `${passLabel || 'clear'} ${passSize}`;
+          stamp = -1;
+          break;
+        case 3: {
+          const p = objects[c[i++]];
+          pass.setPipeline(p);
+          if (timed && !passLabel) passLabel = p.label;
+          break;
+        }
         case 4: {
           const index = c[i]; const g = c[i + 1]; const n = c[i + 2];
           if (n === 0) pass.setBindGroup(index, group(g));
@@ -442,6 +558,7 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
           throw new Error(`unknown command ${op} at word ${i - 1}`);
       }
     }
+    if (timed && !stampable && !frameSent) frameSent = performance.now();
     device.queue.submit([enc.finish()]);
   };
 
@@ -534,7 +651,8 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
     }),
     gpu_create_shader: guard('createShaderModule', (ptr, len) => {
       const code = str(ptr, len);
-      const module = device.createShaderModule({ code });
+      // The entry point it was generated from names the passes it draws in (`timing`).
+      const module = device.createShaderModule({ code, label: /from '([^']+)'/.exec(code)?.[1] });
       module.getCompilationInfo().then((info) => {
         const lines = code.split('\n');
         for (const m of info.messages) {
@@ -581,6 +699,8 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
       d.layout = objects[d.layout];
       d.vertex.module = objects[d.vertex.module];
       if (d.fragment) d.fragment.module = objects[d.fragment.module];
+      // Its fragment (or vertex) shader names the passes it draws in (`timing`).
+      d.label = (d.fragment || d.vertex).module.label;
       return put(device.createRenderPipeline(d));
     }),
     gpu_create_compute_pipeline: guard('createComputePipeline', (ptr, len) => {
@@ -640,6 +760,38 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
     frameTexture() { return surfaceTexture; },
     /** Telemetry for cached GPURenderBundle passes. */
     bundleStats: () => ({ cached: bundleCompiled, candidates: bundleEntries, replays: bundleReplays }),
+    timing,
+    /** Closes a drawn frame's timing: booked once its timestamps are read, or the GPU finished it. */
+    endFrame() {
+      if (!timing.on()) return;
+      if (!stampLabels.length) {
+        const m = timing.mark('frame');
+        m.sent = frameSent || m.sent;
+        frameSent = 0;
+        const frame = timing.take();
+        const done = () => { m.done = performance.now(); frame.finish(); };
+        device.queue.onSubmittedWorkDone().then(done, done);
+        return;
+      }
+      const labels = stampLabels;
+      stampLabels = [];
+      for (const label of labels) timing.mark(label);
+      const frame = timing.take();
+      const bytes = labels.length * 16;
+      const enc = device.createCommandEncoder();
+      enc.resolveQuerySet(stamps.set, 0, labels.length * 2, stamps.resolve, 0);
+      enc.copyBufferToBuffer(stamps.resolve, 0, stamps.read, 0, bytes);
+      device.queue.submit([enc.finish()]);
+      stamps.read.mapAsync(GPUMapMode.READ, 0, bytes).then(() => {
+        const t = new BigInt64Array(stamps.read.getMappedRange(0, bytes));
+        frame.marks.forEach((m, k) => {
+          m.sent = Number(t[2 * k] - t[0]) / 1e6;
+          m.done = Number(t[2 * k + 1] - t[0]) / 1e6;
+        });
+        stamps.read.unmap();
+        frame.finish();
+      }, frame.finish);
+    },
     setXrTarget: () => false,
   };
 }
@@ -1062,6 +1214,41 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
   };
 
   let currentVao = null;
+
+  // While passes are timed (`timing`): a fence after each, flushed so the GPU starts on it, and
+  // polled from later tasks (WebGL signals a fence only between tasks).
+  const timing = createPassTiming();
+  let channel = null;
+  const waiting = [];
+  let passLabel = '';
+  let passSize = '';
+  // A pass that draws with the pipeline the one before it left applied sets none of its own.
+  let lastPipeline = '';
+  let passDrew = false;
+  const glMark = (label) => {
+    const m = timing.mark(label);
+    m.sync = gl.fenceSync(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+    gl.flush();
+    m.sent = performance.now();
+  };
+  const poll = () => {
+    while (waiting.length) {
+      const frame = waiting[0];
+      const m = frame.marks.find((x) => !x.done);
+      if (!m) {
+        waiting.shift();
+        frame.finish();
+        continue;
+      }
+      if (gl.clientWaitSync(m.sync, 0, 0) === gl.TIMEOUT_EXPIRED) {
+        channel.port2.postMessage(0);
+        return;
+      }
+      m.done = performance.now();
+      gl.deleteSync(m.sync);
+    }
+  };
+
   const blit = (src, srcMip, srcLayer, dst, dstMip, dstLayer, filterLinear) => {
     const s = texture(src);
     const d = texture(dst);
@@ -1122,6 +1309,9 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
           fixed.drawBuffers = cs.map(() => 1).join('');
           const a = cs[0] || depth;
           gl.viewport(0, 0, Math.max(1, a.t.w >> a.mip), Math.max(1, a.t.h >> a.mip));
+          passLabel = '';
+          passDrew = false;
+          passSize = `${Math.max(1, a.t.w >> a.mip)}x${Math.max(1, a.t.h >> a.mip)}`;
           setFlag(gl.SCISSOR_TEST, false);
           // Clears obey the write masks.
           const dontCare = [];
@@ -1145,8 +1335,15 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
         case 2: // END_PASS
           if (discard.length) gl.invalidateFramebuffer(gl.FRAMEBUFFER, discard);
           discard = [];
+          if (timing.on()) glMark(`${passLabel || (passDrew ? lastPipeline : 'clear')} ${passSize}`);
           break;
-        case 3: applyPipeline(objects[c[i++]]); break;
+        case 3: {
+          const p = objects[c[i++]];
+          applyPipeline(p);
+          lastPipeline = p.program.name;
+          if (!passLabel) passLabel = lastPipeline;
+          break;
+        }
         case 4: gl.viewport(Math.round(f[i]), Math.round(f[i + 1]), Math.round(f[i + 2]), Math.round(f[i + 3])); i += 4; break;
         case 5:
           setFlag(gl.SCISSOR_TEST, true);
@@ -1185,8 +1382,8 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
           if (currentVao !== v) { gl.bindVertexArray(v); currentVao = v; }
           break;
         }
-        case 12: gl.drawArraysInstanced(current.mode, c[i + 2], c[i], c[i + 1]); i += 3; break;
-        case 13: gl.drawElementsInstanced(current.mode, c[i], gl.UNSIGNED_INT, c[i + 2] * 4, c[i + 1]); i += 3; break;
+        case 12: gl.drawArraysInstanced(current.mode, c[i + 2], c[i], c[i + 1]); i += 3; passDrew = true; break;
+        case 13: gl.drawElementsInstanced(current.mode, c[i], gl.UNSIGNED_INT, c[i + 2] * 4, c[i + 1]); i += 3; passDrew = true; break;
         case 14: { // COPY_BUFFER
           const s = objects[c[i]]; const d = objects[c[i + 2]];
           const so = c[i + 1]; const dO = c[i + 3]; const size = c[i + 4];
@@ -1241,6 +1438,7 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
         case 16: // BLIT
           blit(c[i], c[i + 1], c[i + 2], c[i + 3], c[i + 4], c[i + 5], c[i + 6]);
           i += 7;
+          if (timing.on()) glMark('blit');
           break;
         default:
           throw new Error(`unknown command ${op} at word ${i - 1}`);
@@ -1298,6 +1496,7 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
       gl.blitFramebuffer(0, 0, s.w, s.h, 0, s.h, s.w, 0, gl.COLOR_BUFFER_BIT, gl.NEAREST);
     }
     gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+    if (timing.on()) glMark(`present ${s.w}x${s.h}`);
   };
 
   const imports = {
@@ -1422,6 +1621,9 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
     }),
     gl_create_program: guard('createProgram', (vp, vl, fp, fl, mp, ml) => {
       const program = link(str(vp, vl), str(fp, fl));
+      // The entry point it was generated from names the passes it draws in (`timing`).
+      const entry = (source) => /from '([^']+)'/.exec(source)?.[1];
+      const name = entry(str(fp, fl)) || entry(str(vp, vl)) || 'program';
       const hidden = [];
       gl.useProgram(program);
       for (const line of str(mp, ml).split('\n')) {
@@ -1437,7 +1639,7 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
         }
       }
       gl.useProgram(currentProgram);
-      return put({ program, hidden });
+      return put({ program, hidden, name });
     }),
     gl_create_pipeline: guard('createPipeline', (program, ptr, words) => {
       const w = u32(ptr, words);
@@ -1510,6 +1712,23 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
     /** Sets (or with null clears) the image the next runtime call may upload into a texture. */
     setSource(image) { source = image; },
     nextFrame() {},
+    timing,
+    /** Closes a drawn frame's timed passes: booked once its last fence signalled. */
+    endFrame() {
+      const frame = timing.take();
+      if (!frame) return;
+      if (!channel && typeof MessageChannel === 'function') {
+        channel = new MessageChannel();
+        channel.port1.onmessage = poll;
+      }
+      if (!channel) {
+        for (const m of frame.marks) gl.deleteSync(m.sync);
+        timing.set(false);
+        return;
+      }
+      waiting.push(frame);
+      if (waiting.length === 1) channel.port2.postMessage(0);
+    },
     frameTexture() { return surface; },
     bundleStats: () => ({ cached: 0, candidates: 0, replays: 0 }),
     setXrTarget,
@@ -2354,12 +2573,14 @@ export async function createEngine(options) {
     /** Draws and presents a frame. Returns false when it skipped (GPU busy, nothing to draw). */
     render() {
       if (stopped) return false;
+      if (host.timing.busy()) return false;
       if (gpu.device && inFlight >= 2) return false;
       host.nextFrame();
       drawn = null;
       const r = x.ganbate_rt_render();
       if (!r) throw fail('render');
       if (r !== 1) return false;
+      host.endFrame();
       if (gpu.device) {
         inFlight++;
         gpu.device.queue.onSubmittedWorkDone().then(() => { inFlight--; }, () => { inFlight--; });
@@ -2387,6 +2608,13 @@ export async function createEngine(options) {
     },
     /** Waits until the GPU has finished submitted work (WebGPU; immediate on WebGL 2). */
     async idle() { if (gpu.device) await gpu.device.queue.onSubmittedWorkDone(); },
+    /**
+     * Times each pass of the frames drawn from now on (true), drawing one frame at a time, or
+     * stops (false); each call starts the means afresh.
+     */
+    setPassTiming(on) { host.timing.set(on); },
+    /** The timed frames' mean GPU time a pass, in drawing order, and a frame's (ms). */
+    passTiming: () => host.timing.report(),
 
     /**
      * `source`: {width, height, data (RGBA8)}; a canvas, ImageBitmap, video or loaded image, which

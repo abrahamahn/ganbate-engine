@@ -61,6 +61,18 @@ export interface GanbateFocus {
 export type GanbateStereoEyeName = 'mono' | 'left' | 'right';
 export type GanbateStereoEye = -1 | 0 | 1;
 
+/** Per-pass GPU times (`setPassTiming`), in milliseconds. */
+export interface GanbatePassTiming {
+  /** Frames timed. */
+  readonly frames: number;
+  /** A frame's GPU time: its passes' sum. */
+  readonly gpuMs: number;
+  /** From a frame's first pass sent to its last finished. */
+  readonly wallMs: number;
+  /** Each pass by its first pipeline's entry point and size (`fs_restore 1206x1380`). */
+  readonly passes: readonly { readonly label: string; readonly ms: number }[];
+}
+
 export interface GanbateFrameStats {
   readonly worldDrawsTotal: number;
   readonly worldDrawsSubmitted: number;
@@ -327,6 +339,13 @@ export interface GanbateEngine {
   capture(): Promise<{ width: number; height: number; rgba: Uint8ClampedArray }>;
   /** Waits for submitted GPU work (WebGPU; immediate on WebGL 2). */
   idle(): Promise<void>;
+  /**
+   * Times each pass of the frames drawn from now on (true) on the GPU, drawing one frame at a
+   * time, or stops (false); each call starts the means afresh.
+   */
+  setPassTiming(on: boolean): void;
+  /** The timed frames' mean GPU time a pass, in drawing order, and a frame's. */
+  passTiming(): GanbatePassTiming;
 
   createTexture(source: GanbateImageSource | GanbateClearTexture, options?: { readonly srgb?: boolean }): number;
   /** New pixels for a texture from a source of the texture's size. */
