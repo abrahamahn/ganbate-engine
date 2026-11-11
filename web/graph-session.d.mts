@@ -56,8 +56,6 @@ export declare function windowChannel(
   target: { postMessage(message: unknown, targetOrigin: string): void },
   origin: string,
   name?: string,
-  self?: {
-    addEventListener(type: 'message', listener: (event: MessageEvent) => void): void;
-    removeEventListener(type: 'message', listener: (event: MessageEvent) => void): void;
-  },
+  /** This window (any event target that receives the other window's messages). */
+  self?: EventTarget,
 ): GanbateGraphChannel;
