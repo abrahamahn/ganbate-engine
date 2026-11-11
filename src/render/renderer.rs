@@ -461,6 +461,8 @@ pub(super) struct Pipelines {
     bloom_up: PipelineId,
     tonemap: PipelineId,
     tonemap_final: PipelineId,
+    /// `fs_tonemap` and `fs_final` in one pass, where no painterly filter runs between them.
+    tonemap_output: PipelineId,
     paint: PipelineId,
     output: PipelineId,
 }
@@ -522,11 +524,9 @@ pub(super) struct Slot {
     up: Vec<BindGroupId>,
     tonemap: BindGroupId,
     tonemap_final: BindGroupId,
+    tonemap_output: BindGroupId,
     paint: BindGroupId,
     output: BindGroupId,
-    /// The output pass reading the tone-mapped picture itself: the painterly filter skipped where
-    /// it would change nothing (`fs_paint` copies a pixel through at a radius under one).
-    output_ldr: BindGroupId,
 }
 
 pub struct Renderer {
@@ -1122,6 +1122,7 @@ impl Pipelines {
             bloom_up: fullscreen(device, &fsvs, "fs_bloom_up", HDR, Blend::Additive)?,
             tonemap: fullscreen(device, &fsvs, "fs_tonemap", HDR, Blend::Replace)?,
             tonemap_final: fullscreen(device, &fsvs, "fs_tonemap_final", output, Blend::Replace)?,
+            tonemap_output: fullscreen(device, &fsvs, "fs_tonemap_output", output, Blend::Replace)?,
             paint: fullscreen(device, &fsvs, "fs_paint", HDR, Blend::Replace)?,
             output: fullscreen(device, &fsvs, "fs_final", output, Blend::Replace)?,
         })
@@ -1848,6 +1849,12 @@ impl Renderer {
             Resource::Texture(t.lit),
             Resource::TextureMip(t.bloom, 0),
         )?;
+        let tonemap_output = post(
+            device,
+            p.tonemap_output,
+            Resource::Texture(t.lit),
+            Resource::TextureMip(t.bloom, 0),
+        )?;
         let tonemap_final = device.create_bind_group(
             p.tonemap_final,
             0,
@@ -1868,7 +1875,6 @@ impl Renderer {
             t.ldr
         };
         let output = post(device, p.output, Resource::Texture(final_src), none)?;
-        let output_ldr = post(device, p.output, Resource::Texture(t.ldr), none)?;
         Ok(Slot {
             frame,
             tiles,
@@ -1888,9 +1894,9 @@ impl Renderer {
             up,
             tonemap,
             tonemap_final,
+            tonemap_output,
             paint,
             output,
-            output_ldr,
         })
     }
 
@@ -1903,7 +1909,13 @@ impl Renderer {
                 .chain([
                     s.grass, s.flower, s.particle, s.restore, s.mask, s.ssao, s.air,
                 ])
-                .chain([s.tonemap, s.tonemap_final, s.paint, s.output, s.output_ldr])
+                .chain([
+                    s.tonemap,
+                    s.tonemap_final,
+                    s.tonemap_output,
+                    s.paint,
+                    s.output,
+                ])
             {
                 device.destroy_bind_group(g);
             }
@@ -3568,13 +3580,12 @@ impl Renderer {
             );
         } else {
             // Tone mapping and grading.
-            let mut pc = [0.0f32; 16];
-            pc[..4].copy_from_slice(&[exposure, l.bloom, l.saturation, l.contrast]);
-            pc[4..7].copy_from_slice(&l.lift);
-            pc[7] = l.vignette;
-            pc[8..11].copy_from_slice(&l.gain);
-            pc[11] = l.tonemap as u32 as f32;
-            Self::post_pass(enc, t.ldr, 0, Load::DontCare, p.tonemap, slot.tonemap, pc);
+            let mut grade = [0.0f32; 16];
+            grade[..4].copy_from_slice(&[exposure, l.bloom, l.saturation, l.contrast]);
+            grade[4..7].copy_from_slice(&l.lift);
+            grade[7] = l.vignette;
+            grade[8..11].copy_from_slice(&l.gain);
+            grade[11] = l.tonemap as u32 as f32;
             let mut pc = [0.0f32; 16];
             pc[..4].copy_from_slice(&[
                 (l.painterly * px_scale * 0.6).clamp(0.0, 6.0),
@@ -3592,23 +3603,40 @@ impl Renderer {
                 ]);
             }
             // At radii under a pixel and without depth of field the filter copies each pixel
-            // through: the output pass then reads the tone-mapped picture, a full-screen pass
-            // fewer.
+            // through. Then one pass tone-maps, grades, sharpens and smooths edges as the three
+            // passes would, two full-screen passes fewer.
             let painted = pc[0].round() >= 1.0 || pc[1].round() >= 1.0 || pc[7] > 0.5;
-            if painted {
-                Self::post_pass(enc, t.paint, 0, Load::DontCare, p.paint, slot.paint, pc);
-            }
             stats.painted = painted;
-            let mut pc = [0.0f32; 16];
-            pc[0] = if self.quality.fxaa { 1.0 } else { 0.0 };
-            pc[1] = if encode_srgb { 1.0 } else { 0.0 };
-            pc[2] = l.sharpen.max(0.0);
-            let source = if painted {
-                slot.output
+            if painted {
+                Self::post_pass(
+                    enc,
+                    t.ldr,
+                    0,
+                    Load::DontCare,
+                    p.tonemap,
+                    slot.tonemap,
+                    grade,
+                );
+                Self::post_pass(enc, t.paint, 0, Load::DontCare, p.paint, slot.paint, pc);
+                let mut pc = [0.0f32; 16];
+                pc[0] = if self.quality.fxaa { 1.0 } else { 0.0 };
+                pc[1] = if encode_srgb { 1.0 } else { 0.0 };
+                pc[2] = l.sharpen.max(0.0);
+                Self::post_pass(enc, dest, 0, Load::DontCare, p.output, slot.output, pc);
             } else {
-                slot.output_ldr
-            };
-            Self::post_pass(enc, dest, 0, Load::DontCare, p.output, source, pc);
+                grade[12] = l.sharpen.max(0.0);
+                grade[13] = if self.quality.fxaa { 1.0 } else { 0.0 };
+                grade[14] = if encode_srgb { 1.0 } else { 0.0 };
+                Self::post_pass(
+                    enc,
+                    dest,
+                    0,
+                    Load::DontCare,
+                    p.tonemap_output,
+                    slot.tonemap_output,
+                    grade,
+                );
+            }
         }
         if self.has_overlays() {
             enc.begin_pass(PassDesc {

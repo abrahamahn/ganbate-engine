@@ -500,6 +500,72 @@ fn defocus(uv: vec2f, px: vec2i, r: f32) -> vec3f {
   return vec4f(col, 1.0);
 }
 
+// The lit picture at pixel `p` tone-mapped, graded and vignetted, clamped to display range: what
+// `fs_tonemap` writes there. pc.a = (exposure, bloom, saturation, contrast), pc.b = lift rgb +
+// vignette, pc.c = (gain rgb, tonemap operator).
+fn graded_at(p: vec2i) -> vec3f {
+  let size = vec2i(frame.viewport.xy);
+  let q = clamp(p, vec2i(0), size - vec2i(1));
+  let uv = (vec2f(q) + vec2f(0.5)) * frame.viewport.zw;
+  var col = textureLoad(src_tex, q, 0).rgb;
+  let bloom = textureSampleLevel(extra_tex, lin_sampler, uv, 0.0).rgb;
+  col = (col + bloom * pc.a.y) * pc.a.x;
+  col = apply_tonemap(col, i32(pc.c.w + 0.5));
+  let l = luminance(col);
+  col = max(mix(vec3f(l), col, pc.a.z), vec3f(0.0));
+  let g = pow(col, vec3f(1.0 / 2.2));
+  let c = clamp((g - vec3f(0.5)) * pc.a.w + vec3f(0.5), vec3f(0.0), vec3f(1.0));
+  col = pow(c, vec3f(2.2));
+  col = col * pc.c.rgb + pc.b.rgb * (vec3f(1.0) - col);
+  let v = length(uv - vec2f(0.5)) * 1.35;
+  col *= 1.0 - pc.b.w * pow(v, 2.6);
+  return clamp(col, vec3f(0.0), vec3f(1.0));
+}
+
+// `fs_tonemap` and `fs_final` in one pass, for when no painterly filter runs between them: the
+// same sharpening and edge smoothing on the same tone-mapped pixels, computed here for the pixel
+// and its four neighbours rather than written out and read back. pc.a..c as `graded_at`, pc.d =
+// (sharpen, edge smoothing on, encode sRGB, unused).
+@fragment fn fs_tonemap_output(in: Screen) -> @location(0) vec4f {
+  let px = vec2i(in.clip.xy);
+  let centre = graded_at(px);
+  var col = centre;
+  let d = depth_px(px);
+  let sharpen = pc.d.x * select(1.0 - smoothstep(6.0, 18.0, linear_depth(d)), 0.0, d <= 0.0);
+  let smoothing = pc.d.y > 0.5;
+  if (sharpen > 0.0 || smoothing) {
+    let n = graded_at(px + vec2i(0, -1));
+    let s = graded_at(px + vec2i(0, 1));
+    let e = graded_at(px + vec2i(1, 0));
+    let w = graded_at(px + vec2i(-1, 0));
+    if (sharpen > 0.0) {
+      let detail = col - (n + s + e + w) * 0.25;
+      col = max(col + clamp(detail * sharpen, vec3f(-0.08), vec3f(0.08)), vec3f(0.0));
+    }
+    if (smoothing) {
+      let ln = luminance(n);
+      let ls = luminance(s);
+      let le = luminance(e);
+      let lw = luminance(w);
+      let lc = luminance(col);
+      let lo = min(lc, min(min(ln, ls), min(le, lw)));
+      let hi = max(lc, max(max(ln, ls), max(le, lw)));
+      let range = hi - lo;
+      if (range > max(0.04, hi * 0.12)) {
+        // Half a pixel either way across the edge: between this pixel and its neighbour.
+        let horizontal = abs(ln + ls - 2.0 * lc) > abs(le + lw - 2.0 * lc);
+        let a = (centre + select(e, s, horizontal)) * 0.5;
+        let b = (centre + select(w, n, horizontal)) * 0.5;
+        col = mix(col, (a + b) * 0.5, clamp(range * 1.5, 0.0, 0.6));
+      }
+    }
+  }
+  if (pc.d.z > 0.5) {
+    col = select(1.055 * pow(col, vec3f(1.0 / 2.4)) - vec3f(0.055), col * 12.92, col <= vec3f(0.0031308));
+  }
+  return vec4f(col, 1.0);
+}
+
 // Samples a 16x16x16 colour-grading LUT packed as a 256x16 2D strip, parameterized by
 // `x / (1 + x)` so `[0, inf)` scene-linear HDR maps smoothly into `[0, 1]`.
 fn sample_lut(hdr: vec3f) -> vec3f {
