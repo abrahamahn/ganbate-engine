@@ -380,6 +380,8 @@ pub struct FrameStats {
     pub cache_regions: u32,
     /// Pixels of the cached picture that moved props' shadows can reach were shaded again.
     pub reshaded: bool,
+    /// The painterly filter ran (it is skipped where it would change nothing).
+    pub painted: bool,
 }
 
 /// Where the final pass writes.
@@ -522,6 +524,9 @@ pub(super) struct Slot {
     tonemap_final: BindGroupId,
     paint: BindGroupId,
     output: BindGroupId,
+    /// The output pass reading the tone-mapped picture itself: the painterly filter skipped where
+    /// it would change nothing (`fs_paint` copies a pixel through at a radius under one).
+    output_ldr: BindGroupId,
 }
 
 pub struct Renderer {
@@ -1863,6 +1868,7 @@ impl Renderer {
             t.ldr
         };
         let output = post(device, p.output, Resource::Texture(final_src), none)?;
+        let output_ldr = post(device, p.output, Resource::Texture(t.ldr), none)?;
         Ok(Slot {
             frame,
             tiles,
@@ -1884,6 +1890,7 @@ impl Renderer {
             tonemap_final,
             paint,
             output,
+            output_ldr,
         })
     }
 
@@ -1896,7 +1903,7 @@ impl Renderer {
                 .chain([
                     s.grass, s.flower, s.particle, s.restore, s.mask, s.ssao, s.air,
                 ])
-                .chain([s.tonemap, s.tonemap_final, s.paint, s.output])
+                .chain([s.tonemap, s.tonemap_final, s.paint, s.output, s.output_ldr])
             {
                 device.destroy_bind_group(g);
             }
@@ -3584,12 +3591,24 @@ impl Renderer {
                     1.0,
                 ]);
             }
-            Self::post_pass(enc, t.paint, 0, Load::DontCare, p.paint, slot.paint, pc);
+            // At radii under a pixel and without depth of field the filter copies each pixel
+            // through: the output pass then reads the tone-mapped picture, a full-screen pass
+            // fewer.
+            let painted = pc[0].round() >= 1.0 || pc[1].round() >= 1.0 || pc[7] > 0.5;
+            if painted {
+                Self::post_pass(enc, t.paint, 0, Load::DontCare, p.paint, slot.paint, pc);
+            }
+            stats.painted = painted;
             let mut pc = [0.0f32; 16];
             pc[0] = if self.quality.fxaa { 1.0 } else { 0.0 };
             pc[1] = if encode_srgb { 1.0 } else { 0.0 };
             pc[2] = l.sharpen.max(0.0);
-            Self::post_pass(enc, dest, 0, Load::DontCare, p.output, slot.output, pc);
+            let source = if painted {
+                slot.output
+            } else {
+                slot.output_ldr
+            };
+            Self::post_pass(enc, dest, 0, Load::DontCare, p.output, source, pc);
         }
         if self.has_overlays() {
             enc.begin_pass(PassDesc {
