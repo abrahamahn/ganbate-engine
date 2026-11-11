@@ -334,13 +334,24 @@ fn light_shadow(world: vec3f, n: vec3f, ld: vec3f, l: Light, layer: i32, frag: v
   return sum / 8.0;
 }
 
+// Slices of view depth per screen tile (`CLUSTER_SLICES` in renderer.rs).
+const CLUSTER_SLICES: u32 = 16u;
+
 fn lamp_light(world: vec3f, n: vec3f, frag: vec2f, foliage: bool) -> vec3f {
   // The lamps follow the time of day; a game's own lights shine at every hour.
   let level = frame.amb_sky.w;
   let size = f32(frame.tiles.z);
   let tx = min(u32(frag.x / size), frame.tiles.x - 1u);
   let ty = min(u32(frag.y / size), frame.tiles.y - 1u);
-  let t = tiles[ty * frame.tiles.x + tx];
+  // The pixel's cluster: its tile and the slice of view depth it lies in (clip w is the view
+  // depth), as `Renderer::tile_lights` filled them; lamps.z the nearest slice's far edge,
+  // lamps.w slices per doubling of depth.
+  let depth = (frame.view_proj * vec4f(world, 1.0)).w;
+  var slice = 0u;
+  if (depth > frame.lamps.z) {
+    slice = min(u32(log2(depth / frame.lamps.z) * frame.lamps.w), CLUSTER_SLICES - 1u);
+  }
+  let t = tiles[(slice * frame.tiles.y + ty) * frame.tiles.x + tx];
   var sum = vec3f(0.0);
   for (var k = 0u; k < t.y; k++) {
     // Most of a tile's lights do not reach this pixel: read just the position and range first,

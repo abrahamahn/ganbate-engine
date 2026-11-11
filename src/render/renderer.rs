@@ -33,7 +33,17 @@ const PROP_SHADER_INPUT: &str = include_str!("shaders/prop_shader_input.wgsl");
 const PROP_SHADER: &str = include_str!("shaders/prop_shader.wgsl");
 const HDR: Format = Format::Rgba16Float;
 const LUT_SIZE: u32 = 16;
-const MAX_LIGHTS_PER_TILE: usize = 96;
+/// The lamps a pixel loops over are those of its cluster: its screen tile cut into
+/// `CLUSTER_SLICES` slices of view depth, evenly spaced in log depth from `CLUSTER_NEAR` to
+/// `CLUSTER_FAR` metres. A tile alone holds every lamp whose sphere it sees, near or far: in the
+/// Yozakura house (617 lamps) most tiles held the 96 a list keeps, and each pixel read them all.
+const CLUSTER_SLICES: u32 = 16;
+const CLUSTER_NEAR: f32 = 0.5;
+const CLUSTER_FAR: f32 = 400.0;
+const MAX_LIGHTS_PER_CLUSTER: usize = 96;
+/// Room for a tile's clusters' lists together, in light indices (24 a cluster on average): a lamp
+/// joins every slice its sphere crosses, so the lists hold several times the lamps a tile sees.
+const CLUSTER_ENTRIES_PER_TILE: u64 = CLUSTER_SLICES as u64 * 24;
 /// Frames a cached world may lag the converging AO by (a quarter second at 60 frames a second).
 const AO_CACHE_REFRESH_FRAMES: u32 = 15;
 /// Byte offset of `camera.w` (the clock's seconds) in the frame block: after five matrices.
@@ -69,6 +79,39 @@ struct ReceiverBounds {
     key: u64,
     maps: Vec<[([f32; 4], f32); 4]>,
     screen: Vec<Option<Rect>>,
+}
+
+/// Slices of view depth per doubling of it (`CLUSTER_SLICES` from `CLUSTER_NEAR` to `CLUSTER_FAR`).
+fn cluster_scale() -> f32 {
+    CLUSTER_SLICES as f32 / (CLUSTER_FAR / CLUSTER_NEAR).log2()
+}
+
+/// The most lamps each cluster keeps so the clusters' `lengths` together fit in `room`.
+fn cluster_cap(lengths: impl Iterator<Item = usize> + Clone, room: usize) -> usize {
+    let total = |cap: usize| lengths.clone().map(|n| n.min(cap)).sum::<usize>();
+    let (mut lo, mut hi) = (0, MAX_LIGHTS_PER_CLUSTER);
+    if total(hi) <= room {
+        return hi;
+    }
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if total(mid) <= room {
+            lo = mid
+        } else {
+            hi = mid - 1
+        }
+    }
+    lo
+}
+
+/// The cluster slice a view depth `z` falls in, as `lamp_light` finds it.
+fn cluster_slice(z: f32) -> u32 {
+    if z <= CLUSTER_NEAR {
+        return 0;
+    }
+    ((z / CLUSTER_NEAR).log2() * cluster_scale())
+        .floor()
+        .min((CLUSTER_SLICES - 1) as f32) as u32
 }
 
 impl ReceiverBounds {
@@ -1677,10 +1720,14 @@ impl Renderer {
             let (tx, ty) = t.tiles[v];
             let n = u64::from(tx) * u64::from(ty);
             frame.push(upload(device, FRAME_BYTES, BufferUsage::UNIFORM)?);
-            tiles.push(upload(device, n * 8, BufferUsage::STORAGE)?);
+            tiles.push(upload(
+                device,
+                n * u64::from(CLUSTER_SLICES) * 8,
+                BufferUsage::STORAGE,
+            )?);
             index.push(upload(
                 device,
-                n * MAX_LIGHTS_PER_TILE as u64 * 4,
+                n * CLUSTER_ENTRIES_PER_TILE * 4,
                 BufferUsage::STORAGE,
             )?);
         }
@@ -2337,7 +2384,7 @@ impl Renderer {
         on: bool,
     ) -> (Vec<u32>, Vec<u32>) {
         let ts = self.quality.tile_size as f32;
-        let mut lists: Vec<Vec<u32>> = vec![vec![]; (tx * ty) as usize];
+        let mut lists: Vec<Vec<u32>> = vec![vec![]; (tx * ty * CLUSTER_SLICES) as usize];
         // The lamps while they are lit, and a game's lights (after them in the light buffer):
         // those that follow the lamps while they are lit, the rest always.
         let lamps = self.scene.lights.len();
@@ -2402,11 +2449,21 @@ impl Renderer {
                 let bx = (px(x1.min(1.0), w) as u32).min(tx - 1);
                 let ay = px(y0.max(-1.0), h).max(0.0) as u32;
                 let by = (px(y1.min(1.0), h) as u32).min(ty - 1);
-                for y in ay..=by {
-                    for x in ax..=bx {
-                        let list = &mut lists[(y * tx + x) as usize];
-                        if list.len() < MAX_LIGHTS_PER_TILE {
-                            list.push(i as u32);
+                // The slices of view depth the sphere spans (clip w is the view depth).
+                let centre = transform(&eye.view_proj, [l[0], l[1], l[2], 1.0])[3];
+                let s0 = if straddle {
+                    0
+                } else {
+                    cluster_slice(centre - r)
+                };
+                let s1 = cluster_slice(centre + r);
+                for s in s0..=s1 {
+                    for y in ay..=by {
+                        for x in ax..=bx {
+                            let list = &mut lists[((s * ty + y) * tx + x) as usize];
+                            if list.len() < MAX_LIGHTS_PER_CLUSTER {
+                                list.push(i as u32);
+                            }
                         }
                     }
                 }
@@ -2414,10 +2471,16 @@ impl Renderer {
         }
         let mut tiles = Vec::with_capacity(lists.len() * 2);
         let mut index = vec![];
+        // The index buffer holds `CLUSTER_ENTRIES_PER_TILE` a tile. When the lists hold more,
+        // every cluster keeps the same number of its nearest lamps (each list was filled nearest
+        // first), as many as fit, rather than the last clusters losing all of theirs.
+        let room = (u64::from(tx) * u64::from(ty) * CLUSTER_ENTRIES_PER_TILE) as usize;
+        let cap = cluster_cap(lists.iter().map(Vec::len), room);
         for list in lists {
+            let kept = list.len().min(cap);
             tiles.push(index.len() as u32);
-            tiles.push(list.len() as u32);
-            index.extend(list);
+            tiles.push(kept as u32);
+            index.extend_from_slice(&list[..kept]);
         }
         if index.is_empty() {
             index.push(0);
@@ -2532,7 +2595,12 @@ impl Renderer {
         b.v(t.wet_sand, 0.0);
         b.v(t.rock, 0.0);
         b.v(t.meadow, 0.0);
-        b.f(l.lamp_foliage, l.ambient_occlusion, 0.0, 0.0);
+        b.f(
+            l.lamp_foliage,
+            l.ambient_occlusion,
+            CLUSTER_NEAR,
+            cluster_scale(),
+        );
         let tide = if self.scene.water_level.is_some() {
             l.tide
         } else {
@@ -3612,6 +3680,63 @@ mod tests {
         CompileOptions, ShaderLibrary, SpecValue, compile_glsl_with_options,
         compile_msl_with_options, compile_wgsl_with_options, compile_with_options,
     };
+
+    #[test]
+    fn a_lamp_lands_in_the_cluster_of_every_point_it_lights() {
+        // A camera at the origin looking down -z; a lamp 10 m ahead with a 3 m reach.
+        let v = look_at([0.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]);
+        let p = perspective(60f32.to_radians(), 1.0, 0.1);
+        let vp = mul(&p, &v);
+        let (lamp, r) = ([0.0f32, 0.0, -10.0], 3.0f32);
+        let centre = transform(&vp, [lamp[0], lamp[1], lamp[2], 1.0])[3];
+        assert!(
+            (centre - 10.0).abs() < 1e-3,
+            "clip w is the view depth, got {centre}"
+        );
+        let (s0, s1) = (cluster_slice(centre - r), cluster_slice(centre + r));
+        for z in [7.5f32, 8.0, 10.0, 12.0, 12.9] {
+            let w = transform(&vp, [0.0, 0.0, -z, 1.0])[3];
+            let s = cluster_slice(w);
+            assert!(
+                s0 <= s && s <= s1,
+                "a point {z} m away is in slice {s}, the lamp in {s0}..={s1}"
+            );
+        }
+    }
+
+    #[test]
+    fn crowded_clusters_keep_their_nearest_lamps_alike() {
+        // Room for them all: each keeps every lamp it has (up to the cap a cluster holds).
+        assert_eq!(
+            cluster_cap([3, 200, 0].into_iter(), 1000),
+            MAX_LIGHTS_PER_CLUSTER
+        );
+        // Room for 30: the most each can keep so that all fit, the short lists whole.
+        let cap = cluster_cap([4, 50, 50].into_iter(), 30);
+        assert_eq!(cap, 13);
+        assert!(4 + 13 + 13 <= 30 && 4 + 14 + 14 > 30);
+        assert_eq!(cluster_cap([5, 5].into_iter(), 0), 0);
+    }
+
+    #[test]
+    fn lamp_clusters_slice_view_depth_in_log_steps() {
+        // Everything nearer than the first slice's far edge, and the camera's own plane, is in it.
+        assert_eq!(cluster_slice(-1.0), 0);
+        assert_eq!(cluster_slice(CLUSTER_NEAR), 0);
+        // Beyond the far edge, the last slice.
+        assert_eq!(cluster_slice(CLUSTER_FAR * 4.0), CLUSTER_SLICES - 1);
+        // Never back, and a doubling of depth moves `cluster_scale` slices.
+        let mut last = 0;
+        for i in 1..4000 {
+            let s = cluster_slice(i as f32 * 0.125);
+            assert!(s >= last);
+            last = s;
+        }
+        let (a, b) = (cluster_slice(3.0), cluster_slice(6.0));
+        assert!(
+            (b - a) as f32 >= cluster_scale().floor() && (b - a) as f32 <= cluster_scale().ceil()
+        );
+    }
 
     #[test]
     fn grass_spacing_matches_the_shader() {
