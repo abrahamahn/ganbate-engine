@@ -68,6 +68,6 @@ esac
 
 mkdir -p "$out"
 cp "$target_dir/$target/release/ganbate_web.wasm" "$out/ganbate_web.wasm"
-cp web/index.html web/ganbate.js web/ganbate.d.ts web/character-customization.{mjs,d.mts} "$out/"
+cp web/index.html web/ganbate.js web/ganbate.d.ts web/character-customization.{mjs,d.mts} web/graph-session.{mjs,d.mts} "$out/"
 size=$(wc -c < "$out/ganbate_web.wasm")
 echo "build-web: $out (ganbate_web.wasm $((size / 1024)) KiB, $mode)"
