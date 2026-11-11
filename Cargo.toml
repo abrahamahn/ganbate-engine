@@ -11,6 +11,7 @@ members = [
     "crates/ganbate-assets",
     "crates/ganbate-audio",
     "crates/ganbate-core",
+    "crates/ganbate-graph",
     "crates/ganbate-jobs",
     "crates/ganbate-physics",
     "crates/ganbate-pipeline",

@@ -34,6 +34,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ganbate-graph"
+version = "0.2.0"
+dependencies = [
+ "ganbate-core",
+]
+
+[[package]]
 name = "ganbate-jobs"
 version = "0.2.0"
 
@@ -83,5 +90,6 @@ name = "ganbate-web"
 version = "0.2.0"
 dependencies = [
  "ganbate-engine",
+ "ganbate-graph",
  "ganbate-physics",
 ]
