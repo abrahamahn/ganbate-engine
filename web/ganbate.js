@@ -2638,6 +2638,41 @@ export async function createEngine(options) {
       return JSON.parse(new TextDecoder().decode(new Uint8Array(x.memory.buffer, p, len)));
     },
     /**
+     * Commits `patch` (graph operations) to `graph` (`ganbate.semantic.graph.v2`), each an object
+     * or its JSON text, through the engine's spatial solver: with `mode` 'project' what breaks
+     * support, stage or clearance is moved to the nearest valid place and reported in `repairs`;
+     * with 'reject' the patch is refused. Returns `{graph, digest, repairs}`; throws with the
+     * reason when the patch is malformed or refused. `graph` itself never changes.
+     */
+    graphCommit(graph, patch, mode = 'project') {
+      const json = (v) => encoder.encode(typeof v === 'string' ? v : JSON.stringify(v));
+      const [g, p] = [json(graph), json(patch)];
+      const [gp, pp] = place(g, p);
+      const len = x.ganbate_graph_commit(gp, g.byteLength, pp, p.byteLength, mode === 'reject' ? 1 : 0);
+      const out = reserve(len);
+      x.ganbate_graph_result(out, len);
+      const result = JSON.parse(new TextDecoder().decode(new Uint8Array(x.memory.buffer, out, len)));
+      if (result.error) throw new Error(`graphCommit: ${result.error}`);
+      return result;
+    },
+    /**
+     * Checks a whole graph `graph` (an object or its JSON text), as written by hand or received
+     * from another participant, against `previous` (null when opening it): a node whose relation
+     * changed is placed by it, the others relate anew from where they stand, and every node is
+     * kept to the solver's rules as in `graphCommit`.
+     */
+    graphCheck(graph, previous = null, mode = 'project') {
+      const json = (v) => encoder.encode(typeof v === 'string' ? v : JSON.stringify(v));
+      const [n, p] = [json(graph), previous === null ? new Uint8Array(0) : json(previous)];
+      const [np, pp] = place(n, p);
+      const len = x.ganbate_graph_check(pp, p.byteLength, np, n.byteLength, mode === 'reject' ? 1 : 0);
+      const out = reserve(len);
+      x.ganbate_graph_result(out, len);
+      const result = JSON.parse(new TextDecoder().decode(new Uint8Array(x.memory.buffer, out, len)));
+      if (result.error) throw new Error(`graphCheck: ${result.error}`);
+      return result;
+    },
+    /**
      * Loads a glTF model (GLB): `source` is a URL, ArrayBuffer or Uint8Array. Its images are
      * decoded by the browser into textures. Resolves with `{model, info, textures}`, where
      * `info` lists images, nodes (name, parent, mesh, skin), meshes (morph targets), clips

@@ -258,6 +258,75 @@ export interface GanbateEntityRecord {
   readonly lights: readonly [number, number];
 }
 
+/** A node's footprint and height, centred on its position (its base). */
+export type GanbateGraphBounds =
+  | { readonly shape: 'aabb'; readonly halfExtents: Vec3; readonly surfaceY?: number }
+  | { readonly shape: 'cylinder'; readonly radius: number; readonly height: number };
+
+/** A node of the semantic scene graph; fields beyond these are the game's and are kept. */
+export interface GanbateGraphNode {
+  readonly id: string;
+  readonly type: string;
+  readonly position: Vec3;
+  readonly yawDeg?: number;
+  readonly bounds?: GanbateGraphBounds;
+  readonly [field: string]: unknown;
+}
+
+export type GanbateGraphRelation =
+  | 'on_top_of'
+  | 'left_of'
+  | 'right_of'
+  | 'behind'
+  | 'in_front_of'
+  | 'facing';
+
+export type GanbateGraphAnchor = 'center' | 'left' | 'right' | 'front' | 'back';
+
+export interface GanbateGraphEdge {
+  readonly from: string;
+  readonly rel: GanbateGraphRelation;
+  readonly to: string;
+  readonly anchor?: GanbateGraphAnchor;
+  readonly clearance?: number;
+}
+
+/**
+ * The semantic scene graph (`crates/ganbate-graph`): nodes and the spatial relations between
+ * them. `stage` (`{floorY, bounds: {min: [x, z], max: [x, z]}}`) bounds the floor; other
+ * sections are the game's and are kept.
+ */
+export interface GanbateGraph {
+  readonly schema: 'ganbate.semantic.graph.v2';
+  readonly nodes: readonly GanbateGraphNode[];
+  readonly edges: readonly GanbateGraphEdge[];
+  readonly [section: string]: unknown;
+}
+
+/** One edit of a graph (see `crates/ganbate-graph/src/patch.rs`). */
+export type GanbateGraphOp =
+  | { readonly op: 'put'; readonly node: GanbateGraphNode }
+  | { readonly op: 'remove'; readonly id: string }
+  | { readonly op: 'set'; readonly id: string; readonly key: string; readonly value: unknown }
+  | {
+      readonly op: 'place';
+      readonly id: string;
+      readonly rel: Exclude<GanbateGraphRelation, 'facing'>;
+      readonly to: string;
+      readonly anchor?: GanbateGraphAnchor;
+      readonly clearance?: number;
+    }
+  | { readonly op: 'face'; readonly id: string; readonly to: string | null }
+  | { readonly op: 'graph'; readonly key: string; readonly value: unknown };
+
+export interface GanbateGraphCommit {
+  readonly graph: GanbateGraph;
+  /** sha256 of the graph's canonical text: equal graphs have equal digests. */
+  readonly digest: string;
+  /** What the solver moved to keep its rules, in plain words. */
+  readonly repairs: readonly string[];
+}
+
 export interface GanbateEntityTable {
   readonly entities: readonly GanbateEntityRecord[];
   /** The components the renderer does not draw, by entity id, and the scene's id and name. */
@@ -409,6 +478,26 @@ export interface GanbateEngine {
   pickWorldRay(origin: Vec3, direction: Vec3): GanbateWorldPickHit | null;
   /** The world's entity table, or null when it was cooked without one. */
   worldEntities(): GanbateEntityTable | null;
+  /**
+   * Commits `patch` to `graph` through the engine's spatial solver ('project' repairs and
+   * reports, 'reject' refuses); throws with the reason when the patch is malformed or refused.
+   * `graph` itself never changes.
+   */
+  graphCommit(
+    graph: GanbateGraph | string,
+    patch: readonly GanbateGraphOp[] | string,
+    mode?: 'project' | 'reject',
+  ): GanbateGraphCommit;
+  /**
+   * Checks a whole graph, as written by hand or received from another participant, against
+   * `previous` (null when opening it): changed relations place their nodes, moved nodes relate
+   * anew, and every node is kept to the solver's rules. Throws with the reason when refused.
+   */
+  graphCheck(
+    graph: GanbateGraph | string,
+    previous?: GanbateGraph | string | null,
+    mode?: 'project' | 'reject',
+  ): GanbateGraphCommit;
 
   /** Loads a GLB; its images are decoded into textures. */
   loadModel(source: string | ArrayBuffer | Uint8Array): Promise<{ model: number; info: GanbateModelInfo; textures: number[] }>;

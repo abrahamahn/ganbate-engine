@@ -14,6 +14,7 @@
 #![cfg_attr(not(target_arch = "wasm32"), allow(rustdoc::broken_intra_doc_links))]
 #![cfg(target_arch = "wasm32")]
 
+mod graph;
 mod physics;
 mod runtime;
 mod selftest;

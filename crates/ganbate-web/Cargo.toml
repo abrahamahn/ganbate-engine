@@ -12,4 +12,5 @@ crate-type = ["cdylib"]
 
 [dependencies]
 ganbate-engine = { path = "../.." }
+ganbate-graph = { path = "../ganbate-graph" }
 ganbate-physics = { path = "../ganbate-physics" }

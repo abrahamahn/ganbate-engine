@@ -768,6 +768,74 @@ test('glContext and setXrTarget support WebXR stereo eye framebuffer blits on We
   }
 });
 
+const GRAPH = {
+  schema: 'ganbate.semantic.graph.v2',
+  nodes: [
+    { id: 'desk', type: 'desk', position: [0, 0, 0], bounds: { shape: 'aabb', halfExtents: [1.2, 0.38, 0.6], surfaceY: 0.76 } },
+    { id: 'cup', type: 'cup', position: [2, 0, 2], bounds: { shape: 'cylinder', radius: 0.1, height: 0.15 } },
+  ],
+  edges: [],
+};
+
+test('graphCommit hands graph and patch to the engine as JSON and returns or throws its outcome', async () => {
+  const { canvas } = makeRecordingWebGl2Canvas();
+  const seen = [];
+  let outcome = '';
+  const text = (memory, p, len) => new TextDecoder().decode(new Uint8Array(memory.buffer, p >>> 0, len >>> 0));
+  const mock = makeMockWasm({
+    ganbate_graph_commit(gp, gl, pp, pl, reject) {
+      seen.push({ graph: JSON.parse(text(mock.memory, gp, gl)), patch: JSON.parse(text(mock.memory, pp, pl)), reject });
+      outcome = JSON.stringify(reject ? { error: 'refused' } : { graph: GRAPH, digest: 'ab', repairs: ['moved'] });
+      return new TextEncoder().encode(outcome).byteLength;
+    },
+    ganbate_graph_result(out, cap) {
+      const bytes = new TextEncoder().encode(outcome);
+      if (bytes.byteLength <= cap) new Uint8Array(mock.memory.buffer, out >>> 0, bytes.byteLength).set(bytes);
+      return bytes.byteLength;
+    },
+  });
+  const engine = await createEngine({ canvas, wasm: mock.instance, api: 'webgl2' });
+  const patch = [{ op: 'place', id: 'cup', rel: 'on_top_of', to: 'desk' }];
+  assert.deepEqual(engine.graphCommit(GRAPH, patch), { graph: GRAPH, digest: 'ab', repairs: ['moved'] });
+  assert.deepEqual(seen[0], { graph: GRAPH, patch, reject: 0 });
+  assert.throws(() => engine.graphCommit(JSON.stringify(GRAPH), '[]', 'reject'), /graphCommit: refused/);
+  assert.equal(seen[1].reject, 1);
+});
+
+test('the compiled ganbate_web.wasm solves a graph patch', () => {
+  const wasmPath = path.join(REPO_ROOT, 'target', 'wasm32-unknown-unknown', 'release', 'ganbate_web.wasm');
+  if (!fs.existsSync(wasmPath)) return;
+  const mod = new WebAssembly.Module(fs.readFileSync(wasmPath));
+  const imports = {};
+  for (const i of WebAssembly.Module.imports(mod)) (imports[i.module] ??= {})[i.name] = () => 0;
+  const x = new WebAssembly.Instance(mod, imports).exports;
+  // Calls an export taking two JSON texts and the mode, and reads back its outcome.
+  const call = (name, first, second, reject) => {
+    const [a, b] = [first, second].map((v) => new TextEncoder().encode(v === null ? '' : JSON.stringify(v)));
+    const ap = x.ganbate_alloc(Math.max(a.byteLength, 1));
+    const bp = x.ganbate_alloc(Math.max(b.byteLength, 1));
+    new Uint8Array(x.memory.buffer, ap, a.byteLength).set(a);
+    new Uint8Array(x.memory.buffer, bp, b.byteLength).set(b);
+    const len = x[name](ap, a.byteLength, bp, b.byteLength, reject);
+    const out = x.ganbate_alloc(len);
+    x.ganbate_graph_result(out, len);
+    return JSON.parse(new TextDecoder().decode(new Uint8Array(x.memory.buffer, out, len)));
+  };
+  const commit = (patch, reject) => call('ganbate_graph_commit', GRAPH, patch, reject);
+  const placed = commit([{ op: 'place', id: 'cup', rel: 'on_top_of', to: 'desk' }], 0);
+  assert.deepEqual(placed.graph.nodes[1].position, [0, 0.76, 0]);
+  assert.match(placed.digest, /^[0-9a-f]{64}$/);
+  const into = [{ op: 'set', id: 'cup', key: 'position', value: [0.5, 0, 0.7] }];
+  assert.match(commit(into, 1).error, /overlapped "desk"/);
+  assert.equal(commit(into, 0).repairs.length, 1);
+  // A whole graph: opened as written, and checked again it is the same graph.
+  const opened = call('ganbate_graph_check', null, placed.graph, 1);
+  assert.equal(opened.digest, placed.digest);
+  const floating = structuredClone(placed.graph);
+  floating.nodes[1].position = [3, 1, 3];
+  assert.match(call('ganbate_graph_check', placed.graph, floating, 1).error, /stood at height 1.00/);
+});
+
 test('web/ganbate.d.ts and compiled ganbate_web.wasm expose Wave 8 ray-picking and WebXR contracts', () => {
   const dts = fs.readFileSync(path.join(__dirname, 'ganbate.d.ts'), 'utf8');
   for (const token of [
