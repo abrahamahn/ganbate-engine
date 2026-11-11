@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createGraphSession } from '../graph-session.mjs';
+import { createGraphSession, windowChannel } from '../graph-session.mjs';
 
 // A stand-in for the engine's solver: graph-level operations only, the text as the digest.
 const engine = {
@@ -69,4 +69,43 @@ test('a refused change keeps the state, the history and the other participants u
   assert.equal(session.undo({ source: 'code' }), true);
   assert.equal(session.digest, JSON.stringify(ROOM));
   session.close();
+});
+
+// Two windows of different origins: `win.postMessage` delivers to `win` itself, from the other.
+function windowPair(parentOrigin, frameOrigin) {
+  const make = (origin) => Object.assign(new EventTarget(), { origin });
+  const [parent, frame] = [make(parentOrigin), make(frameOrigin)];
+  const deliver = (win, from) => {
+    win.postMessage = (data, targetOrigin) => {
+      if (targetOrigin !== win.origin) return;
+      setTimeout(() => win.dispatchEvent(Object.assign(new Event('message'), { data, origin: from.origin, source: from })), 0);
+    };
+  };
+  deliver(parent, frame);
+  deliver(frame, parent);
+  return { parent, frame };
+}
+
+test('a page joins the graph of the frame it embeds over postMessage, and nobody else is heard', async () => {
+  const { parent, frame } = windowPair('https://ganbate.io', 'https://play.ganbate.io');
+  // The embedded table opens with its graph; the page opens without one and joins.
+  const table = createGraphSession({ engine, graph: ROOM, channel: windowChannel(parent, 'https://ganbate.io', 'yozakura', frame) });
+  const page = createGraphSession({ engine, channel: windowChannel(frame, 'https://play.ganbate.io', 'yozakura', parent) });
+  assert.equal(page.graph, null);
+  assert.throws(() => page.commit([]), /no graph yet/);
+  await page.ready;
+  assert.equal(page.digest, table.digest);
+
+  page.commit([{ op: 'graph', key: 'environment', value: { preset: 'sunset' } }]);
+  await settle();
+  assert.equal(table.graph.environment.preset, 'sunset');
+
+  // A third window posing as the page is ignored.
+  const stranger = Object.assign(new EventTarget(), { origin: 'https://evil.example' });
+  const forged = { ganbateGraph: 'yozakura', message: { kind: 'graph', graph: ROOM, digest: 'x', source: 'remote' } };
+  frame.dispatchEvent(Object.assign(new Event('message'), { data: forged, origin: 'https://evil.example', source: stranger }));
+  await settle();
+  assert.equal(table.graph.environment.preset, 'sunset');
+  table.close();
+  page.close();
 });

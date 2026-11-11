@@ -319,6 +319,25 @@ export type GanbateGraphOp =
   | { readonly op: 'face'; readonly id: string; readonly to: string | null }
   | { readonly op: 'graph'; readonly key: string; readonly value: unknown };
 
+/** The graph solver's calls, on an engine or from `createGraphSolver`. */
+export interface GanbateGraphSolver {
+  graphCommit(
+    graph: GanbateGraph | string,
+    patch: readonly GanbateGraphOp[] | string,
+    mode?: 'project' | 'reject',
+  ): GanbateGraphCommit;
+  graphCheck(
+    graph: GanbateGraph | string,
+    previous?: GanbateGraph | string | null,
+    mode?: 'project' | 'reject',
+  ): GanbateGraphCommit;
+}
+
+/** The graph solver without a canvas, for pages and tools that edit a graph without drawing it. */
+export function createGraphSolver(options: {
+  readonly wasm: string | ArrayBuffer | Uint8Array | WebAssembly.Module;
+}): Promise<GanbateGraphSolver>;
+
 export interface GanbateGraphCommit {
   readonly graph: GanbateGraph;
   /** sha256 of the graph's canonical text: equal graphs have equal digests. */

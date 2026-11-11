@@ -2013,6 +2013,98 @@ function resolveStereoEyeCode(eye) {
  * calls `render()` when it wants a frame. Positions are metres; matrices are 16 numbers,
  * column-major, model to world.
  */
+/**
+ * One scratch allocation in the module's memory, reused: the module reads call arguments during
+ * the call only. Its start is rounded up to 4 bytes so typed-array views of it are aligned.
+ * `reserve(len)` returns room for `len` bytes; `place(...arrays)` copies byte arrays there, each at
+ * a 4-byte boundary, and returns their pointers; `free()` gives the memory back.
+ */
+function scratchFor(x) {
+  let scratch = 0;
+  let scratchCap = 0;
+  const reserve = (len) => {
+    if (len + 4 > scratchCap) {
+      if (scratch) x.ganbate_free(scratch, scratchCap);
+      scratchCap = Math.max(len + 4, scratchCap * 2, 4096);
+      scratch = x.ganbate_alloc(scratchCap) >>> 0;
+    }
+    return (scratch + 3) & ~3;
+  };
+  const place = (...arrays) => {
+    let total = 0;
+    const offsets = arrays.map((a) => {
+      const at = total;
+      total += a ? (a.byteLength + 3) & ~3 : 0;
+      return at;
+    });
+    const base = reserve(Math.max(total, 4));
+    const mem = new Uint8Array(x.memory.buffer);
+    return arrays.map((a, i) => {
+      if (!a) return 0;
+      mem.set(new Uint8Array(a.buffer, a.byteOffset, a.byteLength), base + offsets[i]);
+      return base + offsets[i];
+    });
+  };
+  const free = () => {
+    if (scratch) x.ganbate_free(scratch, scratchCap);
+    scratch = 0;
+    scratchCap = 0;
+  };
+  return { reserve, place, free };
+}
+
+/**
+ * The graph solver's two calls on module exports `x` (see `crates/ganbate-graph`): `graphCommit`
+ * applies a patch, `graphCheck` takes a whole graph. Each returns `{graph, digest, repairs}` or
+ * throws with the reason a change was refused.
+ */
+function graphCalls(x, { reserve, place }) {
+  const encoder = new TextEncoder();
+  const json = (v) => (v === null ? new Uint8Array(0) : encoder.encode(typeof v === 'string' ? v : JSON.stringify(v)));
+  const call = (name, label, first, second, mode) => {
+    const [a, b] = [json(first), json(second)];
+    const [ap, bp] = place(a, b);
+    const len = x[name](ap, a.byteLength, bp, b.byteLength, mode === 'reject' ? 1 : 0);
+    const out = reserve(len);
+    x.ganbate_graph_result(out, len);
+    const result = JSON.parse(new TextDecoder().decode(new Uint8Array(x.memory.buffer, out, len)));
+    if (result.error) throw new Error(`${label}: ${result.error}`);
+    return result;
+  };
+  return {
+    /**
+     * Commits `patch` (graph operations) to `graph` (`ganbate.semantic.graph.v2`), each an object
+     * or its JSON text: with `mode` 'project' what breaks support, stage or clearance is moved to
+     * the nearest valid place and reported in `repairs`; with 'reject' the patch is refused.
+     * `graph` itself never changes.
+     */
+    graphCommit: (graph, patch, mode = 'project') => call('ganbate_graph_commit', 'graphCommit', graph, patch, mode),
+    /**
+     * Checks a whole graph, as written by hand or received from another participant, against
+     * `previous` (null when opening it): a node whose relation changed is placed by it, the
+     * others relate anew from where they stand, and every node is kept to the rules.
+     */
+    graphCheck: (graph, previous = null, mode = 'project') => call('ganbate_graph_check', 'graphCheck', previous, graph, mode),
+  };
+}
+
+/**
+ * The graph solver without a canvas, for pages and tools that edit a semantic graph without
+ * drawing it (an editor panel, a demo's controls): the module is instantiated with inert host
+ * imports, which the graph functions never call. `wasm`: the module's URL, bytes, or a compiled
+ * `WebAssembly.Module`.
+ */
+export async function createGraphSolver({ wasm }) {
+  const module =
+    wasm instanceof WebAssembly.Module
+      ? wasm
+      : await WebAssembly.compile(typeof wasm === 'string' ? await (await fetch(wasm)).arrayBuffer() : wasm);
+  const imports = {};
+  for (const i of WebAssembly.Module.imports(module)) (imports[i.module] ??= {})[i.name] = () => 0;
+  const { exports: x } = await WebAssembly.instantiate(module, imports);
+  return graphCalls(x, scratchFor(x));
+}
+
 export async function createEngine(options) {
   const { canvas } = options;
   let lastError = '';
@@ -2041,35 +2133,8 @@ export async function createEngine(options) {
     return r;
   };
 
-  // One scratch allocation, reused: the engine reads call arguments during the call only.
-  // Its start is rounded up to 4 bytes so typed-array views of it are aligned.
-  let scratch = 0;
-  let scratchCap = 0;
-  const reserve = (len) => {
-    if (len + 4 > scratchCap) {
-      if (scratch) x.ganbate_free(scratch, scratchCap);
-      scratchCap = Math.max(len + 4, scratchCap * 2, 4096);
-      scratch = x.ganbate_alloc(scratchCap) >>> 0;
-    }
-    return (scratch + 3) & ~3;
-  };
+  const { reserve, place, free: freeScratch } = scratchFor(x);
   const encoder = new TextEncoder();
-  /** Copies byte arrays into scratch memory, each at a 4-byte boundary; returns pointers. */
-  const place = (...arrays) => {
-    let total = 0;
-    const offsets = arrays.map((a) => {
-      const at = total;
-      total += a ? (a.byteLength + 3) & ~3 : 0;
-      return at;
-    });
-    const base = reserve(Math.max(total, 4));
-    const mem = new Uint8Array(x.memory.buffer);
-    return arrays.map((a, i) => {
-      if (!a) return 0;
-      mem.set(new Uint8Array(a.buffer, a.byteOffset, a.byteLength), base + offsets[i]);
-      return base + offsets[i];
-    });
-  };
   /**
    * Has the browser copy `source` straight into a texture (no readback, no copy through wasm
    * memory): `call(width, height)` is the runtime export, and the host holds `source` for that
@@ -2637,41 +2702,7 @@ export async function createEngine(options) {
       x.ganbate_world_entities(p, len);
       return JSON.parse(new TextDecoder().decode(new Uint8Array(x.memory.buffer, p, len)));
     },
-    /**
-     * Commits `patch` (graph operations) to `graph` (`ganbate.semantic.graph.v2`), each an object
-     * or its JSON text, through the engine's spatial solver: with `mode` 'project' what breaks
-     * support, stage or clearance is moved to the nearest valid place and reported in `repairs`;
-     * with 'reject' the patch is refused. Returns `{graph, digest, repairs}`; throws with the
-     * reason when the patch is malformed or refused. `graph` itself never changes.
-     */
-    graphCommit(graph, patch, mode = 'project') {
-      const json = (v) => encoder.encode(typeof v === 'string' ? v : JSON.stringify(v));
-      const [g, p] = [json(graph), json(patch)];
-      const [gp, pp] = place(g, p);
-      const len = x.ganbate_graph_commit(gp, g.byteLength, pp, p.byteLength, mode === 'reject' ? 1 : 0);
-      const out = reserve(len);
-      x.ganbate_graph_result(out, len);
-      const result = JSON.parse(new TextDecoder().decode(new Uint8Array(x.memory.buffer, out, len)));
-      if (result.error) throw new Error(`graphCommit: ${result.error}`);
-      return result;
-    },
-    /**
-     * Checks a whole graph `graph` (an object or its JSON text), as written by hand or received
-     * from another participant, against `previous` (null when opening it): a node whose relation
-     * changed is placed by it, the others relate anew from where they stand, and every node is
-     * kept to the solver's rules as in `graphCommit`.
-     */
-    graphCheck(graph, previous = null, mode = 'project') {
-      const json = (v) => encoder.encode(typeof v === 'string' ? v : JSON.stringify(v));
-      const [n, p] = [json(graph), previous === null ? new Uint8Array(0) : json(previous)];
-      const [np, pp] = place(n, p);
-      const len = x.ganbate_graph_check(pp, p.byteLength, np, n.byteLength, mode === 'reject' ? 1 : 0);
-      const out = reserve(len);
-      x.ganbate_graph_result(out, len);
-      const result = JSON.parse(new TextDecoder().decode(new Uint8Array(x.memory.buffer, out, len)));
-      if (result.error) throw new Error(`graphCheck: ${result.error}`);
-      return result;
-    },
+    ...graphCalls(x, { reserve, place }),
     /**
      * Loads a glTF model (GLB): `source` is a URL, ArrayBuffer or Uint8Array. Its images are
      * decoded by the browser into textures. Resolves with `{model, info, textures}`, where
@@ -2795,9 +2826,7 @@ export async function createEngine(options) {
       x.ganbate_rt_stop();
       observer?.disconnect();
       drawn = null;
-      if (scratch) x.ganbate_free(scratch, scratchCap);
-      scratch = 0;
-      scratchCap = 0;
+      freeScratch();
     },
   };
   return engine;

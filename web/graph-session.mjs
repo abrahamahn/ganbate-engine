@@ -5,18 +5,21 @@
  * (`engine.graphCommit` for patches, `engine.graphCheck` for a whole graph written as text), so all
  * participants keep the same rules, and a graph's digest names the same state everywhere.
  *
- * Participants talk over a `BroadcastChannel` named `ganbate-graph:<name>` (or any object with
- * `postMessage`, `addEventListener('message')` and `close`, such as an adapter over a frame's
- * `postMessage`). Messages: `{kind: 'graph', graph, digest, source}` when the state changes,
- * `{kind: 'select', id, source}` when the selection does, and `{kind: 'hello'}` from a newcomer,
- * which every participant answers with its state.
+ * Participants talk over a `BroadcastChannel` named `ganbate-graph:<name>` within one origin, or
+ * over `windowChannel` between a page and a frame of another origin. Messages:
+ * `{kind: 'graph', graph, digest, source}` when the state changes, `{kind: 'select', id, source}`
+ * when the selection does, and `{kind: 'hello'}` from a newcomer, which every participant with a
+ * graph answers with its state. A participant that has not changed anything takes the state the
+ * others answer with; one opened without a graph joins with the first state it hears.
  */
 
 export const GRAPH_CHANNEL_PREFIX = 'ganbate-graph:';
 
 /**
- * Opens a session on `graph` (an object or its text), checked by `engine` first.
- * `engine` needs `graphCommit(graph, patch, mode)` and `graphCheck(graph, previous, mode)`.
+ * Opens a session on `graph` (an object or its text), checked by `engine` first, or, without one,
+ * a session that joins the graph another participant shares (`ready` resolves then).
+ * `engine` needs `graphCommit(graph, patch, mode)` and `graphCheck(graph, previous, mode)`, as the
+ * engine and `createGraphSolver` provide.
  * `mode` 'project' repairs what breaks the rules and reports it; 'reject' refuses the change.
  * `channel`: false for a page-local session, an object as above, or omitted for the default.
  */
@@ -28,10 +31,17 @@ export function createGraphSession({
   mode = 'project',
   historyLimit = 64,
 }) {
-  const opened = engine.graphCheck(graph, null, mode);
-  let current = { graph: opened.graph, digest: opened.digest };
+  const opened = graph == null ? null : engine.graphCheck(graph, null, mode);
+  let current = opened && { graph: opened.graph, digest: opened.digest };
+  let joined = () => {};
+  const ready = new Promise((resolve) => {
+    joined = resolve;
+  });
+  if (current) joined();
   let selection = null;
-  let edited = false;
+  // Settled once it has changed the graph or heard the shared one: from then on, a newcomer's
+  // state (`sync`) no longer replaces its own.
+  let settled = false;
   const past = [];
   const future = [];
   const listeners = new Set();
@@ -44,13 +54,16 @@ export function createGraphSession({
   const emit = (event) => {
     for (const listener of listeners) listener({ ...event, graph: current.graph, digest: current.digest, selection });
   };
-  const announce = (source) => post({ kind: 'graph', graph: current.graph, digest: current.digest, source });
+  const announce = (source) => current && post({ kind: 'graph', graph: current.graph, digest: current.digest, source });
   const adopt = (next, source, repairs = [], remote = false) => {
-    if (next.digest === current.digest) return false;
-    past.push(current);
-    if (past.length > historyLimit) past.shift();
+    if (next.digest === current?.digest) return false;
+    if (current) {
+      past.push(current);
+      if (past.length > historyLimit) past.shift();
+    }
     future.length = 0;
     current = { graph: next.graph, digest: next.digest };
+    joined();
     if (selection !== null && !current.graph.nodes.some((n) => n.id === selection)) selection = null;
     emit({ kind: 'graph', source, repairs, remote });
     return true;
@@ -58,7 +71,7 @@ export function createGraphSession({
   const step = (from, to, source) => {
     const target = from.pop();
     if (!target) return false;
-    edited = true;
+    settled = true;
     to.push(current);
     current = target;
     emit({ kind: 'graph', source, repairs: [], remote: false });
@@ -71,45 +84,56 @@ export function createGraphSession({
     if (!message || typeof message !== 'object') return;
     if (message.kind === 'hello') {
       announce('sync');
-    } else if (message.kind === 'graph' && message.digest !== current.digest) {
+    } else if (message.kind === 'graph') {
+      if (message.source === 'sync' && settled) return;
+      if (message.digest === current?.digest) {
+        settled = true;
+        return;
+      }
       try {
-        // A newcomer takes the state already shared; afterwards every change is adopted.
-        if (message.source === 'sync' && edited) return;
         adopt(engine.graphCheck(message.graph, null, 'reject'), message.source ?? 'remote', [], true);
+        settled = true;
       } catch {
         // A graph the rules refuse is not adopted; the sender keeps its own.
       }
-    } else if (message.kind === 'select' && (message.id === null || typeof message.id === 'string')) {
+    } else if (current && message.kind === 'select' && (message.id === null || typeof message.id === 'string')) {
       selection = message.id;
       emit({ kind: 'select', source: message.source ?? 'remote', remote: true });
     }
   };
   link?.addEventListener('message', onMessage);
   post({ kind: 'hello' });
+  announce('sync');
 
+  const joinedState = () => {
+    if (!current) throw new Error('graph session: no graph yet; wait for `ready`');
+    return current;
+  };
   const change = (result, source) => {
-    edited = true;
+    settled = true;
     if (adopt(result, source, result.repairs)) announce(source);
     return result;
   };
 
   return {
+    /** Resolves once the session has a graph (at once when opened with one). */
+    ready,
     get graph() {
-      return current.graph;
+      return current?.graph ?? null;
     },
     get digest() {
-      return current.digest;
+      return current?.digest ?? null;
     },
     get selection() {
       return selection;
     },
     /** Applies graph operations; returns `{graph, digest, repairs}` or throws why they were refused. */
     commit(patch, { source = 'local' } = {}) {
-      return change(engine.graphCommit(current.graph, patch, mode), source);
+      return change(engine.graphCommit(joinedState().graph, patch, mode), source);
     },
     /** Takes a whole graph written as code; changed relations place nodes, moved nodes relate anew. */
     replace(graph, { source = 'code' } = {}) {
-      return change(engine.graphCheck(graph, current.graph, mode), source);
+      return change(engine.graphCheck(graph, joinedState().graph, mode), source);
     },
     undo({ source = 'local' } = {}) {
       return step(past, future, source);
@@ -119,7 +143,7 @@ export function createGraphSession({
     },
     /** Selects a node by id (null: nothing) for every participant. */
     select(id, { source = 'local' } = {}) {
-      if (id !== null && !current.graph.nodes.some((n) => n.id === id)) return false;
+      if (id !== null && !joinedState().graph.nodes.some((n) => n.id === id)) return false;
       selection = id;
       emit({ kind: 'select', source, remote: false });
       post({ kind: 'select', id, source });
@@ -134,6 +158,40 @@ export function createGraphSession({
       link?.removeEventListener('message', onMessage);
       if (channel === undefined) link?.close();
       listeners.clear();
+    },
+  };
+}
+
+/**
+ * A channel over `postMessage` to another window, such as a frame embedded from another origin or
+ * the page embedding this one. Only messages from `target` at `origin` are heard, and messages go
+ * to that origin only; `name` keeps sessions sharing a window apart. `self` is this window.
+ */
+export function windowChannel(target, origin, name = 'default', self = globalThis) {
+  const wrapped = new Map();
+  return {
+    postMessage(message) {
+      target.postMessage({ ganbateGraph: name, message }, origin);
+    },
+    addEventListener(type, listener) {
+      if (type !== 'message' || wrapped.has(listener)) return;
+      const hear = (event) => {
+        const data = event.data;
+        if (event.source !== target || event.origin !== origin || data?.ganbateGraph !== name) return;
+        listener({ data: data.message });
+      };
+      wrapped.set(listener, hear);
+      self.addEventListener('message', hear);
+    },
+    removeEventListener(type, listener) {
+      const hear = wrapped.get(listener);
+      if (type !== 'message' || !hear) return;
+      self.removeEventListener('message', hear);
+      wrapped.delete(listener);
+    },
+    close() {
+      for (const hear of wrapped.values()) self.removeEventListener('message', hear);
+      wrapped.clear();
     },
   };
 }

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import {
   createEngine,
   createGlHost,
+  createGraphSolver,
   createHost,
 } from './ganbate.js';
 
@@ -834,6 +835,18 @@ test('the compiled ganbate_web.wasm solves a graph patch', () => {
   const floating = structuredClone(placed.graph);
   floating.nodes[1].position = [3, 1, 3];
   assert.match(call('ganbate_graph_check', placed.graph, floating, 1).error, /stood at height 1.00/);
+});
+
+test('createGraphSolver solves a graph without a canvas', async () => {
+  const wasmPath = path.join(REPO_ROOT, 'target', 'wasm32-unknown-unknown', 'release', 'ganbate_web.wasm');
+  if (!fs.existsSync(wasmPath)) return;
+  const solver = await createGraphSolver({ wasm: fs.readFileSync(wasmPath) });
+  const placed = solver.graphCommit(GRAPH, [{ op: 'place', id: 'cup', rel: 'on_top_of', to: 'desk' }]);
+  assert.deepEqual(placed.graph.nodes[1].position, [0, 0.76, 0]);
+  assert.equal(solver.graphCheck(placed.graph).digest, placed.digest);
+  const floating = structuredClone(placed.graph);
+  floating.nodes[1].position = [3, 1, 3];
+  assert.throws(() => solver.graphCheck(floating, placed.graph, 'reject'), /^Error: graphCheck: .*stood at height 1.00/);
 });
 
 test('web/ganbate.d.ts and compiled ganbate_web.wasm expose Wave 8 ray-picking and WebXR contracts', () => {
