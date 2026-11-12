@@ -2609,10 +2609,14 @@ export async function createEngine(options) {
     /** Waits until the GPU has finished submitted work (WebGPU; immediate on WebGL 2). */
     async idle() { if (gpu.device) await gpu.device.queue.onSubmittedWorkDone(); },
     /**
-     * Times each pass of the frames drawn from now on (true), drawing one frame at a time, or
-     * stops (false); each call starts the means afresh.
+     * Times each pass of the frames drawn from now on (true), drawing one frame at a time and the
+     * main pass as its parts, or stops (false); each call starts the means afresh.
      */
-    setPassTiming(on) { host.timing.set(on); },
+    setPassTiming(on) {
+      host.timing.set(on);
+      // The main pass splits into its parts while timed, so each shows on its own.
+      if (typeof x.ganbate_rt_set_split_passes === 'function') x.ganbate_rt_set_split_passes(on ? 1 : 0);
+    },
     /** The timed frames' mean GPU time a pass, in drawing order, and a frame's (ms). */
     passTiming: () => host.timing.report(),
 

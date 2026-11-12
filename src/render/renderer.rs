@@ -540,6 +540,9 @@ pub struct Renderer {
     /// The AO refinement the cached world shows, and the frames since it was drawn.
     cache_ao_revision: u64,
     cache_age: u32,
+    /// The main pass ends and starts again between what it draws, so each part is timed as a pass
+    /// of its own on a device ([`Renderer::set_split_passes`]).
+    split_passes: bool,
     pub(super) scene: GpuScene,
     pub(super) pipelines: Pipelines,
     pub(super) quality: Quality,
@@ -1532,6 +1535,7 @@ impl Renderer {
             receivers: None,
             cache_ao_revision: 0,
             cache_age: 0,
+            split_passes: false,
             world_moved: false,
             ao_quiet_frames: AO_SETTLE_FRAMES,
             details,
@@ -1613,6 +1617,13 @@ impl Renderer {
     /// frame after start and after world edits).
     pub fn ao_progress(&self) -> f32 {
         self.scene.ao.progress()
+    }
+    /// Draws the main pass as several, one for each thing it draws over the cached picture (the
+    /// picture, the live props, the water and the masked water, the grass, the sky, the weather,
+    /// the blended props), so
+    /// a device's pass timing shows what each costs; the picture is the same.
+    pub fn set_split_passes(&mut self, on: bool) {
+        self.split_passes = on;
     }
     pub fn size(&self) -> (u32, u32) {
         (self.targets.width, self.targets.height)
@@ -3403,11 +3414,27 @@ impl Renderer {
             ],
             depth: Some(Attachment::clear(t.depth, clear)),
         });
+        // Timing each part (`split_passes`): the pass ends and goes on as another.
+        let splits = self.split_passes && cached;
+        let split = |enc: &mut crate::gpu::Encoder| {
+            if splits {
+                let keep = |texture| Attachment {
+                    load: Load::Load,
+                    ..Attachment::clear(texture, clear)
+                };
+                enc.end_pass();
+                enc.begin_pass(PassDesc {
+                    colors: vec![keep(t.hdr), keep(t.aux)],
+                    depth: Some(keep(t.depth)),
+                });
+            }
+        };
         if cached {
             // The cached picture (colour, aux and depth), then the live props over it.
             enc.set_pipeline(p.restore);
             enc.set_bind_group(0, slot.restore);
             enc.draw(3, 1, 0, 0);
+            split(enc);
             self.draw_props(enc, slot_index, 0, PropSet::Live);
         } else {
             // The game's props first: the table and its players stand nearest and cover most
@@ -3423,9 +3450,11 @@ impl Renderer {
         // The water moves with the clock, so it is drawn every frame. Without an alpha test it
         // never discards, so the floor and the table in front of it hide it before it is
         // shaded: behind the room it spans the whole view.
+        split(enc);
         enc.set_pipeline(p.scene_opaque);
         enc.set_bind_group(0, slot.scene[0]);
         count(self.draw_world(enc, &mut push, &eye, true, WorldPart::Water, None));
+        split(enc);
         enc.set_pipeline(p.scene);
         enc.set_bind_group(0, slot.scene[0]);
         count(self.draw_world(enc, &mut push, &eye, true, WorldPart::MaskedWater, None));
@@ -3435,6 +3464,7 @@ impl Renderer {
         stats.world_draws_submitted = submitted_draws;
         stats.world_draws_culled = total_draws.saturating_sub(submitted_draws);
         let blades = self.grass_instances();
+        split(enc);
         if blades > 0 {
             enc.set_pipeline(p.grass);
             enc.set_bind_group(0, slot.grass);
@@ -3445,9 +3475,11 @@ impl Renderer {
                 enc.draw(6, blades, 0, 0);
             }
         }
+        split(enc);
         enc.set_pipeline(p.sky);
         enc.set_bind_group(0, slot.sky[0]);
         enc.draw(3, 1, 0, 0);
+        split(enc);
         if self.quality.particles {
             enc.set_pipeline(p.particle);
             enc.set_bind_group(0, slot.particle);
@@ -3480,6 +3512,7 @@ impl Renderer {
                 enc.draw(6, petals, 0, 0);
             }
         }
+        split(enc);
         self.draw_blended_props(enc, slot_index);
         enc.end_pass();
 
