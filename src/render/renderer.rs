@@ -254,14 +254,17 @@ fn shadow_volume(
         return out.extend(corners(b));
     }
     // As deep as the box reaches in the map (ahead of a spot light, where the deepest of its
-    // points is a corner: depth grows with the distance along the light).
+    // points is a corner: depth grows with the distance along the light), and no deeper than a
+    // game light's range (depth 1, its map's far plane): past it `game_light_share` is 1 whatever
+    // moved.
     let far = corners(b)
         .iter()
         .map(|p| transform(m, [p[0], p[1], p[2], 1.0]))
         .filter(|c| c[3] > 1e-6)
         .map(|c| c[2] / c[3])
         .fold(f32::NEG_INFINITY, f32::max);
-    if far == f32::NEG_INFINITY {
+    let far = if v >= 2 { far.min(1.0) } else { far };
+    if far == f32::NEG_INFINITY || v >= 2 && near > far {
         return;
     }
     let (lo, hi) = ([r[0], r[1], near], [r[2], r[3], far.max(near)]);
@@ -5725,6 +5728,10 @@ mod tests {
                     if !(inside && rect[1] <= q[1] && q[1] <= rect[3] && q[2] >= near) {
                         continue;
                     }
+                    // Past a spot's range its shadows change nothing.
+                    if v == 2 && q[2] > 1.0 {
+                        continue;
+                    }
                     // Seen at the centre of a pixel there, that pixel is in the region.
                     let s = transform(&view_proj, [p[0], p[1], p[2], 1.0]);
                     let (x, y) = ((s[0] / s[3] * 0.5 + 0.5) * w, (s[1] / s[3] * 0.5 + 0.5) * h);
@@ -5761,6 +5768,45 @@ mod tests {
                 assert!(!near_cascade_only(&points, eye, 3.0, m, *grow));
             }
         }
+    }
+
+    /// Past a game light's range (depth 1 in its map) its share is 1 whatever moved: a wall
+    /// there sees nothing of a caster's footprint in the spot's map, nor does any receiver of a
+    /// caster past it, and a box across the range sees it only up to the range.
+    #[test]
+    fn nothing_past_a_spot_lights_range_is_reshaded() {
+        let spot = mul(
+            &math::perspective_depth(1.0, 1.0, 0.05, 3.0),
+            &look_at([0.0, 1.0, 0.0], [0.0, 1.0, -1.0], [0.0, 1.0, 0.0]),
+        );
+        let key = (math::IDENTITY, 0.0, 0.0);
+        let maps = [key, key, (spot, 0.02, 0.0), (spot, 0.02, 0.0)];
+        let footprint = |caster: (V3, V3)| -> Footprint {
+            let (r, near, _) = map_bounds(caster, &spot);
+            (
+                2,
+                [r[0] - 0.02, r[1] - 0.02, r[2] + 0.02, r[3] + 0.02],
+                near,
+            )
+        };
+        let points = |b, f: &Footprint| {
+            let mut points = vec![];
+            shadow_volume(b, f, &maps, &mut points);
+            points
+        };
+        let wall = |z: f32| ([-2.0, 0.0, z - 0.05], [2.0, 2.0, z + 0.05]);
+        let ball = footprint(([-0.1, 0.9, -1.1], [0.1, 1.1, -0.9]));
+        let across = points(([-2.0, 0.0, -3.5], [2.0, 2.0, -2.5]), &ball);
+        assert!(!across.is_empty());
+        let deepest = across
+            .iter()
+            .map(|p| transform(&spot, [p[0], p[1], p[2], 1.0]))
+            .map(|c| c[2] / c[3])
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(deepest < 1.0 + 1e-4, "{deepest}");
+        assert!(points(wall(-3.5), &ball).is_empty());
+        let beyond = footprint(([-0.1, 0.9, -3.4], [0.1, 1.1, -3.2]));
+        assert!(points(wall(-4.0), &beyond).is_empty());
     }
 
     /// A caster re-posed by a hair every frame (a breathing dealer), then moved a little, low
