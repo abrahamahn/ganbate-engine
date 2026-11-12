@@ -1031,6 +1031,15 @@ impl Props {
         }
     }
 
+    /// This frame's batches and prop bounds as a hash, for a benchmark to show two builds
+    /// decide alike.
+    #[cfg(test)]
+    pub(super) fn digest(&self) -> u64 {
+        let mut h = Fnv::new();
+        h.write(format!("{:?} {:?}", self.batches, self.bounds).as_bytes());
+        h.finish()
+    }
+
     /// Removes an instance; what it held in the cached picture is drawn again.
     fn remove_instance(&mut self, id: u32) {
         if let Some(i) = self.instances.remove(id) {

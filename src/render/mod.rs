@@ -21,6 +21,8 @@ macro_rules! handle {
 }
 
 pub mod ao;
+#[cfg(test)]
+mod bench;
 mod lights;
 pub mod look;
 pub mod math;
