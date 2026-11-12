@@ -15,6 +15,16 @@ export interface CreateEngineOptions {
   readonly wasm: string | ArrayBuffer | ArrayBufferView | WebAssembly.Instance;
   /** WebGPU where the browser has it, otherwise WebGL 2 (`auto`, the default). */
   readonly api?: GanbateApi;
+  /**
+   * How frames reach a WebGPU canvas. 'settled' draws offscreen and copies each frame to the
+   * canvas once the GPU has finished it, with one frame on the GPU: Safari's WebGPU canvas takes
+   * frames with no fence, unfinished, and shows an undrawn buffer's three-frame-old picture.
+   * 'direct' draws into the canvas with up to two frames on the GPU. 'auto' (the default): settled
+   * on Apple's WebKit.
+   */
+  readonly present?: 'auto' | 'direct' | 'settled';
+  /** WebGPU replays repeated passes from render bundles (the default); false encodes every pass. */
+  readonly bundles?: boolean;
   /** A cooked `.gbew` world: URL or bytes. Omit for a scene of props only. */
   readonly world?: string | ArrayBuffer | Uint8Array;
   /**
@@ -278,6 +288,8 @@ export interface GanbateEntityTable {
 
 export interface GanbateEngine {
   readonly api: 'webgpu' | 'webgl2';
+  /** How frames reach the canvas (`CreateEngineOptions.present`); WebGL 2 is always 'direct'. */
+  readonly present: 'direct' | 'settled';
   readonly adapter: string;
   errors(): string[];
   /** Sizes the canvas to its CSS box times `dpr` (default: the device pixel ratio). */

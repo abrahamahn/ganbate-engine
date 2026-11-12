@@ -108,6 +108,67 @@ function createPassTiming() {
   };
 }
 
+/** Apple's WebKit: every browser on an iPhone or iPad (iPadOS asks as a Mac with touch), and Safari on a Mac. */
+function appleWebKit() {
+  if (typeof navigator === 'undefined') return false;
+  const ua = navigator.userAgent || '';
+  const ios = /iPhone|iPad|iPod/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+  const macSafari = /Macintosh/.test(ua) && /Version\/[\d.]+.*Safari\//.test(ua)
+    && !/Chrome|Chromium|Edg|Firefox|OPR/.test(ua);
+  return ios || macSafari;
+}
+
+/**
+ * How many frames are on the GPU at once and, on a settled host, when a finished frame is shown.
+ * Safari's WebGPU canvas (26 and the fix after it for WebKit bug 320866 alike) hands each frame to
+ * the compositor with no fence, before the GPU has finished it, and shows whichever of its three
+ * buffers is next even if nothing was drawn into it, a picture three frames old: on an iPhone the
+ * table judders and steps back and forth. Settled, the engine draws offscreen with one frame on the
+ * GPU and copies a frame to the canvas only once the GPU has finished it, ahead of the next, so the
+ * canvas only ever receives a finished picture (a frame the GPU refused shows the last one again).
+ * Direct (every other browser), it draws into the canvas with up to two frames on the GPU.
+ */
+function createFrameGate(gpu, host, settled) {
+  let inFlight = 0;
+  let ready = null;
+  let shown = null;
+  let wake = 0;
+  let stopped = false;
+  const show = () => {
+    if (!ready || stopped) return;
+    shown = ready;
+    ready = null;
+    host.present(shown);
+  };
+  return {
+    full: () => inFlight >= (settled ? 1 : 2),
+    /** Counts a submitted frame until the GPU has finished it; settled, it is then shown. */
+    submitted() {
+      if (!gpu.device) return;
+      inFlight++;
+      const frame = settled ? host.frameTexture() : null;
+      const done = () => {
+        inFlight--;
+        if (!frame || stopped) return;
+        ready = frame;
+        // A table at rest draws no next frame to show this one before: an animation frame does.
+        if (!wake) wake = requestAnimationFrame(() => { wake = 0; show(); });
+      };
+      gpu.device.queue.onSubmittedWorkDone().then(done, done);
+    },
+    /** Shows the finished frame (settled), before the next is drawn into its texture. */
+    show,
+    /** A resized canvas starts empty: the last finished frame, stretched, until the next. */
+    reshow() {
+      if (!settled || inFlight || stopped) return;
+      if (ready) show();
+      else if (shown) host.present(shown);
+    },
+    /** Shows nothing more (the engine is destroyed). */
+    stop() { stopped = true; },
+  };
+}
+
 /** Creates the WebGPU device and, if `canvas` is given, configures its context. */
 export async function createGpu(canvas) {
   if (!navigator.gpu) {
@@ -147,7 +208,7 @@ export async function createGpu(canvas) {
 }
 
 /** The import object for the wasm module and the host state behind it. */
-export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError = () => {} } = {}) {
+export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError = () => {}, settled = false, bundles = true } = {}) {
   const { device, canvas, context } = gpu;
   const objects = [null];
   const freeList = [];
@@ -191,8 +252,26 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
     }
   };
 
+  // Settled (`createFrameGate`), frames are drawn into a texture of the canvas's size and copied
+  // to the canvas once finished (`present`); one replaced by a resize goes once a newer is shown.
+  let stage = null;
+  const retired = [];
+  const presentGroups = new WeakMap();
   const currentTexture = () => {
-    if (!surfaceTexture) surfaceTexture = context.getCurrentTexture();
+    if (surfaceTexture) return surfaceTexture;
+    if (!settled) {
+      surfaceTexture = context.getCurrentTexture();
+    } else {
+      if (!stage || stage.width !== canvas.width || stage.height !== canvas.height) {
+        if (stage) retired.push(stage);
+        stage = device.createTexture({
+          size: [canvas.width, canvas.height],
+          format: gpu.format,
+          usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
+        });
+      }
+      surfaceTexture = stage;
+    }
     return surfaceTexture;
   };
   const texture = (h) => (h >>> 0 === SURFACE
@@ -314,7 +393,9 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
     pass.end();
   };
 
-  const canBundle = typeof device.createRenderBundleEncoder === 'function';
+  const canBundle = bundles && typeof device.createRenderBundleEncoder === 'function';
+  // Settled, the copy to the canvas is ready before the first frame needs it.
+  if (settled) blitPipeline(gpu.format, false);
   // While passes are timed (`timing`): each pass's own begin and end where the GPU has timestamps,
   // otherwise the frame's submission to its completion.
   const timing = createPassTiming();
@@ -764,8 +845,43 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
     setSource(image) { source = image; },
     /** Forgets the canvas texture of the last frame (call once per animation frame). */
     nextFrame() { surfaceTexture = null; surfaceView = null; },
-    /** The canvas texture of the current frame, if one was rendered. */
+    /** The canvas texture of the current frame (settled, its offscreen texture), if one was rendered. */
     frameTexture() { return surfaceTexture; },
+    /** Copies a finished frame onto the canvas (settled), stretched if the canvas was resized. */
+    present(frame) {
+      const target = context.getCurrentTexture();
+      const linear = frame.width !== target.width || frame.height !== target.height;
+      const p = blitPipeline(gpu.format, linear);
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginRenderPass({
+        colorAttachments: [{ view: target.createView(), loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }],
+      });
+      pass.setPipeline(p.pipeline);
+      let groups = presentGroups.get(frame);
+      if (!groups) presentGroups.set(frame, groups = new Map());
+      let group = groups.get(p.id);
+      if (!group) {
+        group = device.createBindGroup({
+          layout: p.layout,
+          entries: [
+            { binding: 0, resource: frame.createView() },
+            { binding: 1, resource: blitSamplers[linear ? 1 : 0] },
+          ],
+        });
+        groups.set(p.id, group);
+      }
+      pass.setBindGroup(0, group);
+      pass.draw(3);
+      pass.end();
+      device.queue.submit([enc.finish()]);
+      if (frame === stage) while (retired.length) retired.pop().destroy();
+    },
+    /** Releases the settled host's frame textures. */
+    release() {
+      while (retired.length) retired.pop().destroy();
+      stage?.destroy();
+      stage = null;
+    },
     /** Telemetry for cached GPURenderBundle passes. */
     bundleStats: () => ({ cached: bundleCompiled, candidates: bundleEntries, replays: bundleReplays }),
     timing,
@@ -1909,11 +2025,17 @@ async function boot(options) {
     gpu = createGl(canvas);
   }
   onLog(0, `${gpu.adapterName}; features: ${gpu.features.join(', ') || 'none'}; canvas ${gpu.format}`);
+  // WebGPU on Apple's WebKit presents settled (`createFrameGate`); `present` forces either way.
+  const present = options.present && options.present !== 'auto' ? options.present
+    : appleWebKit() ? 'settled' : 'direct';
+  const settled = gpu.api === 'webgpu' && present === 'settled';
   const hostOptions = {
     onLog,
     onStatus: options.onStatus || (() => {}),
     onError: fail,
     checkErrors: !!options.checkErrors,
+    settled,
+    bundles: options.bundles !== false,
   };
   const host = gpu.api === 'webgl2' ? createGlHost(gpu, hostOptions) : createHost(gpu, hostOptions);
   onPhase('Loading the engine', 0);
@@ -1932,7 +2054,7 @@ async function boot(options) {
     }
   }
   host.attach(instance);
-  return { gpu, host, x: instance.exports, errors, fail };
+  return { gpu, host, x: instance.exports, errors, fail, settled };
 }
 
 /** Reads `texture` (the canvas texture of the current frame) back as RGBA8 pixels. */
@@ -1965,7 +2087,7 @@ async function readPixels(gpu, texture, host) {
  * canvas) and resolves with the canvas pixels and any errors.
  */
 export async function startSelfTest(options) {
-  const { gpu, host, x, errors, fail } = await boot({ ...options, checkErrors: true });
+  const { gpu, host, x, errors, fail } = await boot({ ...options, checkErrors: true, present: 'direct' });
   if (options.sizeCanvas) options.sizeCanvas();
   const pixels = await new Promise((resolve, reject) => requestAnimationFrame(() => {
     host.nextFrame();
@@ -2001,7 +2123,7 @@ export async function startSelfTest(options) {
  */
 export async function startPlayer(options) {
   const { canvas, onPhase = () => {} } = options;
-  const { gpu, host, x, errors, fail } = await boot(options);
+  const { gpu, host, x, errors, fail, settled } = await boot(options);
   const call = (what, f) => {
     try {
       return f();
@@ -2108,16 +2230,17 @@ export async function startPlayer(options) {
   let running = true;
   let captures = [];
   const capture = (texture) => readPixels(gpu, texture, host);
-  // At most two frames in flight: without vsync (or on a slow GPU) frames would otherwise queue
-  // up without bound and input, readbacks and resizes would wait behind them.
-  let inFlight = 0;
+  // Frames on the GPU are bounded (`createFrameGate`): without vsync (or on a slow GPU) they would
+  // otherwise queue up without bound and input, readbacks and resizes would wait behind them.
+  const gate = createFrameGate(gpu, host, settled);
   const tick = (now) => {
     if (!running) return;
-    if (inFlight >= 2) {
+    if (options.sizeCanvas) options.sizeCanvas();
+    gate.show();
+    if (gate.full()) {
       requestAnimationFrame(tick);
       return;
     }
-    if (options.sizeCanvas) options.sizeCanvas();
     const dt = Math.min(Math.max((now - last) / 1000, 0), 0.25);
     last = now;
     host.nextFrame();
@@ -2132,10 +2255,7 @@ export async function startPlayer(options) {
       if (!errors.length) fail('the engine stopped');
       return;
     }
-    if (gpu.device) {
-      inFlight++;
-      gpu.device.queue.onSubmittedWorkDone().then(() => { inFlight--; }, () => { inFlight--; });
-    }
+    gate.submitted();
     const texture = host.frameTexture();
     if (captures.length && texture) {
       const pending = captures;
@@ -2155,7 +2275,7 @@ export async function startPlayer(options) {
     errors: () => [...errors, ...host.errors.filter((e) => !errors.includes(e))],
     frames: () => x.ganbate_frames(),
     key,
-    stop() { running = false; },
+    stop() { running = false; gate.stop(); },
     /** The next rendered frame as RGBA pixels. */
     capture: () => new Promise((resolve, reject) => captures.push({ resolve, reject })),
   };
@@ -2256,7 +2376,7 @@ export async function createEngine(options) {
   const onLog = options.onLog || (() => {});
   // While a texture is copied from its source: a refusal falls back to the pixels, so it warns.
   let trying = false;
-  const { gpu, host, x, errors } = await boot({
+  const { gpu, host, x, errors, settled } = await boot({
     ...options,
     onLog: (level, text) => {
       // A panic is never a refusal: the module is dead, and the error must stay one.
@@ -2394,7 +2514,7 @@ export async function createEngine(options) {
     if (!x.ganbate_rt_ao_import(p, bytes.length)) onLog(1, 'The baked AO does not fit this world; baking it live');
   }
 
-  let inFlight = 0;
+  const gate = createFrameGate(gpu, host, settled);
   let stopped = false;
   // The size frames are drawn at changes only inside ganbate_rt_render (a resize), so it is
   // read once after each render() call, not on every project or pick.
@@ -2445,6 +2565,8 @@ export async function createEngine(options) {
 
   const engine = {
     api: gpu.api,
+    /** How frames reach the canvas: 'settled' (finished first, `createFrameGate`) or 'direct'. */
+    present: settled ? 'settled' : 'direct',
     adapter: gpu.adapterName,
     errors: () => [...errors, ...host.errors.filter((e) => !errors.includes(e))],
     /**
@@ -2455,8 +2577,10 @@ export async function createEngine(options) {
     fitCanvas(dpr = window.devicePixelRatio || 1) {
       const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
       const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
-      if (canvas.width !== w) canvas.width = w;
-      if (canvas.height !== h) canvas.height = h;
+      if (canvas.width === w && canvas.height === h) return;
+      canvas.width = w;
+      canvas.height = h;
+      gate.reshow();
     },
     /** The size the last frame was drawn at, in device pixels. */
     size,
@@ -2591,18 +2715,15 @@ export async function createEngine(options) {
     /** Draws and presents a frame. Returns false when it skipped (GPU busy, nothing to draw). */
     render() {
       if (stopped) return false;
-      if (host.timing.busy()) return false;
-      if (gpu.device && inFlight >= 2) return false;
+      gate.show();
+      if (host.timing.busy() || gate.full()) return false;
       host.nextFrame();
       drawn = null;
       const r = x.ganbate_rt_render();
       if (!r) throw fail('render');
       if (r !== 1) return false;
       host.endFrame();
-      if (gpu.device) {
-        inFlight++;
-        gpu.device.queue.onSubmittedWorkDone().then(() => { inFlight--; }, () => { inFlight--; });
-      }
+      gate.submitted();
       return true;
     },
     frames: () => x.ganbate_rt_frames(),
@@ -3007,7 +3128,9 @@ export async function createEngine(options) {
     destroy() {
       if (stopped) return;
       stopped = true;
+      gate.stop();
       x.ganbate_rt_stop();
+      if (settled) host.release();
       observer?.disconnect();
       drawn = null;
       if (scratch) x.ganbate_free(scratch, scratchCap);

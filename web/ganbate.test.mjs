@@ -820,3 +820,124 @@ test('both hosts provide every import of the compiled ganbate_web.wasm, which ha
     for (const name of needed) assert.equal(typeof host.imports.ganbate[name], 'function', `host lacks ${name}`);
   }
 });
+
+/** createEngine on a mock WebGPU device whose frames draw into the canvas, with GPU completion by hand. */
+async function makePresentEngine(present) {
+  const t = { log: [], done: [], rafs: [], canvasTextures: 0 };
+  const anything = () => new Proxy(function () {}, {
+    get: (_, prop) => (prop === 'then' ? undefined : anything()),
+    apply: () => anything(),
+  });
+  const texture = (width, height) => ({ width, height, createView: anything, destroy() {} });
+  const device = new Proxy({
+    lost: new Promise(() => {}),
+    queue: {
+      submit: () => t.log.push(`submit (${t.done.length} unfinished)`),
+      writeBuffer() {},
+      onSubmittedWorkDone: () => new Promise((resolve) => t.done.push(resolve)),
+    },
+    createTexture: ({ size }) => texture(size[0], size[1]),
+  }, { get: (target, prop) => (prop === 'then' ? undefined : prop in target ? target[prop] : anything()) });
+  const canvas = {
+    width: 16,
+    height: 16,
+    clientWidth: 16,
+    clientHeight: 16,
+    getContext: () => ({
+      configure() {},
+      getCurrentTexture: () => {
+        t.canvasTextures++;
+        t.log.push(`canvas texture (${t.done.length} unfinished)`);
+        return texture(canvas.width, canvas.height);
+      },
+    }),
+  };
+  const globals = {
+    GPUTextureUsage: { RENDER_ATTACHMENT: 0x10, COPY_SRC: 0x01, TEXTURE_BINDING: 0x04 },
+    GPUShaderStage: { VERTEX: 1, FRAGMENT: 2, COMPUTE: 4 },
+    GPUBufferUsage: { UNIFORM: 0x40, COPY_DST: 0x08 },
+    requestAnimationFrame: (cb) => t.rafs.push(cb),
+    navigator: {
+      gpu: {
+        getPreferredCanvasFormat: () => 'bgra8unorm',
+        requestAdapter: async () => ({
+          features: new Set(),
+          limits: { maxBufferSize: 65536, maxStorageBufferBindingSize: 65536, maxTextureDimension2D: 2048 },
+          info: {},
+          requestDevice: async () => device,
+        }),
+      },
+    },
+  };
+  let imports = null;
+  // A frame: one pass clearing the canvas (BEGIN_RENDER, the surface, clear and store; END_RENDER).
+  const mock = makeMockWasm({
+    ganbate_rt_render() {
+      const at = 4096;
+      new Uint32Array(mock.memory.buffer, at, 12).set([1, 1, 0, 0xFFFFFFFF, 0, 0, 1, 1, 0, 0, 0, 0, 2].slice(0, 12));
+      new Uint32Array(mock.memory.buffer, at + 48, 1)[0] = 2;
+      imports.gpu_submit(at, 13, 0, 0);
+      return 1;
+    },
+  });
+  const instantiate = WebAssembly.instantiate;
+  WebAssembly.instantiate = async (_bytes, given) => {
+    imports = given.ganbate;
+    return { instance: mock.instance };
+  };
+  try {
+    t.engine = await withGlobals(globals, () => createEngine({ canvas, wasm: new Uint8Array(8), api: 'webgpu', present }));
+  } finally {
+    WebAssembly.instantiate = instantiate;
+  }
+  t.canvas = canvas;
+  t.run = (steps) => withGlobals(globals, steps);
+  // Finishes the oldest frame on the GPU, as the queue reports it.
+  t.finish = async () => {
+    t.done.shift()();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  };
+  return t;
+}
+
+test('settled WebGPU shows only finished frames, copied ahead of the next; direct keeps two in flight', async () => {
+  const s = await makePresentEngine('settled');
+  assert.equal(s.engine.present, 'settled');
+  await s.run(async () => {
+    assert.equal(s.engine.render(), true);
+    // Drawn offscreen: the canvas is not touched while the frame is on the GPU, and no second
+    // frame joins it.
+    assert.equal(s.canvasTextures, 0);
+    assert.equal(s.engine.render(), false);
+    await s.finish();
+    // A table at rest still shows it, at the next animation frame.
+    assert.equal(s.rafs.length, 1);
+    assert.equal(s.engine.render(), true);
+    s.rafs.shift()();
+    assert.deepEqual(s.log.slice(-3), [
+      'canvas texture (0 unfinished)',
+      'submit (0 unfinished)',
+      'submit (0 unfinished)',
+    ], 'the finished frame reaches the canvas before the next frame goes to the GPU');
+    assert.equal(s.canvasTextures, 1);
+    await s.finish();
+    s.rafs.shift()();
+    assert.equal(s.canvasTextures, 2);
+    // A resize shows the last frame again in the new size.
+    s.canvas.clientWidth = 20;
+    s.engine.fitCanvas(1);
+    assert.equal(s.canvasTextures, 3);
+  });
+
+  const d = await makePresentEngine('direct');
+  assert.equal(d.engine.present, 'direct');
+  await d.run(async () => {
+    assert.equal(d.engine.render(), true);
+    assert.equal(d.engine.render(), true);
+    assert.equal(d.engine.render(), false);
+    assert.equal(d.canvasTextures, 2, 'direct frames draw straight into the canvas');
+    await d.finish();
+    assert.equal(d.rafs.length, 0);
+    assert.equal(d.engine.render(), true);
+  });
+});
