@@ -68,8 +68,9 @@ impl Fnv {
 /// Footprints of moved props (a shadow map apiece) `fs_reshade_mask` tests at most; more boxes
 /// are joined into one.
 const MAX_RESHADE_ENTRIES: usize = 32;
-/// Bytes of the re-shade block (`Reshade` in scene.wgsl): a count, then two vec4s an entry.
-const RESHADE_BYTES: u64 = 16 + MAX_RESHADE_ENTRIES as u64 * 32;
+/// Bytes of the re-shade block (`Reshade` in scene.wgsl): a count, the key light's near cascade's
+/// margins, then two vec4s an entry.
+const RESHADE_BYTES: u64 = 32 + MAX_RESHADE_ENTRIES as u64 * 32;
 /// Boxes of props moved since the water's lamp light and shadow were kept that the water follows
 /// (`fs_water` computes them within their shadows' footprints), at most: a footprint in each of
 /// the four maps fits the re-shade block. More have them drawn whole again.
@@ -112,11 +113,14 @@ fn reached(footprints: &[Footprint], maps: &[([f32; 4], f32); 4]) -> bool {
 }
 
 /// The `Reshade` block (scene.wgsl) for `footprints`: their count and the light buffer index + 1
-/// of a game's light casting into each shadow layer (`shadowed`, 0: none), then per footprint
-/// its rect, nearest depth, map and that map's `margins` (clip x and y, depth: how far a lookup
-/// can lie from the point it shades, [`Renderer::lookup_margins`]).
+/// of a game's light casting into each shadow layer (`shadowed`, 0: none), the key light's near
+/// cascade's `margins`, then per footprint its rect, nearest depth, map and that map's `margins`
+/// (clip x and y, depth: how far a lookup can lie from the point it shades,
+/// [`Renderer::lookup_margins`]).
 fn reshade_block(footprints: &[Footprint], shadowed: [u32; 2], margins: [[f32; 2]; 4]) -> Vec<u32> {
     let mut block = vec![footprints.len() as u32, shadowed[0], shadowed[1], 0];
+    let [xy, depth] = margins[0];
+    block.extend([xy, depth, 0.0, 0.0].map(f32::to_bits));
     for (v, r, near) in footprints {
         block.extend(r.map(f32::to_bits));
         let [xy, depth] = margins[*v];
@@ -5953,6 +5957,167 @@ mod tests {
         }
     }
 
+    /// Two casters far down a wide floor moved by a hair every frame and then visibly: one whose
+    /// shadow lies across where the key light's near cascade blends into the far one (0.85 to 1
+    /// times the split from the eye), one whose shadow lies past the split, in the far cascade
+    /// alone. On lavapipe every cached frame is byte-identical to the frame drawn whole, the mask
+    /// passing over the far cascade's footprints where a pixel's shadow reads only the near one.
+    #[test]
+    fn shadows_across_the_cascade_split_reshade_exactly() {
+        let Ok(mut device) = Device::headless() else {
+            return;
+        };
+        let mut world = World::default();
+        world.materials.push(Material {
+            name: "floor".into(),
+            base_color: [0.6, 0.58, 0.55, 1.0],
+            roughness: 0.8,
+            ..Material::default()
+        });
+        world.meshes.push(make_quad_mesh(0.0, 40.0));
+        world.instances.push(Instance {
+            mesh: 0,
+            transform: Transform(math::IDENTITY),
+        });
+        let look = Look {
+            painterly: 0.0,
+            ..Look::default()
+        };
+        let (w, h) = (192, 128);
+        let view = View {
+            name: "far".into(),
+            eye: [0.0, 6.0, 0.0],
+            target: [0.0, 0.0, -10.0],
+            fov: 50.0,
+            ..View::default()
+        };
+        let env = Environment::resolve(
+            &TimeOfDay {
+                hours: 15.0,
+                ..TimeOfDay::default()
+            },
+            &Weather::default(),
+            &look.palette,
+            1.0,
+        );
+        let (sp, sn, suv, sidx) = sphere_prop_data();
+        let place = |at: V3, size: f32| {
+            let mut m = math::IDENTITY;
+            (m[0], m[5], m[10]) = (size, size, size);
+            m[12..15].copy_from_slice(&at);
+            m
+        };
+        // Where on the floor (y 0) the key light casts a point's shadow, and how far from the eye.
+        let l = normalize(env.key_dir);
+        let shadow_at = |p: V3| sub(p, scale(l, p[1] / l[1]));
+        let from_eye = |p: V3| math::length(sub(shadow_at(p), view.eye));
+        // The casters (radius 1.1 m, 0.15 m over the floor) along -z, their shadows' centres at
+        // 0.925 and 1.35 times the split.
+        let (size, y) = (1.3, 1.25);
+        let make = |device: &mut Device<'_>| {
+            let mut r = Renderer::new(
+                device,
+                &world,
+                look.clone(),
+                Quality::realtime(),
+                (w, h),
+                Output::Surface(Format::Rgba8Unorm),
+            )
+            .expect("renderer");
+            r.finish_ao(device).expect("ao");
+            let sphere = r
+                .create_prop_mesh(
+                    device,
+                    &MeshData {
+                        positions: &sp,
+                        normals: &sn,
+                        uvs: &suv,
+                        indices: &sidx,
+                    },
+                )
+                .expect("mesh");
+            let desc = MaterialDesc {
+                name: "ball".into(),
+                base_color: [0.8, 0.6, 0.5, 1.0],
+                ..MaterialDesc::default()
+            };
+            let skin = r.create_prop_material(device, &desc).expect("material");
+            let balls = [0, 1].map(|_| {
+                r.create_prop_instance(sphere, skin, &place([0.0, y, -10.0], size))
+                    .expect("ball")
+            });
+            (r, balls, canvas(device, (w, h)))
+        };
+        let (mut cached, cached_balls, cached_out) = make(&mut device);
+        let (mut whole, whole_balls, whole_out) = make(&mut device);
+        let split = cached.cascades(&view, &env).split;
+        let ats = [0.925, 1.35].map(|share| {
+            let z = (0..400)
+                .map(|k| -5.0 - 0.1 * k as f32)
+                .min_by(|a, b| {
+                    let off = |z: f32| (from_eye([0.0, y, z]) - share * split).abs();
+                    off(*a).total_cmp(&off(*b))
+                })
+                .expect("a place");
+            [0.0, y, z]
+        });
+        // The first casts from short of the blend to past the split, the second past the split:
+        // the shadows of their boxes' corners from the eye.
+        let reach = |at: V3| {
+            let r = 0.85 * size;
+            let corners = corners((at.map(|x| x - r), at.map(|x| x + r)));
+            let d = corners.map(from_eye);
+            (
+                d.iter().copied().fold(f32::INFINITY, f32::min),
+                d.iter().copied().fold(0.0, f32::max),
+            )
+        };
+        let (near, far) = reach(ats[0]);
+        assert!(
+            near < 0.85 * split && split < far,
+            "{near}..{far} of {split}"
+        );
+        assert!(reach(ats[1]).0 > split, "{:?} of {split}", reach(ats[1]));
+        let mut frame = |device: &mut Device<'_>, x: f32| {
+            for (r, balls) in [(&mut cached, cached_balls), (&mut whole, whole_balls)] {
+                for (ball, at) in balls.into_iter().zip(ats) {
+                    let at = [at[0] + x, at[1], at[2]];
+                    r.set_prop_instance(ball, &place(at, size), true)
+                        .expect("ball");
+                }
+            }
+            let a = present(device, &mut cached, &view, &env, cached_out);
+            whole.world_cache = None;
+            whole.prop_shadows_for = None;
+            let b = present(device, &mut whole, &view, &env, whole_out);
+            let (off, largest) = off_by_more_than_a_step(&a, &b);
+            assert_eq!(
+                largest,
+                0,
+                "balls at {x} m: {:.3} % of pixels off by more than a step",
+                off * 100.0
+            );
+            (cached.last_frame_stats(), a)
+        };
+        for _ in 0..12 {
+            frame(&mut device, 0.0);
+        }
+        for k in 1..6 {
+            let stats = frame(&mut device, k as f32 * 5e-5).0;
+            assert!(stats.reshaded, "hair {k}");
+        }
+        let before = frame(&mut device, 25e-5).1;
+        let (stats, after) = frame(&mut device, 0.6);
+        assert!(stats.reshaded);
+        assert!(off_by_more_than_a_step(&before, &after).0 > 0.002);
+
+        let errs = device.validation_errors();
+        assert!(errs.is_empty(), "validation errors: {errs:?}");
+        for r in [&mut cached, &mut whole] {
+            r.destroy_props(&mut device);
+        }
+    }
+
     /// A card table seen from a seat, for `reshade_plan`: 17 world draws (the room) and 40
     /// settled props (the table, chairs, chips, cards) under the key light and a spot casting
     /// shadows, and the footprints of the dealer breathing (her box in the three maps) and of ten
@@ -6114,6 +6279,7 @@ mod tests {
             size,
             cas,
             cases,
+            ..
         } = card_table(&mut device);
         let receivers = r.receivers.as_ref().expect("receivers");
         let maps = r.prop_shadow_maps(&cas);
@@ -6209,6 +6375,7 @@ mod tests {
             size,
             cas,
             cases,
+            ..
         } = card_table(&mut device);
         for (name, footprints) in &cases {
             let plan = |footprints| {

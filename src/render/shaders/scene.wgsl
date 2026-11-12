@@ -190,6 +190,8 @@ fn shadow_taps(world: vec3f, n: vec3f, dist: f32, frag: vec2f, count: i32) -> f3
 struct Reshade {
   head: vec4u,              // entries, then the light buffer index + 1 of a game's shadowed
                             // lights (layers 0, 1; 0: none), unused
+  near: vec4f,              // the key light's near cascade's margins (map 0's: clip x and y,
+                            // depth), unused
   entries: array<vec4f, 64>,
 };
 
@@ -221,26 +223,40 @@ fn moved_footprint(map: u32, c: vec4f, loose: bool) -> bool {
   return false;
 }
 
-// Whether the key light's shadow lookups at `world`, moved off its surface along `n` as `shadow`
-// moves them, can see what moved.
-fn key_moved(world: vec3f, n: vec3f) -> bool {
+// Whether the key light's shadow at a point `dist` from the eye takes nothing from its far
+// cascade, its lookup in the near cascade lying within `m` (clip x and y, depth) of `c0`: the
+// point short of where `shadow_taps` starts to blend the near cascade into the far one, and the
+// lookup inside the near cascade's map (`shadow_cascade`), each by a hair more than rounding
+// moves them (`near_cascade_only` in renderer.rs). What moved in the far cascade changes nothing
+// there.
+fn near_cascade_only(c0: vec4f, dist: f32, m: vec2f) -> bool {
+  let e = m + vec2f(1e-4);
+  return dist < frame.cascades.x * 0.85 * (1.0 - 1e-4) && all(abs(c0.xy) < vec2f(0.996 - e.x))
+    && e.y < c0.z && c0.z < 1.0 - e.y;
+}
+
+// Whether the key light's shadow lookups at `world` (`dist` from the eye), moved off its surface
+// along `n` as `shadow` moves them, can see what moved.
+fn key_moved(world: vec3f, n: vec3f, dist: f32) -> bool {
   let grow = 1.0 + 1.5 * (1.0 - abs(dot(n, frame.key_dir.xyz)));
   let c0 = frame.shadow0 * vec4f(world + n * (frame.cascades.y * grow), 1.0);
   let c1 = frame.shadow1 * vec4f(world + n * (frame.cascades.z * grow), 1.0);
-  return moved_footprint(0u, c0, false) || moved_footprint(1u, c1, false);
+  return moved_footprint(0u, c0, false)
+    || (!near_cascade_only(c0, dist, vec2f(0.0)) && moved_footprint(1u, c1, false));
 }
 
 // Whether what moved since the water's lamp light and shadow were kept (`reshade`, bound to its
-// own block in `fs_water`) can have changed them at `world` (`n` as `shadow` takes it): the test
-// `fs_reshade_mask` makes before comparing shadows, but for points behind a game light, whose
-// lookups find none of its shadows (`light_shadow`) short of a few centimetres from the light.
-fn water_shadows_moved(world: vec3f, n: vec3f) -> bool {
+// own block in `fs_water`) can have changed them at `world` (`n` and `dist` as `shadow` takes
+// them): the test `fs_reshade_mask` makes before comparing shadows, but for points behind a game
+// light, whose lookups find none of its shadows (`light_shadow`) short of a few centimetres from
+// the light.
+fn water_shadows_moved(world: vec3f, n: vec3f, dist: f32) -> bool {
   if (reshade.head.x == 0u) {
     return false;
   }
   let l0 = frame.light_shadow0 * vec4f(world, 1.0);
   let l1 = frame.light_shadow1 * vec4f(world, 1.0);
-  return key_moved(world, n) || (l0.w > 0.0 && moved_footprint(2u, l0, false))
+  return key_moved(world, n, dist) || (l0.w > 0.0 && moved_footprint(2u, l0, false))
     || (l1.w > 0.0 && moved_footprint(3u, l1, false));
 }
 
@@ -282,12 +298,15 @@ fn game_light_share(world: vec3f, n: vec3f, l: Light, frag: vec2f) -> f32 {
   let h = frame.inv_view_proj * vec4f(uv * 2.0 - 1.0, d, 1.0);
   let world = h.xyz / h.w;
   // The footprints first, from the point alone: a game light's lookups are tested there, and
-  // the key light's lie off it within the margins its footprints carry. Most pixels are in
-  // none, and read nothing more.
+  // the key light's lie off it within the margins its footprints carry (the far cascade's only
+  // where the key light's shadow can read it). Most pixels are in none, and read nothing more.
   let p = vec4f(world, 1.0);
+  let dist = length(frame.camera.xyz - world);
+  let c0 = frame.shadow0 * p;
   let lit0 = reshade.head.y > 0u && moved_footprint(2u, frame.light_shadow0 * p, false);
   let lit1 = reshade.head.z > 0u && moved_footprint(3u, frame.light_shadow1 * p, false);
-  let key = moved_footprint(0u, frame.shadow0 * p, true) || moved_footprint(1u, frame.shadow1 * p, true);
+  let key = moved_footprint(0u, c0, true)
+    || (!near_cascade_only(c0, dist, reshade.near.xy) && moved_footprint(1u, frame.shadow1 * p, true));
   if (!(lit0 || lit1 || key)) {
     return o;
   }
@@ -305,8 +324,8 @@ fn game_light_share(world: vec3f, n: vec3f, l: Light, frag: vec2f) -> f32 {
       }
     }
   }
-  if (key && was.w > 0.5 && key_moved(world, n)
-      && abs(shadow(world, n, length(frame.camera.xyz - world), frag.xy) - was.x) > changed) {
+  if (key && was.w > 0.5 && key_moved(world, n, dist)
+      && abs(shadow(world, n, dist, frag.xy) - was.x) > changed) {
     o.depth = 0.0;
   }
   return o;
@@ -855,7 +874,7 @@ fn shade_scene(in: VsOut, front: bool, frag: vec4f, cut: bool) -> FsOut {
   var sh: f32;
   var lamps: vec3f;
   if (WATER_STATICS) {
-    if (water_shadows_moved(in.world, geo_n)) {
+    if (water_shadows_moved(in.world, geo_n, dist)) {
       sh = shadow(in.world, geo_n, dist, frag.xy);
       lamps = lamp_light(in.world, n, frag.xy, foliage);
     } else {
