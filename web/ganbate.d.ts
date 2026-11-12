@@ -390,8 +390,12 @@ export interface GanbateEngine {
   readonly present: 'direct' | 'settled';
   readonly adapter: string;
   errors(): string[];
-  /** Sizes the canvas to its CSS box times `dpr` (default: the device pixel ratio). */
-  fitCanvas(dpr?: number): void;
+  /**
+   * Sizes the canvas to its CSS box times `dpr` (default: the device pixel ratio). `box`: the CSS
+   * box the page observed (a page drawing every frame), read instead of the canvas's, which
+   * forces a layout whenever the page changed since the last.
+   */
+  fitCanvas(dpr?: number, box?: { readonly width: number; readonly height: number } | null): void;
   /** The size the last frame was drawn at, in device pixels. */
   size(): { width: number; height: number };
   setLook(look: object | string): void;

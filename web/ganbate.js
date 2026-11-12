@@ -2637,11 +2637,13 @@ export async function createEngine(options) {
     /**
      * Sizes the canvas to its CSS box times `dpr` (default: the device pixel ratio). It reads the
      * box itself, once a frame at most: a page may call it from its own resize handler, which can
-     * run before the engine's observer has seen the new size.
+     * run before the engine's observer has seen the new size. A page calling it every frame passes
+     * the box it observed (`box`, CSS pixels) instead: reading it there forces a layout whenever
+     * the page changed since the last.
      */
-    fitCanvas(dpr = window.devicePixelRatio || 1) {
-      const w = Math.max(1, Math.round(canvas.clientWidth * dpr));
-      const h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+    fitCanvas(dpr = window.devicePixelRatio || 1, box = null) {
+      const w = Math.max(1, Math.round((box ? box.width : canvas.clientWidth) * dpr));
+      const h = Math.max(1, Math.round((box ? box.height : canvas.clientHeight) * dpr));
       if (canvas.width === w && canvas.height === h) return;
       canvas.width = w;
       canvas.height = h;
