@@ -5177,4 +5177,180 @@ mod tests {
         assert!(errs.is_empty(), "validation errors: {errs:?}");
         r.destroy_props(&mut device);
     }
+
+    /// The presented picture drawn through the caches frame after frame (the cached picture, the
+    /// kept props' shadow maps) against the same scene drawn whole: a second renderer whose
+    /// cached picture and props' shadow maps are thrown away before each of its frames. They
+    /// agree within one 8-bit step on 99.9 % of pixels while a prop that casts no shadow moves,
+    /// while a caster rests, is re-posed by a hair every frame (as a breathing character) and
+    /// moves a long way.
+    #[test]
+    fn cached_frames_match_frames_drawn_whole() {
+        use crate::render::lights::{LightDesc, SpotCone};
+        let Ok(mut device) = Device::headless() else {
+            return;
+        };
+        let mut world = World::default();
+        world.materials.push(Material {
+            name: "floor".into(),
+            base_color: [0.6, 0.58, 0.55, 1.0],
+            roughness: 0.8,
+            alpha: AlphaMode::Opaque,
+            shading: Shading::Standard,
+            ..Material::default()
+        });
+        world.meshes.push(make_quad_mesh(0.0, 4.0));
+        world.instances.push(Instance {
+            mesh: 0,
+            transform: Transform(math::IDENTITY),
+        });
+        // The fused tone-map output, as the table draws.
+        let look = Look {
+            painterly: 0.0,
+            ..Look::default()
+        };
+        let (w, h) = (128, 96);
+        let view = View {
+            name: "table".into(),
+            eye: [0.0, 1.9, 2.4],
+            target: [0.0, 0.7, 0.0],
+            fov: 45.0,
+            ..View::default()
+        };
+        let env = Environment::resolve(
+            &TimeOfDay {
+                hours: 15.0,
+                ..TimeOfDay::default()
+            },
+            &Weather::default(),
+            &look.palette,
+            1.0,
+        );
+        let (sp, sn, suv, sidx) = sphere_prop_data();
+        let place = |x: f32, z: f32, size: f32| {
+            let mut m = math::IDENTITY;
+            for k in [0, 5, 10] {
+                m[k] = size;
+            }
+            m[12..15].copy_from_slice(&[x, 1.15, z]);
+            m
+        };
+        // A table slab that settles into the cached picture, a figure over it casting shadows,
+        // a pawn that casts none, and a spot light casting shadows.
+        let make = |device: &mut Device<'_>| {
+            let mut r = Renderer::new(
+                device,
+                &world,
+                look.clone(),
+                Quality::realtime(),
+                (w, h),
+                Output::Surface(Format::Rgba8Unorm),
+            )
+            .expect("renderer");
+            r.finish_ao(device).expect("ao");
+            let sphere = r
+                .create_prop_mesh(
+                    device,
+                    &MeshData {
+                        positions: &sp,
+                        normals: &sn,
+                        uvs: &suv,
+                        indices: &sidx,
+                    },
+                )
+                .expect("mesh");
+            let mut material = |name: &str, base_color, casts_shadow| {
+                let desc = MaterialDesc {
+                    name: name.into(),
+                    base_color,
+                    casts_shadow,
+                    ..MaterialDesc::default()
+                };
+                r.create_prop_material(device, &desc).expect("material")
+            };
+            let wood = material("table", [0.5, 0.3, 0.2, 1.0], true);
+            let skin = material("figure", [0.8, 0.6, 0.5, 1.0], true);
+            let glass = material("pawn", [0.3, 0.5, 0.8, 1.0], false);
+            let mut top = math::IDENTITY;
+            top[0] = 1.2;
+            top[5] = 0.06;
+            top[10] = 0.8;
+            top[13] = 0.75;
+            r.create_prop_instance(sphere, wood, &top).expect("table");
+            let figure = r
+                .create_prop_instance(sphere, skin, &place(0.0, 0.1, 0.25))
+                .expect("figure");
+            let pawn = r
+                .create_prop_instance(sphere, glass, &place(-0.45, 0.2, 0.1))
+                .expect("pawn");
+            r.create_light(&LightDesc {
+                position: [0.3, 3.0, 0.4],
+                range: 8.0,
+                color: [1.0, 0.9, 0.8],
+                intensity: 6.0,
+                spot: Some(SpotCone {
+                    direction: [-0.1, -1.0, -0.1],
+                    inner: 0.35,
+                    outer: 0.6,
+                }),
+                follows_lamps: false,
+                shadow: 1.0,
+            })
+            .expect("spot");
+            (r, [figure, pawn], canvas(device, (w, h)))
+        };
+        let (mut cached, cached_props, cached_out) = make(&mut device);
+        let (mut whole, whole_props, whole_out) = make(&mut device);
+
+        // Draws a frame of both with the figure `figure` metres along and the pawn `pawn`
+        // metres along, compares them, and returns what the cached frame kept and drew.
+        let mut frame = |device: &mut Device<'_>, figure: f32, pawn: f32| {
+            for (r, [f, p]) in [(&mut cached, cached_props), (&mut whole, whole_props)] {
+                r.set_prop_instance(f, &place(figure, 0.1, 0.25), true)
+                    .expect("figure");
+                r.set_prop_instance(p, &place(pawn - 0.45, 0.2, 0.1), true)
+                    .expect("pawn");
+            }
+            let a = present(device, &mut cached, &view, &env, cached_out);
+            whole.world_cache = None;
+            whole.prop_shadows_for = None;
+            let b = present(device, &mut whole, &view, &env, whole_out);
+            let (off, largest) = off_by_more_than_a_step(&a, &b);
+            assert!(
+                off <= 0.001,
+                "figure at {figure} m, pawn at {pawn} m: {:.3} % of pixels off by more than a \
+                 step (up to {largest})",
+                off * 100.0
+            );
+            (cached.last_frame_stats(), a)
+        };
+
+        frame(&mut device, 0.0, 0.0);
+        // The pawn moves every frame and the table settles: the maps are kept.
+        for k in 1..12 {
+            let stats = frame(&mut device, 0.0, k as f32 * 1e-3).0;
+            assert!(stats.prop_shadows_kept && !stats.reshaded, "frame {k}");
+        }
+        // The figure re-posed by a hair (a twentieth of a millimetre) every frame: drawn again.
+        for k in 1..6 {
+            let stats = frame(&mut device, k as f32 * 5e-5, 0.0).0;
+            assert!(!stats.prop_shadows_kept, "hair {k}");
+        }
+        // Resting where the maps were last drawn, it settles into the cached picture under them.
+        for k in 0..12 {
+            let stats = frame(&mut device, 25e-5, 0.0).0;
+            assert!(stats.prop_shadows_kept && !stats.reshaded, "rest {k}");
+        }
+        // Moved a long way, its shadow moves over the cached picture, shaded again.
+        let before = frame(&mut device, 25e-5, 0.0).1;
+        let (stats, after) = frame(&mut device, 0.3, 0.0);
+        assert!(!stats.prop_shadows_kept && stats.reshaded);
+        assert!(off_by_more_than_a_step(&before, &after).0 > 0.01);
+
+        let errs = device.validation_errors();
+        assert!(errs.is_empty(), "validation errors: {errs:?}");
+        for r in [&mut cached, &mut whole] {
+            r.destroy_props(&mut device);
+        }
+    }
 }
