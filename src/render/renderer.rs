@@ -5331,6 +5331,25 @@ mod tests {
         (target, readback)
     }
 
+    /// Asserts a frame drawn through the caches is the same frame drawn whole (`what` says
+    /// which): byte for byte on lavapipe (llvmpipe), where that holds; on another driver, whose
+    /// compilers may round the cache's shaders apart from the whole frame's (unchecked), within
+    /// one 8-bit step on 99.9 % of pixels.
+    fn assert_same_frame(device: &Device<'_>, cached: &[u8], whole: &[u8], what: &str) {
+        let (off, largest) = off_by_more_than_a_step(cached, whole);
+        if device.name().starts_with("llvmpipe") {
+            let pixels = cached.chunks_exact(4).zip(whole.chunks_exact(4));
+            let differ = pixels.filter(|(p, q)| p != q).count();
+            assert_eq!(largest, 0, "{what}: {differ} pixels differ");
+        } else {
+            assert!(
+                off <= 0.001,
+                "{what}: {:.3} % of pixels off by more than a step (up to {largest})",
+                off * 100.0
+            );
+        }
+    }
+
     /// Of two pictures, the share of pixels where a channel differs by more than one 8-bit step,
     /// and the largest difference.
     fn off_by_more_than_a_step(a: &[u8], b: &[u8]) -> (f64, u8) {
@@ -5476,9 +5495,9 @@ mod tests {
     /// The presented picture drawn through the caches frame after frame (the cached picture, the
     /// kept props' shadow maps) against the same scene drawn whole: a second renderer whose
     /// cached picture and props' shadow maps are thrown away before each of its frames. They
-    /// agree within one 8-bit step on 99.9 % of pixels while a prop that casts no shadow moves,
-    /// while a caster rests, is re-posed by a hair every frame (as a breathing character) and
-    /// moves a long way.
+    /// are byte-identical on lavapipe (`assert_same_frame`) while a prop that casts no shadow
+    /// moves, while a caster rests, is re-posed by a hair every frame (as a breathing character)
+    /// and moves a long way.
     #[test]
     fn cached_frames_match_frames_drawn_whole() {
         use crate::render::lights::{LightDesc, SpotCone};
@@ -5610,13 +5629,8 @@ mod tests {
             whole.world_cache = None;
             whole.prop_shadows_for = None;
             let b = present(device, &mut whole, &view, &env, whole_out);
-            let (off, largest) = off_by_more_than_a_step(&a, &b);
-            assert!(
-                off <= 0.001,
-                "figure at {figure} m, pawn at {pawn} m: {:.3} % of pixels off by more than a \
-                 step (up to {largest})",
-                off * 100.0
-            );
+            let what = format!("figure at {figure} m, pawn at {pawn} m");
+            assert_same_frame(device, &a, &b, &what);
             (cached.last_frame_stats(), a)
         };
 
@@ -5815,8 +5829,9 @@ mod tests {
 
     /// A caster re-posed by a hair every frame (a breathing dealer), then moved a little, low
     /// over a floor filling the picture, by a slab settled into the picture under its shadow and
-    /// another far off, under a spot light: the cached frames match those drawn whole, and the
-    /// region re-shaded is around its shadows, under half the floor's picture (all of it).
+    /// another far off, under a spot light: the cached frames are those drawn whole, byte for
+    /// byte on lavapipe (`assert_same_frame`), and the region re-shaded is around its shadows,
+    /// under half the floor's picture (all of it).
     #[test]
     fn a_caster_over_a_wide_floor_reshades_around_its_shadow() {
         let Ok(mut device) = Device::headless() else {
@@ -5928,12 +5943,7 @@ mod tests {
             whole.world_cache = None;
             whole.prop_shadows_for = None;
             let b = present(device, &mut whole, &view, &env, whole_out);
-            let (off, largest) = off_by_more_than_a_step(&a, &b);
-            assert!(
-                off <= 0.001,
-                "ball at {x} m: {:.3} % of pixels off by more than a step (up to {largest})",
-                off * 100.0
-            );
+            assert_same_frame(device, &a, &b, &format!("ball at {x} m"));
             (cached.last_frame_stats(), a)
         };
         // At rest, the slabs settle into the picture.
@@ -5960,8 +5970,9 @@ mod tests {
     /// Two casters far down a wide floor moved by a hair every frame and then visibly: one whose
     /// shadow lies across where the key light's near cascade blends into the far one (0.85 to 1
     /// times the split from the eye), one whose shadow lies past the split, in the far cascade
-    /// alone. On lavapipe every cached frame is byte-identical to the frame drawn whole, the mask
-    /// passing over the far cascade's footprints where a pixel's shadow reads only the near one.
+    /// alone. Every cached frame is the frame drawn whole, byte for byte on lavapipe
+    /// (`assert_same_frame`), the mask passing over the far cascade's footprints where a pixel's
+    /// shadow reads only the near one.
     #[test]
     fn shadows_across_the_cascade_split_reshade_exactly() {
         let Ok(mut device) = Device::headless() else {
@@ -6090,13 +6101,7 @@ mod tests {
             whole.world_cache = None;
             whole.prop_shadows_for = None;
             let b = present(device, &mut whole, &view, &env, whole_out);
-            let (off, largest) = off_by_more_than_a_step(&a, &b);
-            assert_eq!(
-                largest,
-                0,
-                "balls at {x} m: {:.3} % of pixels off by more than a step",
-                off * 100.0
-            );
+            assert_same_frame(device, &a, &b, &format!("balls at {x} m"));
             (cached.last_frame_stats(), a)
         };
         for _ in 0..12 {
@@ -6128,6 +6133,8 @@ mod tests {
         eye: Eye,
         size: (u32, u32),
         cas: Cascades,
+        /// Toward the key light, as the frame block holds it.
+        key: V3,
         cases: [(&'static str, Vec<Footprint>); 2],
     }
 
@@ -6257,6 +6264,7 @@ mod tests {
             eye,
             size,
             cas,
+            key: normalize(env.key_dir),
             cases,
         }
     }
@@ -6357,6 +6365,177 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The planes bounding the convex hull of `points`: through three of them, with all of them
+    /// on the inner side (`h · [p, 1] >= 0`), normals of unit length.
+    fn hull_planes(points: &[V3]) -> Vec<[f32; 4]> {
+        let n = points.len();
+        let triples =
+            (0..n).flat_map(|i| (i + 1..n).flat_map(move |j| (j + 1..n).map(move |k| [i, j, k])));
+        triples
+            .filter_map(|[i, j, k]| {
+                let (a, b, c) = (points[i], points[j], points[k]);
+                let normal = cross(sub(b, a), sub(c, a));
+                let length = math::length(normal);
+                if length < 1e-9 {
+                    return None;
+                }
+                let normal = scale(normal, 1.0 / length);
+                let h = [normal[0], normal[1], normal[2], -math::dot(normal, a)];
+                let side = |p: &V3| math::dot(normal, *p) + h[3];
+                let (lo, hi) = points
+                    .iter()
+                    .map(side)
+                    .fold((0.0f32, 0.0f32), |(lo, hi), d| (lo.min(d), hi.max(d)));
+                let flat = 1e-6;
+                match (lo >= -flat, hi <= flat) {
+                    (true, _) => Some(h),
+                    (_, true) => Some(h.map(|x| -x)),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// At the card table, with the key light's cascades as a frame makes them: wherever a point
+    /// on a receiver looks up the dealer's footprint in a cascade (its lookup moved off the
+    /// surface along a normal up to 1.001 long, as `shadow_cascade` moves it), the point itself
+    /// passes `fs_reshade_mask`'s first test (the footprint grown by `lookup_margins`) and lies
+    /// in the convex hull of the points `shadow_volume` gives. And where a point passes as
+    /// reading only the near cascade with those margins (`near_cascade_only` in scene.wgsl), so
+    /// does each of its lookups, as `shadow_taps` reads it: short of the blend, inside the near
+    /// cascade's map, at the receivers and by the map's borders.
+    #[test]
+    fn every_key_lookup_in_a_footprint_is_in_its_shadow_volume() {
+        let Ok(mut device) = Device::headless() else {
+            return;
+        };
+        let CardTable {
+            r,
+            settled,
+            eye,
+            cas,
+            key,
+            cases,
+            ..
+        } = card_table(&mut device);
+        let maps = r.prop_shadow_maps(&cas);
+        let margins = Renderer::lookup_margins(&maps);
+        let mut seed = 0x9e37_79b9_u32;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f32 / u32::MAX as f32
+        };
+        // A normal as the picture's aux gives it back (up to 1.001 long, as often a full one).
+        let normal = |i: usize, rand: &mut dyn FnMut() -> f32| {
+            let dir = normalize([rand() - 0.5, rand() - 0.5, rand() - 0.5]);
+            scale(dir, if i % 4 < 2 { 1.001 } else { 1.001 * rand() })
+        };
+        // Where `shadow_cascade` looks up cascade `v` for a point `p` with normal `n`.
+        let lookup = |v: usize, p: V3, n: V3| {
+            let grow = 1.0 + 1.5 * (1.0 - math::dot(n, key).abs());
+            add(p, scale(n, cas.offset[v] * grow))
+        };
+        let clip = |v: usize, p: V3| {
+            let c = transform(&maps[v].0, [p[0], p[1], p[2], 1.0]);
+            [c[0] / c[3], c[1] / c[3], c[2] / c[3]]
+        };
+        // `near_cascade_only` in scene.wgsl: a point `dist` from the eye, its lookup in the near
+        // cascade within `m` of clip coordinates `c` there.
+        let near_only = |c: V3, dist: f32, m: [f32; 2]| {
+            let e = [m[0] + 1e-4, m[1] + 1e-4];
+            dist < cas.split * 0.85 * (1.0 - 1e-4)
+                && c[0].abs() < 0.996 - e[0]
+                && c[1].abs() < 0.996 - e[0]
+                && e[1] < c[2]
+                && c[2] < 1.0 - e[1]
+        };
+        let receivers = [
+            ("floor", r.scene.draws[0].bounds),
+            ("rug", r.scene.draws[13].bounds),
+            ("stand", r.scene.draws[14].bounds),
+            ("table", settled[0]),
+        ];
+        let dealer = &cases[0].1;
+        let (mut found, mut near_skips) = ([0; 2], 0);
+        for v in 0..2 {
+            let f = dealer.iter().find(|f| f.0 == v).expect("a footprint");
+            let (_, rect, near) = *f;
+            for (name, b) in receivers {
+                let mut points = vec![];
+                shadow_volume(b, f, &maps, &mut points);
+                let hull = hull_planes(&points);
+                // Half the points anywhere on the receiver, half under the dealer.
+                let under = (b.0.map(|x| x.max(-1.5)), b.1.map(|x| x.min(1.5)));
+                for i in 0..40_000 {
+                    let (lo, hi) = if i % 2 == 0 { b } else { under };
+                    let p: V3 = std::array::from_fn(|k| math::lerp(lo[k], hi[k], rand()));
+                    let n = normal(i, &mut rand);
+                    let q = clip(v, lookup(v, p, n));
+                    let inside = rect[0] <= q[0] && q[0] <= rect[2] && rect[1] <= q[1];
+                    if !(inside && q[1] <= rect[3] && q[2] >= near) {
+                        continue;
+                    }
+                    found[v] += 1;
+                    let [xy, depth] = margins[v];
+                    let at = clip(v, p);
+                    assert!(
+                        rect[0] - xy <= at[0]
+                            && at[0] <= rect[2] + xy
+                            && rect[1] - xy <= at[1]
+                            && at[1] <= rect[3] + xy
+                            && at[2] >= near - depth,
+                        "map {v}, {name}: {p:?} (normal {n:?}) fails the early test"
+                    );
+                    let side = |h: &[f32; 4]| h[0] * p[0] + h[1] * p[1] + h[2] * p[2] + h[3];
+                    let outside = hull.iter().map(side).fold(0.0f32, f32::min);
+                    assert!(
+                        outside >= 0.0,
+                        "map {v}, {name}: {p:?} (normal {n:?}) {outside} m out of its volume"
+                    );
+                    let dist = math::length(sub(p, eye.pos));
+                    if v == 1 && near_only(clip(0, p), dist, margins[0]) {
+                        near_skips += 1;
+                        assert!(
+                            near_only(clip(0, lookup(0, p, n)), dist, [0.0; 2]),
+                            "{name}: {p:?} (normal {n:?}) reads the far cascade"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(found[0] > 5000 && found[1] > 5000, "{found:?}");
+        assert!(near_skips > 1000, "{near_skips} near the eye");
+        // By the near cascade's borders: points whose clip coordinates there lie within a few
+        // margins of one (inside and out).
+        let inv = invert(&maps[0].0).expect("a cascade");
+        let [xy, depth] = margins[0];
+        let mut held = 0;
+        for i in 0..100_000 {
+            let mut c: V3 = [2.0 * rand() - 1.0, 2.0 * rand() - 1.0, rand()];
+            let off = (2.0 * rand() - 0.5) * 3.0;
+            let high = rand() < 0.5;
+            c[i % 3] = match (i % 3, high) {
+                (2, true) => 1.0 - off * depth,
+                (2, false) => off * depth,
+                (_, true) => 0.996 - off * xy,
+                (_, false) => off * xy - 0.996,
+            };
+            let w = transform(&inv, [c[0], c[1], c[2], 1.0]);
+            let p = [w[0] / w[3], w[1] / w[3], w[2] / w[3]];
+            if near_only(clip(0, p), 0.0, margins[0]) {
+                held += 1;
+                let n = normal(i, &mut rand);
+                assert!(
+                    near_only(clip(0, lookup(0, p, n)), 0.0, [0.0; 2]),
+                    "{p:?} (normal {n:?}) looks up past the near cascade's border"
+                );
+            }
+        }
+        assert!(held > 10_000, "{held} by the borders");
     }
 
     /// What `reshade_plan` costs the CPU a frame at the card table, while the dealer breathes
