@@ -105,14 +105,187 @@ fn reached(footprints: &[Footprint], maps: &[([f32; 4], f32); 4]) -> bool {
 
 /// The `Reshade` block (scene.wgsl) for `footprints`: their count and the light buffer index + 1
 /// of a game's light casting into each shadow layer (`shadowed`, 0: none), then per footprint
-/// its rect, nearest depth and map.
-fn reshade_block(footprints: &[Footprint], shadowed: [u32; 2]) -> Vec<u32> {
+/// its rect, nearest depth, map and that map's `margins` (clip x and y, depth: how far a lookup
+/// can lie from the point it shades, [`Renderer::lookup_margins`]).
+fn reshade_block(footprints: &[Footprint], shadowed: [u32; 2], margins: [[f32; 2]; 4]) -> Vec<u32> {
     let mut block = vec![footprints.len() as u32, shadowed[0], shadowed[1], 0];
     for (v, r, near) in footprints {
         block.extend(r.map(f32::to_bits));
-        block.extend([near.to_bits(), (*v as f32).to_bits(), 0, 0]);
+        let [xy, depth] = margins[*v];
+        block.extend([*near, *v as f32, xy, depth].map(f32::to_bits));
     }
     block
+}
+
+/// How much farther than its cascade's offset, at the most a grazing light moves it (2.5 times),
+/// a key light's lookup may lie from the point it shades ([`Renderer::prop_shadow_maps`]): the
+/// normal it is moved along is read back from a half-float target, a hair longer than a unit.
+const LOOKUP_SLACK: f32 = 1.01;
+
+/// A convex volume: its six bounding planes (`h · [p, 1] >= 0` inside) and its corners, corner
+/// `c` on planes `c & 1`, `2 + (c >> 1 & 1)` and `4 + (c >> 2)` (low or high x, y and z), as
+/// [`corners`] numbers a box's.
+struct Hull {
+    planes: [[f32; 4]; 6],
+    corners: [V3; 8],
+}
+
+fn box_hull((lo, hi): (V3, V3)) -> Hull {
+    Hull {
+        planes: std::array::from_fn(|i| {
+            let k = i / 2;
+            let mut h = [0.0; 4];
+            (h[k], h[3]) = if i % 2 == 0 {
+                (1.0, -lo[k])
+            } else {
+                (-1.0, hi[k])
+            };
+            h
+        }),
+        corners: corners((lo, hi)),
+    }
+}
+
+/// The world points within `grow` metres of one whose lookup in shadow map `m` falls in the box
+/// `lo..hi` (clip x, y and depth) ahead of the map's eye. None when its corners do not lie ahead
+/// of that eye.
+fn map_hull(m: &M4, lo: V3, hi: V3, grow: f32) -> Option<Hull> {
+    let row = |r: usize| [m[r], m[4 + r], m[8 + r], m[12 + r]];
+    let planes: [[f32; 4]; 6] = std::array::from_fn(|i| {
+        let k = i / 2;
+        let (s, bound) = if i % 2 == 0 {
+            (1.0, lo[k])
+        } else {
+            (-1.0, hi[k])
+        };
+        // x / w >= lo is x - lo w >= 0 ahead of the eye (w > 0); the plane moved out by `grow`
+        // metres holds the points within `grow` of its side.
+        let h: [f32; 4] = std::array::from_fn(|j| s * (row(k)[j] - bound * row(3)[j]));
+        [
+            h[0],
+            h[1],
+            h[2],
+            h[3] + grow * math::length([h[0], h[1], h[2]]),
+        ]
+    });
+    let normal = |h: [f32; 4]| [h[0], h[1], h[2]];
+    let corners: [V3; 8] = std::array::from_fn(|c| {
+        let [a, b, d] = [
+            planes[c & 1],
+            planes[2 + (c >> 1 & 1)],
+            planes[4 + (c >> 2)],
+        ];
+        let (bd, da, ab) = (
+            cross(normal(b), normal(d)),
+            cross(normal(d), normal(a)),
+            cross(normal(a), normal(b)),
+        );
+        let p = add(add(scale(bd, a[3]), scale(da, b[3])), scale(ab, d[3]));
+        scale(p, -1.0 / math::dot(normal(a), bd))
+    });
+    let ahead =
+        |p: &V3| p.iter().all(|x| x.is_finite()) && transform(m, [p[0], p[1], p[2], 1.0])[3] > 0.0;
+    corners
+        .iter()
+        .all(ahead)
+        .then_some(Hull { planes, corners })
+}
+
+/// The ends of the parts of `a`'s edges that lie in `b`, into `out`.
+fn clip_edges(a: &Hull, b: &Hull, out: &mut Vec<V3>) {
+    'edges: for (c, bit) in (0..8).flat_map(|c| [1, 2, 4].map(|bit| (c, bit))) {
+        if c & bit != 0 {
+            continue;
+        }
+        let (p, q) = (a.corners[c], a.corners[c | bit]);
+        let (mut t0, mut t1) = (0.0f32, 1.0f32);
+        for h in &b.planes {
+            let side = |x: V3| h[0] * x[0] + h[1] * x[1] + h[2] * x[2] + h[3];
+            let (dp, dq) = (side(p), side(q));
+            if dp < 0.0 && dq < 0.0 {
+                continue 'edges;
+            }
+            if dp < 0.0 {
+                t0 = t0.max(dp / (dp - dq));
+            } else if dq < 0.0 {
+                t1 = t1.min(dp / (dp - dq));
+            }
+        }
+        if t0 <= t1 {
+            out.extend([math::lerp3(p, q, t0), math::lerp3(p, q, t1)]);
+        }
+    }
+}
+
+/// Points whose convex hull holds every point of a surface in box `b` that can see footprint `f`
+/// as `fs_reshade_mask` tests it (none when no point can): the points of the box whose lookups in
+/// the footprint's map (`maps`; the key light's lie off the surface by up to its receivers'
+/// margin) fall in the footprint behind its nearest depth. They lie in the box and in the
+/// footprint's box in the map, its depth reaching past the box (the footprint swept along the
+/// light) and grown by that margin; every corner of the volume both hold is where an edge of one
+/// crosses into the other. The shadow filter adds nothing here: its taps (within the unit disc,
+/// `TAPS`) and the comparison's bilinear texels sample where the footprint is grown to. The box
+/// and the margin grow by a hundred-thousandth of the coordinates, far more than rounding moves
+/// the planes and the points the picture's depth gives back.
+fn shadow_volume(b: (V3, V3), &(v, r, near): &Footprint, maps: &[(M4, f32, f32); 4]) -> Vec<V3> {
+    let (m, _, grow) = &maps[v];
+    let eps = 1e-5
+        * corners(b)
+            .iter()
+            .flatten()
+            .fold(1.0f32, |a, x| a.max(x.abs()));
+    let b = (b.0.map(|x| x - eps), b.1.map(|x| x + eps));
+    // A moved box across a spot light's eye has a footprint over all of its map.
+    if r.iter().chain([&near]).any(|x| x.abs() > 1e6) {
+        return corners(b).to_vec();
+    }
+    // As deep as the box reaches in the map (ahead of a spot light, where the deepest of its
+    // points is a corner: depth grows with the distance along the light).
+    let far = corners(b)
+        .iter()
+        .map(|p| transform(m, [p[0], p[1], p[2], 1.0]))
+        .filter(|c| c[3] > 1e-6)
+        .map(|c| c[2] / c[3])
+        .fold(f32::NEG_INFINITY, f32::max);
+    if far == f32::NEG_INFINITY {
+        return vec![];
+    }
+    let (lo, hi) = ([r[0], r[1], near], [r[2], r[3], far.max(near)]);
+    let Some(volume) = map_hull(m, lo, hi, grow + eps) else {
+        return corners(b).to_vec();
+    };
+    let receiver = box_hull(b);
+    let mut points = vec![];
+    clip_edges(&receiver, &volume, &mut points);
+    clip_edges(&volume, &receiver, &mut points);
+    points
+}
+
+/// Whether the key light's shadow at every point in the convex hull of `points` takes nothing
+/// from its far cascade (`shadow_taps`): they lie nearer `eye` than where the near cascade starts
+/// to blend into it, and their lookups (off the surface by up to `grow` metres) fall in the near
+/// cascade's map `m`, short of its border by a hair more than rounding moves them.
+fn near_cascade_only(points: &[V3], eye: V3, split: f32, m: &M4, grow: f32) -> bool {
+    let margin = |r: usize| grow * math::length([m[r], m[4 + r], m[8 + r]]) + 1e-4;
+    points.iter().all(|p| {
+        let c = transform(m, [p[0], p[1], p[2], 1.0]);
+        math::length(sub(*p, eye)) < 0.85 * split * (1.0 - 1e-4)
+            && c[0].abs() < 0.996 - margin(0)
+            && c[1].abs() < 0.996 - margin(1)
+            && margin(2) < c[2]
+            && c[2] < 1.0 - margin(2)
+    })
+}
+
+/// The pixels both regions hold.
+fn intersect(a: Rect, b: Rect) -> Option<Rect> {
+    let r = [
+        a[0].max(b[0]),
+        a[1].max(b[1]),
+        a[2].min(b[2]),
+        a[3].min(b[3]),
+    ];
+    (r[0] < r[2] && r[1] < r[3]).then_some(r)
 }
 
 /// Slices of view depth per doubling of it (`CLUSTER_SLICES` from `CLUSTER_NEAR` to `CLUSTER_FAR`).
@@ -426,6 +599,8 @@ pub struct FrameStats {
     pub cache_regions: u32,
     /// Pixels of the cached picture that moved props' shadows can reach were shaded again.
     pub reshaded: bool,
+    /// The pixels of the region they were sought in (`fs_reshade_mask`) and shaded again within.
+    pub reshade_pixels: u32,
     /// The water read its lamp light and shadow as kept with the cached picture (`cache_water`)
     /// rather than computing them, as a still does.
     pub water_kept: bool,
@@ -2450,14 +2625,17 @@ impl Renderer {
     /// The shadow maps props cast into, as `fs_reshade_mask` numbers them (0, 1 the key light's
     /// cascades; 2, 3 a game's lights), with their view-projection and margins around a
     /// footprint (clip units: the filter and a few texels) and around a receiver (metres: the
-    /// key light's receivers sample from a point off their surface).
+    /// key light's receivers sample from a point off their surface, `LOOKUP_SLACK`).
     fn prop_shadow_maps(&self, cas: &Cascades) -> [(M4, f32, f32); 4] {
         let texel = 2.0 / self.quality.shadow_size.max(16) as f32;
-        let offset = 2.5 * cas.offset[0].max(cas.offset[1]);
         let light_texel = 2.0 / self.quality.light_shadow_size.max(16) as f32;
         let lights = self.game_lights.shadow_views();
         std::array::from_fn(|v| match v {
-            0 | 1 => (cas.mats[v], 2.0 * cas.radius[v] + 4.0 * texel, offset),
+            0 | 1 => (
+                cas.mats[v],
+                2.0 * cas.radius[v] + 4.0 * texel,
+                2.5 * LOOKUP_SLACK * cas.offset[v],
+            ),
             _ => (
                 lights.get(v - 2).copied().unwrap_or(math::IDENTITY),
                 6.0 * light_texel,
@@ -2499,10 +2677,22 @@ impl Renderer {
         footprints
     }
 
+    /// How far a lookup in each shadow map props cast into ([`Renderer::prop_shadow_maps`]) can
+    /// lie from the point it shades, in the map's clip units across and in depth: the key light's
+    /// within its receivers' margin, through its cascade's scale; a game light's footprints are
+    /// tested at the point itself.
+    fn lookup_margins(maps: &[(M4, f32, f32); 4]) -> [[f32; 2]; 4] {
+        std::array::from_fn(|v| {
+            let (m, _, grow) = &maps[v];
+            let scale = |r: usize| grow * math::length([m[r], m[4 + r], m[8 + r]]);
+            [scale(0).max(scale(1)), scale(2)]
+        })
+    }
+
     /// What the GPU needs to shade again the cached picture's pixels that moved props' shadows
     /// (`footprints`, which `fs_reshade_mask` tests per pixel) can reach: the world's draws a
-    /// footprint can reach, and the region of the picture holding them and the reachable settled
-    /// props. None when nothing the picture holds is in reach.
+    /// footprint can reach, and the region of the picture holding where they and the settled
+    /// props can see one ([`shadow_volume`]). None when nothing the picture holds is in reach.
     fn reshade_plan(
         &self,
         footprints: &[Footprint],
@@ -2513,18 +2703,38 @@ impl Renderer {
     ) -> Option<ReshadePlan> {
         let receivers = self.receivers.as_ref().filter(|_| !footprints.is_empty())?;
         let maps = self.prop_shadow_maps(cas);
+        // Where the key light's far cascade is not looked up, its footprints change nothing.
+        let (m0, _, grow0) = &maps[0];
+        let unused = |v: usize, points: &[V3]| {
+            v == 1 && near_cascade_only(points, eye.pos, cas.split, m0, *grow0)
+        };
+        // The pixels of a receiver in box `b` (lying within `screen`; `bounds` in the maps) where
+        // it can see a footprint: the projection of the points that can, rounded out by half a
+        // pixel (a pixel is tested at its centre) and half a pixel more for rounding.
+        let reach = |b: (V3, V3), bounds: &[([f32; 4], f32); 4], screen: Rect| {
+            footprints
+                .iter()
+                .filter(|f| reached(std::slice::from_ref(f), bounds))
+                .map(|f| (f.0, shadow_volume(b, f, &maps)))
+                .filter(|(v, points)| !points.is_empty() && !unused(*v, points))
+                .filter_map(|(_, points)| screen_rect(&points, &eye.view_proj, size, 1.0))
+                .filter_map(|r| intersect(r, screen))
+                .reduce(union)
+        };
         let mut region: Option<Rect> = None;
         let mut grow = |r: Rect| region = Some(region.map_or(r, |a| union(a, r)));
-        let draws: Vec<bool> = receivers
-            .maps
+        // Every draw in reach is drawn again, as the region holds where they can see a
+        // footprint: the mask may mark a pixel of one where nothing changed (as where only the
+        // far cascade's footprint holds its lookups), which must find what it held.
+        let draws: Vec<bool> = self
+            .scene
+            .draws
             .iter()
+            .zip(&receivers.maps)
             .zip(&receivers.screen)
-            .map(|(m, screen)| {
-                let hit = reached(footprints, m);
-                if hit {
-                    screen.map(&mut grow);
-                }
-                hit
+            .map(|((d, m), screen)| {
+                screen.and_then(|s| reach(d.bounds, m, s)).map(&mut grow);
+                reached(footprints, m)
             })
             .collect();
         for b in settled {
@@ -2533,8 +2743,8 @@ impl Renderer {
                 let (r, _, far) = map_bounds((b.0.map(|x| x - grow), b.1.map(|x| x + grow)), m);
                 (r, far)
             });
-            if reached(footprints, &bounds) {
-                screen_rect(&corners(*b), &eye.view_proj, size, 2.0).map(&mut grow);
+            if let Some(screen) = screen_rect(&corners(*b), &eye.view_proj, size, 2.0) {
+                reach(*b, &bounds, screen).map(&mut grow);
             }
         }
         let region = region?;
@@ -2547,7 +2757,7 @@ impl Renderer {
             }
         }
         Some(ReshadePlan {
-            block: reshade_block(footprints, shadowed),
+            block: reshade_block(footprints, shadowed, Self::lookup_margins(&maps)),
             draws,
             region,
         })
@@ -3366,10 +3576,11 @@ impl Renderer {
         if water_whole {
             self.water_statics = Some(vec![]);
         }
-        let water_block = self
-            .water_statics
-            .as_ref()
-            .map(|boxes| reshade_block(&self.shadow_footprints(boxes, &cas, key), [0, 0]));
+        // The water tests its footprints at the lookups themselves (`water_shadows_moved`).
+        let water_block = self.water_statics.as_ref().map(|boxes| {
+            let footprints = self.shadow_footprints(boxes, &cas, key);
+            reshade_block(&footprints, [0, 0], [[0.0; 2]; 4])
+        });
         let mut stats = FrameStats::default();
 
         // Shadow cascades: layers 0..2 cache static world depth; layers 2..4 hold dynamic props.
@@ -3532,7 +3743,7 @@ impl Renderer {
             enc.set_pipeline(self.pipelines.scene);
             enc.set_bind_group(0, self.slots[slot_index].scene[1]);
             self.draw_world(enc, &mut push, re, false, WorldPart::All, None);
-            self.draw_props(enc, slot_index, 1, PropSet::All);
+            self.draw_props(enc, slot_index, 1, PropSet::All, None);
             enc.set_pipeline(self.pipelines.sky);
             enc.set_bind_group(0, self.slots[slot_index].sky[1]);
             enc.draw(3, 1, 0, 0);
@@ -3591,7 +3802,7 @@ impl Renderer {
                 }
                 let within = eye.within(r, size);
                 // The settled props first: they stand nearest and cover most of the picture.
-                self.draw_props(enc, slot_index, 0, PropSet::Settled);
+                self.draw_props(enc, slot_index, 0, PropSet::Settled, None);
                 enc.set_pipeline(p.cache_scene[1]);
                 enc.set_bind_group(0, slot.scene[0]);
                 count(self.draw_world(enc, &mut push, &within, true, WorldPart::Opaque, None));
@@ -3626,7 +3837,9 @@ impl Renderer {
             });
             enc.set_scissor(x0, y0, x1 - x0, y1 - y0);
             let within = eye.within(&plan.region, size);
-            self.draw_props(enc, slot_index, 0, PropSet::Settled);
+            // The settled props with a pixel in the region (the rest draw none there).
+            let seen = Frustum::from_view_proj(&within.view_proj);
+            self.draw_props(enc, slot_index, 0, PropSet::Settled, Some(&seen));
             enc.set_pipeline(p.cache_scene[1]);
             enc.set_bind_group(0, slot.scene[0]);
             let only = Some(&plan.draws[..]);
@@ -3636,6 +3849,7 @@ impl Renderer {
             count(self.draw_world(enc, &mut push, &within, true, WorldPart::Masked, only));
             enc.end_pass();
             stats.reshaded = true;
+            stats.reshade_pixels = (x1 - x0) * (y1 - y0);
         }
         // The water's kept lamp light and shadow, drawn whole or in the regions drawn again where
         // the picture's depth (a copy) shows the water, the nearer of two waters keeping them; the
@@ -3725,11 +3939,11 @@ impl Renderer {
             enc.set_bind_group(0, slot.restore);
             enc.draw(3, 1, 0, 0);
             split(enc);
-            self.draw_props(enc, slot_index, 0, PropSet::Live);
+            self.draw_props(enc, slot_index, 0, PropSet::Live, None);
         } else {
             // The game's props first: the table and its players stand nearest and cover most
             // of the screen, so the world behind them fails the depth test before it is shaded.
-            self.draw_props(enc, slot_index, 0, PropSet::All);
+            self.draw_props(enc, slot_index, 0, PropSet::All, None);
             enc.set_pipeline(p.scene_opaque);
             enc.set_bind_group(0, slot.scene[0]);
             count(self.draw_world(enc, &mut push, &eye, true, WorldPart::Opaque, None));
@@ -4179,6 +4393,13 @@ mod tests {
         compile(SCENE, Stage::Fragment, "fs_main_cache").expect("fs_main_cache");
         compile(SCENE, Stage::Fragment, "fs_main_opaque_cache").expect("fs_main_opaque_cache");
         compile(POST, Stage::Fragment, "fs_clear").expect("fs_clear");
+        // The mask on every backend the player draws with.
+        let composed = ganbate_shader::compose(SCENE, &shader_modules()).expect("compose");
+        let opts = CompileOptions::default();
+        let entry = "fs_reshade_mask";
+        compile_glsl_with_options(&composed, Stage::Fragment, entry, &opts).expect("glsl");
+        compile_msl_with_options(&composed, Stage::Fragment, entry, &opts).expect("msl");
+        compile_wgsl_with_options(&composed, Stage::Fragment, entry, &opts).expect("wgsl");
     }
 
     #[test]
@@ -5350,6 +5571,266 @@ mod tests {
         let (stats, after) = frame(&mut device, 0.3, 0.0);
         assert!(!stats.prop_shadows_kept && stats.reshaded);
         assert!(off_by_more_than_a_step(&before, &after).0 > 0.01);
+
+        let errs = device.validation_errors();
+        assert!(errs.is_empty(), "validation errors: {errs:?}");
+        for r in [&mut cached, &mut whole] {
+            r.destroy_props(&mut device);
+        }
+    }
+
+    /// Every point of a receiver whose lookups `fs_reshade_mask` finds in a moved prop's
+    /// footprint lies in the pixels the points `shadow_volume` gives project to (as
+    /// `reshade_plan` rounds them out): in an oblique key light's cascade (its lookups off the
+    /// surface by up to the receivers' margin) and in a spot light's map, on a floor filling the
+    /// picture, a table and a wall across the spot's eye. On the floor those pixels are a small
+    /// part of the floor's. Near the eye, the key light's far cascade is not looked up.
+    #[test]
+    fn the_reshade_region_holds_every_point_that_sees_a_footprint() {
+        let size = (160, 120);
+        let (w, h) = (size.0 as f32, size.1 as f32);
+        let view_proj = mul(
+            &perspective(50f32.to_radians(), w / h, 0.1),
+            &look_at([0.0, 1.6, 2.6], [0.0, 0.5, -0.4], [0.0, 1.0, 0.0]),
+        );
+        let key = mul(
+            &ortho(-6.0, 6.0, -6.0, 6.0, 1.0, 60.0),
+            &look_at(
+                scale(normalize([0.7, 1.0, 0.4]), 30.0),
+                [0.0; 3],
+                [0.0, 1.0, 0.0],
+            ),
+        );
+        let spot = mul(
+            &math::perspective_depth(1.4, 1.0, 0.05, 6.0),
+            &look_at([0.4, 2.2, -0.2], [0.4, 0.0, -0.2], [0.0, 0.0, 1.0]),
+        );
+        let grow = 0.04;
+        let maps = [
+            (key, 0.01, grow),
+            (key, 0.01, grow),
+            (spot, 0.02, 0.0),
+            (spot, 0.02, 0.0),
+        ];
+        // A dealer's upper body over the table.
+        let caster: (V3, V3) = ([-0.25, 0.8, -0.7], [0.25, 1.5, -0.35]);
+        let floor = ([-8.0, 0.0, -8.0], [8.0, 0.0, 8.0]);
+        let table = ([-1.2, 0.0, -0.9], [1.2, 0.76, 0.6]);
+        let wall = ([-3.0, 0.0, -1.1], [3.0, 3.0, -1.0]);
+        let mut seed = 0x2545_f491_u32;
+        let mut rand = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as f32 / u32::MAX as f32
+        };
+        let area = |r: Option<Rect>| r.map_or(0, |r| (r[2] - r[0]) * (r[3] - r[1]));
+        let reach = |b, f: &Footprint| {
+            let points = shadow_volume(b, f, &maps);
+            if points.is_empty() {
+                return None;
+            }
+            screen_rect(&points, &view_proj, size, 1.0)
+        };
+        for v in [0, 2] {
+            let (m, margin, grow) = &maps[v];
+            let (r, near, _) = map_bounds(caster, m);
+            let rect = [r[0] - margin, r[1] - margin, r[2] + margin, r[3] + margin];
+            let f: Footprint = (v, rect, near);
+            for (name, b) in [("floor", floor), ("table", table), ("wall", wall)] {
+                let pixels = reach(b, &f);
+                // Half the points anywhere in the box, half where the shadows fall.
+                let near_shadows = (b.0.map(|x| x.max(-3.0)), b.1.map(|x| x.min(3.0)));
+                let mut seen = 0;
+                for i in 0..100_000 {
+                    let (lo, hi) = if i % 2 == 0 { b } else { near_shadows };
+                    let p: V3 = std::array::from_fn(|k| math::lerp(lo[k], hi[k], rand()));
+                    let off = normalize([rand() - 0.5, rand() - 0.5, rand() - 0.5]);
+                    let at = add(p, scale(off, grow * rand()));
+                    let c = transform(m, [at[0], at[1], at[2], 1.0]);
+                    // Behind a spot's eye, outside its cone: its shadows change nothing there.
+                    if c[3] <= 1e-6 {
+                        continue;
+                    }
+                    let q = [c[0] / c[3], c[1] / c[3], c[2] / c[3]];
+                    let inside = rect[0] <= q[0] && q[0] <= rect[2];
+                    if !(inside && rect[1] <= q[1] && q[1] <= rect[3] && q[2] >= near) {
+                        continue;
+                    }
+                    // Seen at the centre of a pixel there, that pixel is in the region.
+                    let s = transform(&view_proj, [p[0], p[1], p[2], 1.0]);
+                    let (x, y) = ((s[0] / s[3] * 0.5 + 0.5) * w, (s[1] / s[3] * 0.5 + 0.5) * h);
+                    if s[3] < 0.1 || x < 0.5 || y < 0.5 || x > w - 0.5 || y > h - 0.5 {
+                        continue;
+                    }
+                    seen += 1;
+                    let r = pixels.unwrap_or_else(|| panic!("map {v}, {name}: {p:?} unheld"));
+                    let held =
+                        |lo: u32, hi: u32, z: f32| lo as f32 + 0.5 <= z && z <= hi as f32 - 0.5;
+                    assert!(
+                        held(r[0], r[2], x) && held(r[1], r[3], y),
+                        "map {v}, {name}: {p:?} at ({x}, {y}) outside {r:?}"
+                    );
+                }
+                assert!(
+                    seen > 1000,
+                    "map {v}, {name}: {seen} points see the footprint"
+                );
+            }
+            // The floor's picture is all of it; the shadow's is a small part.
+            let whole = screen_rect(&corners(floor), &view_proj, size, 2.0);
+            assert_eq!(area(whole), size.0 * size.1);
+            let shadow = area(reach(floor, &f));
+            assert!(
+                shadow * 8 < area(whole),
+                "map {v}: the floor's region {shadow} of {} pixels",
+                area(whole)
+            );
+            if v == 0 {
+                let eye = [0.0, 1.6, 2.6];
+                let points = shadow_volume(table, &(1, rect, near), &maps);
+                assert!(near_cascade_only(&points, eye, 18.0, m, *grow));
+                assert!(!near_cascade_only(&points, eye, 3.0, m, *grow));
+            }
+        }
+    }
+
+    /// A caster re-posed by a hair every frame (a breathing dealer), then moved a little, low
+    /// over a floor filling the picture, by a slab settled into the picture under its shadow and
+    /// another far off, under a spot light: the cached frames match those drawn whole, and the
+    /// region re-shaded is around its shadows, under half the floor's picture (all of it).
+    #[test]
+    fn a_caster_over_a_wide_floor_reshades_around_its_shadow() {
+        let Ok(mut device) = Device::headless() else {
+            return;
+        };
+        let mut world = World::default();
+        world.materials.push(Material {
+            name: "floor".into(),
+            base_color: [0.6, 0.58, 0.55, 1.0],
+            roughness: 0.8,
+            ..Material::default()
+        });
+        world.meshes.push(make_quad_mesh(0.0, 10.0));
+        world.instances.push(Instance {
+            mesh: 0,
+            transform: Transform(math::IDENTITY),
+        });
+        let look = Look {
+            painterly: 0.0,
+            ..Look::default()
+        };
+        let (w, h) = (128, 96);
+        let view = View {
+            name: "floor".into(),
+            eye: [0.0, 2.4, 2.6],
+            target: [0.0, 0.0, -0.2],
+            fov: 50.0,
+            ..View::default()
+        };
+        let env = Environment::resolve(
+            &TimeOfDay {
+                hours: 15.0,
+                ..TimeOfDay::default()
+            },
+            &Weather::default(),
+            &look.palette,
+            1.0,
+        );
+        let (sp, sn, suv, sidx) = sphere_prop_data();
+        let place = |at: V3, size: V3| {
+            let mut m = math::IDENTITY;
+            (m[0], m[5], m[10]) = (size[0], size[1], size[2]);
+            m[12..15].copy_from_slice(&at);
+            m
+        };
+        let ball_at = |x: f32| place([x, 0.45, 0.0], [0.3; 3]);
+        let make = |device: &mut Device<'_>| {
+            let mut r = Renderer::new(
+                device,
+                &world,
+                look.clone(),
+                Quality::realtime(),
+                (w, h),
+                Output::Surface(Format::Rgba8Unorm),
+            )
+            .expect("renderer");
+            r.finish_ao(device).expect("ao");
+            let sphere = r
+                .create_prop_mesh(
+                    device,
+                    &MeshData {
+                        positions: &sp,
+                        normals: &sn,
+                        uvs: &suv,
+                        indices: &sidx,
+                    },
+                )
+                .expect("mesh");
+            let mut material = |name: &str, base_color| {
+                let desc = MaterialDesc {
+                    name: name.into(),
+                    base_color,
+                    ..MaterialDesc::default()
+                };
+                r.create_prop_material(device, &desc).expect("material")
+            };
+            let stone = material("slab", [0.4, 0.42, 0.45, 1.0]);
+            let skin = material("ball", [0.8, 0.6, 0.5, 1.0]);
+            for at in [[-0.6, 0.06, 0.4], [-3.0, 0.06, -2.5]] {
+                r.create_prop_instance(sphere, stone, &place(at, [0.6, 0.06, 0.6]))
+                    .expect("slab");
+            }
+            let ball = r
+                .create_prop_instance(sphere, skin, &ball_at(0.0))
+                .expect("ball");
+            r.create_light(&LightDesc {
+                position: [0.2, 2.6, 0.3],
+                range: 6.0,
+                color: [1.0, 0.9, 0.8],
+                intensity: 5.0,
+                spot: Some(SpotCone {
+                    direction: [-0.1, -1.0, -0.1],
+                    inner: 0.4,
+                    outer: 0.7,
+                }),
+                follows_lamps: false,
+                shadow: 1.0,
+            })
+            .expect("spot");
+            (r, ball, canvas(device, (w, h)))
+        };
+        let (mut cached, cached_ball, cached_out) = make(&mut device);
+        let (mut whole, whole_ball, whole_out) = make(&mut device);
+        let mut frame = |device: &mut Device<'_>, x: f32| {
+            for (r, ball) in [(&mut cached, cached_ball), (&mut whole, whole_ball)] {
+                r.set_prop_instance(ball, &ball_at(x), true).expect("ball");
+            }
+            let a = present(device, &mut cached, &view, &env, cached_out);
+            whole.world_cache = None;
+            whole.prop_shadows_for = None;
+            let b = present(device, &mut whole, &view, &env, whole_out);
+            let (off, largest) = off_by_more_than_a_step(&a, &b);
+            assert!(
+                off <= 0.001,
+                "ball at {x} m: {:.3} % of pixels off by more than a step (up to {largest})",
+                off * 100.0
+            );
+            (cached.last_frame_stats(), a)
+        };
+        // At rest, the slabs settle into the picture.
+        for _ in 0..12 {
+            frame(&mut device, 0.0);
+        }
+        let small = |s: &FrameStats| s.reshaded && s.reshade_pixels * 2 < w * h;
+        for k in 1..6 {
+            let stats = frame(&mut device, k as f32 * 5e-5).0;
+            assert!(small(&stats), "hair {k}: {} pixels", stats.reshade_pixels);
+        }
+        let before = frame(&mut device, 25e-5).1;
+        let (stats, after) = frame(&mut device, 0.12);
+        assert!(small(&stats), "moved: {} pixels", stats.reshade_pixels);
+        assert!(off_by_more_than_a_step(&before, &after).0 > 0.005);
 
         let errs = device.validation_errors();
         assert!(errs.is_empty(), "validation errors: {errs:?}");

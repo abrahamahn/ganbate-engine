@@ -20,7 +20,7 @@ use std::collections::HashMap;
 
 use super::View;
 use super::look::SurfaceModel;
-use super::math::{self, M4, V3};
+use super::math::{self, Frustum, M4, V3};
 use super::renderer::{Fnv, Renderer};
 use super::scene::MaterialData;
 use crate::gpu::pool::Pool;
@@ -986,6 +986,8 @@ pub(super) struct Props {
     skin_buffer: Option<(BufferId, u32)>,
     skin_dirty: bool,
     batches: Vec<Batch>,
+    /// Each of this frame's instances' world bounds, in the order the instance buffer holds them.
+    placed: Vec<(V3, V3)>,
     /// World bounds of this frame's visible instances.
     bounds: Option<(V3, V3)>,
 }
@@ -2255,6 +2257,10 @@ impl Renderer {
                 .then((a.material, a.mesh).cmp(&(b.material, b.mesh)))
         });
         let mut batches: Vec<Batch> = Vec::new();
+        let placed: Vec<(V3, V3)> = live
+            .iter()
+            .map(|l| l.inst.world_bounds.unwrap_or_default())
+            .collect();
         let mut data: Vec<f32> = Vec::with_capacity(live.len() * 40);
         let mut joint_data: Vec<f32> = Vec::new();
         for (n, l) in live.iter().enumerate() {
@@ -2295,6 +2301,7 @@ impl Renderer {
         let count = live.len() as u32;
         drop(live);
         self.props.batches = batches;
+        self.props.placed = placed;
         self.props.bounds = (lo[0] <= hi[0]).then_some((lo, hi));
         self.make_prop_shader_pipelines(device)?;
         // The shared skin records: rewritten when a skinned mesh came or went, and grown (with
@@ -2548,14 +2555,35 @@ impl Renderer {
         push
     }
 
+    /// The runs (first, count) of a batch's instances whose bounds `within` sees; the whole
+    /// batch without it.
+    fn instance_runs(&self, b: &Batch, within: Option<&Frustum>) -> Vec<(u32, u32)> {
+        let Some(f) = within else {
+            return vec![(b.first, b.count)];
+        };
+        let mut runs: Vec<(u32, u32)> = vec![];
+        for i in b.first..b.first + b.count {
+            let (lo, hi) = self.props.placed[i as usize];
+            if !f.intersects_aabb(lo, hi) {
+                continue;
+            }
+            match runs.last_mut() {
+                Some((first, count)) if *first + *count == i => *count += 1,
+                _ => runs.push((i, 1)),
+            }
+        }
+        runs
+    }
+
     /// Draws this frame's opaque prop batches in `set` with the scene shading (`view` 0 main,
-    /// 1 reflection).
+    /// 1 reflection): of their instances, those `within` sees (all without it).
     pub(super) fn draw_props(
         &self,
         enc: &mut crate::gpu::Encoder,
         slot: usize,
         view: usize,
         set: PropSet,
+        within: Option<&Frustum>,
     ) {
         let Some(Some(s)) = self.props.slots.get(slot) else {
             return;
@@ -2595,14 +2623,20 @@ impl Renderer {
                 if view == 1 && mat.data.params[3] == 2.0 {
                     continue;
                 }
+                let runs = self.instance_runs(b, within);
+                if runs.is_empty() {
+                    continue;
+                }
                 if bound != Some(b.material) {
                     enc.set_bind_group(1, mat.group);
                     bound = Some(b.material);
                 }
-                enc.push_constants(&f32_bytes(&Self::prop_push(mat, b.first, false)));
                 enc.set_vertex_buffer(mesh.vertices, 0);
                 enc.set_index_buffer(mesh.indices, 0);
-                enc.draw_indexed(mesh.index_count, b.count, 0, 0, 0);
+                for (first, count) in runs {
+                    enc.push_constants(&f32_bytes(&Self::prop_push(mat, first, false)));
+                    enc.draw_indexed(mesh.index_count, count, 0, 0, 0);
+                }
             }
         }
     }
@@ -2715,6 +2749,7 @@ impl Renderer {
         self.props.instances.drain();
         self.forget_prop_shadows();
         self.props.batches.clear();
+        self.props.placed.clear();
         self.props.vacated.clear();
         self.props.vacated_boxes.clear();
         self.props.texture_edits.clear();
