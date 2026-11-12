@@ -334,6 +334,7 @@ impl<'w> Gpu<'w> {
             uniform_offset_alignment: u64::from(self.info.uniform_align),
             storage_offset_alignment: 16,
             depth_filterable: false,
+            float32_readable: true,
             texture_compression_bc: self.info.s3tc && self.info.bptc,
             texture_compression_astc: self.info.astc,
         }

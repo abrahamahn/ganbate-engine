@@ -483,6 +483,14 @@ impl Default for Look {
 }
 
 impl Look {
+    /// The grade changes nothing: saturation and contrast 1, lift 0 and gain 1.
+    pub fn grade_is_identity(&self) -> bool {
+        self.saturation == 1.0
+            && self.contrast == 1.0
+            && self.lift == [0.0; 3]
+            && self.gain == [1.0; 3]
+    }
+
     /// Scene-linear exposure multiplier combining `exposure` with physical camera (`camera` or `ev100`).
     pub fn effective_exposure(&self) -> f32 {
         if let Some(cam) = &self.camera {

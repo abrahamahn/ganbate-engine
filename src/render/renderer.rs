@@ -12,7 +12,7 @@ use crate::gpu::{
     RenderPipelineDesc, Resource, Result, SamplerDesc, SamplerId, TextureDesc, TextureId,
     TextureUsage, Topology, VertexAttribute, VertexFormat, VertexLayout, f32_bytes,
 };
-use ganbate_shader::{Compiled, Stage};
+use ganbate_shader::{Compiled, SpecValue, Stage};
 
 use super::look::{DetailPreset, Focus, Look, ToneMap, View};
 use super::math::{
@@ -20,7 +20,8 @@ use super::math::{
     perspective, reflect_y, scale, sub, transform,
 };
 use super::props::{
-    CacheChanges, CacheView, PropSet, Rect, corners, screen_rect, track_cached_props, union,
+    CacheChanges, CacheView, PropSet, Rect, SHADOW_DRIFT_TEXELS, ShadowMap, commit_prop_shadows,
+    corners, merge_boxes, screen_rect, track_cached_props, union,
 };
 use super::scene::{DrawItem, GpuScene};
 use super::sky::Environment;
@@ -69,6 +70,10 @@ impl Fnv {
 const MAX_RESHADE_ENTRIES: usize = 32;
 /// Bytes of the re-shade block (`Reshade` in scene.wgsl): a count, then two vec4s an entry.
 const RESHADE_BYTES: u64 = 16 + MAX_RESHADE_ENTRIES as u64 * 32;
+/// Boxes of props moved since the water's lamp light and shadow were kept that the water follows
+/// (`fs_water` computes them within their shadows' footprints), at most: a footprint in each of
+/// the four maps fits the re-shade block. More have them drawn whole again.
+const MAX_WATER_MOVED: usize = MAX_RESHADE_ENTRIES / 4;
 
 /// Where each world draw lies, for re-shading the cached picture ([`Renderer::reshade_plan`]):
 /// in each shadow map props cast into (the key light's cascades 0, 1, grown by the offset its
@@ -79,6 +84,35 @@ struct ReceiverBounds {
     key: u64,
     maps: Vec<[([f32; 4], f32); 4]>,
     screen: Vec<Option<Rect>>,
+    /// Where the water draws in view lie in the shadow maps: the water's kept lamp light and
+    /// shadow (`cache_water`) follow the moved props whose shadows can reach one.
+    water: Vec<[([f32; 4], f32); 4]>,
+}
+
+/// A moved prop's footprint in one shadow map props cast into ([`Renderer::shadow_footprints`]):
+/// the map (0, 1 the key light's cascades; 2, 3 a game's lights), its clip-space rect and its
+/// nearest depth.
+type Footprint = (usize, [f32; 4], f32);
+
+/// Whether a receiver with these bounds in the shadow maps can sample one of `footprints`: its
+/// bounds in that map overlap the footprint and reach past its nearest depth.
+fn reached(footprints: &[Footprint], maps: &[([f32; 4], f32); 4]) -> bool {
+    footprints.iter().any(|(v, fr, near)| {
+        let (r, far) = &maps[*v];
+        r[0] <= fr[2] && fr[0] <= r[2] && r[1] <= fr[3] && fr[1] <= r[3] && *far >= *near
+    })
+}
+
+/// The `Reshade` block (scene.wgsl) for `footprints`: their count and the light buffer index + 1
+/// of a game's light casting into each shadow layer (`shadowed`, 0: none), then per footprint
+/// its rect, nearest depth and map.
+fn reshade_block(footprints: &[Footprint], shadowed: [u32; 2]) -> Vec<u32> {
+    let mut block = vec![footprints.len() as u32, shadowed[0], shadowed[1], 0];
+    for (v, r, near) in footprints {
+        block.extend(r.map(f32::to_bits));
+        block.extend([near.to_bits(), (*v as f32).to_bits(), 0, 0]);
+    }
+    block
 }
 
 /// Slices of view depth per doubling of it (`CLUSTER_SLICES` from `CLUSTER_NEAR` to `CLUSTER_FAR`).
@@ -118,7 +152,7 @@ impl ReceiverBounds {
     /// Where each of `draws` lies in `maps` ([`Renderer::prop_shadow_maps`]) and in a `size`
     /// picture seen through `view_proj`. The water and the draws outside the view (the test
     /// `draw_world` culls with) get none, which no footprint reaches: the picture holds no
-    /// pixel of them. Indices stay those of `draws`.
+    /// pixel of them. Indices stay those of `draws`. The water in view is kept apart (`water`).
     fn new(
         key: u64,
         draws: &[DrawItem],
@@ -128,25 +162,37 @@ impl ReceiverBounds {
     ) -> Self {
         let none = ([1.0, 1.0, -1.0, -1.0], f32::NEG_INFINITY);
         let view = Frustum::from_view_proj(view_proj);
+        let seen = |d: &&DrawItem| view.intersects_aabb(d.bounds.0, d.bounds.1);
+        let in_maps = |d: &DrawItem| {
+            std::array::from_fn(|v| {
+                let (m, _, grow) = &maps[v];
+                let grown = (d.bounds.0.map(|x| x - grow), d.bounds.1.map(|x| x + grow));
+                let (r, _, far) = map_bounds(grown, m);
+                (r, far)
+            })
+        };
         let (bounds, screen) = draws
             .iter()
             .map(|d| {
-                if d.water || !view.intersects_aabb(d.bounds.0, d.bounds.1) {
+                if d.water || !seen(&d) {
                     return ([none; 4], None);
                 }
-                let b = std::array::from_fn(|v| {
-                    let (m, _, grow) = &maps[v];
-                    let grown = (d.bounds.0.map(|x| x - grow), d.bounds.1.map(|x| x + grow));
-                    let (r, _, far) = map_bounds(grown, m);
-                    (r, far)
-                });
-                (b, screen_rect(&corners(d.bounds), view_proj, size, 2.0))
+                (
+                    in_maps(d),
+                    screen_rect(&corners(d.bounds), view_proj, size, 2.0),
+                )
             })
             .unzip();
         Self {
             key,
             maps: bounds,
             screen,
+            water: draws
+                .iter()
+                .filter(|d| d.water)
+                .filter(seen)
+                .map(in_maps)
+                .collect(),
         }
     }
 }
@@ -380,6 +426,19 @@ pub struct FrameStats {
     pub cache_regions: u32,
     /// Pixels of the cached picture that moved props' shadows can reach were shaded again.
     pub reshaded: bool,
+    /// The water read its lamp light and shadow as kept with the cached picture (`cache_water`)
+    /// rather than computing them, as a still does.
+    pub water_kept: bool,
+    /// The water's kept lamp light and shadow were drawn whole this frame.
+    pub water_statics_whole: bool,
+    /// Regions of them drawn again this frame, with the cached picture's.
+    pub water_statics_regions: u32,
+    /// Footprints of the shadows of props moved since they were drawn whole (one shadow map
+    /// apiece), within which the water computes them.
+    pub water_footprints: u32,
+    /// The props' shadow maps (the key light's prop cascades, a game's lights') were kept from
+    /// the last frame: no caster moved, and the lights' views held.
+    pub prop_shadows_kept: bool,
     /// The painterly filter ran (it is skipped where it would change nothing).
     pub painted: bool,
 }
@@ -416,6 +475,11 @@ pub(super) struct Pipelines {
     /// main view: a shader that never discards lets the GPU drop hidden fragments before shading
     /// them.
     scene_opaque: PipelineId,
+    /// The water in a frame that keeps the cached picture (`fs_water`): `scene_opaque` with its
+    /// lamp light and shadow read from `cache_water` where no prop moved since they were kept.
+    water: PipelineId,
+    /// Draws the water's lamp light and shadow into `cache_water` (`fs_water_static`).
+    water_static: PipelineId,
     /// The scene shading for props (model-space vertices placed per instance).
     pub(super) scene_prop: PipelineId,
     /// The same without the alpha test, for opaque prop materials in the main view.
@@ -461,8 +525,9 @@ pub(super) struct Pipelines {
     bloom_up: PipelineId,
     tonemap: PipelineId,
     tonemap_final: PipelineId,
-    /// `fs_tonemap` and `fs_final` in one pass, where no painterly filter runs between them.
-    tonemap_output: PipelineId,
+    /// `fs_tonemap` and `fs_final` in one pass, where no painterly filter runs between them; then
+    /// the same for a Look whose grade changes nothing ([`Look::grade_is_identity`]).
+    tonemap_output: [PipelineId; 2],
     paint: PipelineId,
     output: PipelineId,
 }
@@ -482,6 +547,9 @@ pub(super) struct Targets {
     /// The shadows moved props can change, as the cached picture was shaded with them
     /// (`CacheOut::shadow`).
     cache_shadow: TextureId,
+    /// The water's lamp light and shadow where the cached picture shows it (`fs_water_static`),
+    /// for a presented view on a device that reads 32-bit float textures.
+    cache_water: Option<TextureId>,
     refl: (u32, u32),
     pub(super) refl_hdr: TextureId,
     refl_aux: TextureId,
@@ -511,6 +579,10 @@ pub(super) struct Slot {
     tiles_for: [Option<u64>; 2],
     scene: [BindGroupId; 2],
     sky: [BindGroupId; 2],
+    /// The water's group in a frame that keeps the cached picture (`fs_water`, with `cache_water`)
+    /// and the `Reshade` block it binds: the footprints of props moved since its lamp light and
+    /// shadow were kept.
+    water: Option<(BindGroupId, BufferId)>,
     grass: BindGroupId,
     flower: BindGroupId,
     particle: BindGroupId,
@@ -524,7 +596,7 @@ pub(super) struct Slot {
     up: Vec<BindGroupId>,
     tonemap: BindGroupId,
     tonemap_final: BindGroupId,
-    tonemap_output: BindGroupId,
+    tonemap_output: [BindGroupId; 2],
     paint: BindGroupId,
     output: BindGroupId,
 }
@@ -537,6 +609,10 @@ pub struct Renderer {
     grass_grid: [u32; 4],
     /// The world's draws' bounds for re-shading the cached picture, as of `world_cache`.
     receivers: Option<ReceiverBounds>,
+    /// The water's lamp light and shadow kept with the cached picture (`cache_water`): `None`
+    /// until drawn whole for it as it stands; then the boxes of props moved since that the water
+    /// follows (within their shadows' footprints `fs_water` computes them).
+    water_statics: Option<Vec<(V3, V3)>>,
     /// The AO refinement the cached world shows, and the frames since it was drawn.
     cache_ao_revision: u64,
     cache_age: u32,
@@ -556,6 +632,9 @@ pub struct Renderer {
     pub(super) shadow_map: TextureId,
     shadow_layers_ready: bool,
     static_shadows_vp: Option<[M4; 2]>,
+    /// What the props' shadow maps were last drawn for; while it holds and no caster moved, they
+    /// are kept.
+    prop_shadows_for: Option<PropShadowViews>,
     /// The game lights' shadow maps, a layer for each light casting shadows.
     pub(super) light_shadow_map: TextureId,
     /// Every layer of the light shadow map has been written (cleared) once.
@@ -602,9 +681,28 @@ fn shader_modules() -> [(&'static str, &'static str); 2] {
 }
 
 fn compile(body: &str, stage: Stage, entry: &str) -> Result<Compiled> {
-    let source = ganbate_shader::compose(body, &shader_modules()).map_err(|e| e.to_string())?;
-    crate::gpu::compile_shader(&source, stage, entry)
+    compile_specialized(body, stage, entry, &[])
 }
+
+/// [`compile`] with the shader's module `const`s set.
+fn compile_specialized(
+    body: &str,
+    stage: Stage,
+    entry: &str,
+    specialize: &[(&str, SpecValue)],
+) -> Result<Compiled> {
+    let source = ganbate_shader::compose(body, &shader_modules()).map_err(|e| e.to_string())?;
+    crate::gpu::compile_shader_specialized(&source, stage, entry, specialize)
+}
+
+/// `fs_water` as the water's pipeline compiles it: its lamp light and shadow read from
+/// `cache_water` where no prop moved since they were kept, computed elsewhere.
+const WATER_STATICS: [(&str, SpecValue); 1] = [("WATER_STATICS", SpecValue::Bool(true))];
+
+/// `cache_water`'s format: 32-bit floats hand the water the very values computing them gives, so
+/// its frames match those that compute them byte for byte (16-bit floats moved some pixels a few
+/// steps). Devices that cannot read them (WebGPU without `float32-filterable`) compute them.
+const WATER_STATICS_FORMAT: Format = Format::Rgba32Float;
 
 /// The scene shader with a game's prop shader (`shade`) and the overlay entry point that calls it.
 pub(super) fn prop_shader_source(user: &str) -> Result<String> {
@@ -772,6 +870,33 @@ impl Pipelines {
             front_ccw: true,
             depth: Some(reverse_depth(Compare::Greater, true)),
             colors: mrt(),
+        })?;
+        let water = device.create_render_pipeline(&RenderPipelineDesc {
+            vertex: &vs,
+            fragment: Some(&compile_specialized(
+                SCENE,
+                Stage::Fragment,
+                "fs_water",
+                &WATER_STATICS,
+            )?),
+            vertex_layout: Some(world_layout_cache.clone()),
+            topology: Topology::TriangleList,
+            cull: Cull::None,
+            front_ccw: true,
+            depth: Some(reverse_depth(Compare::Greater, true)),
+            colors: mrt(),
+        })?;
+        // Tested against the cached picture's depth (a copy) and writing its own, so where water
+        // lies over water the nearer keeps its light, as in the main pass.
+        let water_static = device.create_render_pipeline(&RenderPipelineDesc {
+            vertex: &vs,
+            fragment: Some(&compile(SCENE, Stage::Fragment, "fs_water_static")?),
+            vertex_layout: Some(world_layout_cache.clone()),
+            topology: Topology::TriangleList,
+            cull: Cull::None,
+            front_ccw: true,
+            depth: Some(reverse_depth(Compare::Greater, true)),
+            colors: vec![color(WATER_STATICS_FORMAT, Blend::Replace)],
         })?;
         let vs = compile(SCENE, Stage::Vertex, "vs_prop")?;
         let prop_vs = vs.clone();
@@ -1045,6 +1170,8 @@ impl Pipelines {
         Ok(Self {
             scene,
             scene_opaque,
+            water,
+            water_static,
             scene_prop,
             scene_prop_opaque,
             cache_scene,
@@ -1127,7 +1254,16 @@ impl Pipelines {
             bloom_up: fullscreen(device, &fsvs, "fs_bloom_up", HDR, Blend::Additive)?,
             tonemap: fullscreen(device, &fsvs, "fs_tonemap", HDR, Blend::Replace)?,
             tonemap_final: fullscreen(device, &fsvs, "fs_tonemap_final", output, Blend::Replace)?,
-            tonemap_output: fullscreen(device, &fsvs, "fs_tonemap_output", output, Blend::Replace)?,
+            tonemap_output: [
+                fullscreen(device, &fsvs, "fs_tonemap_output", output, Blend::Replace)?,
+                fullscreen(
+                    device,
+                    &fsvs,
+                    "fs_tonemap_output_plain",
+                    output,
+                    Blend::Replace,
+                )?,
+            ],
             paint: fullscreen(device, &fsvs, "fs_paint", HDR, Blend::Replace)?,
             output: fullscreen(device, &fsvs, "fs_final", output, Blend::Replace)?,
         })
@@ -1187,6 +1323,14 @@ impl Eye {
             near: self.near,
         }
     }
+}
+
+/// The views the props' shadow maps are drawn from: the key light's cascades while it shines on
+/// casters (layers 2, 3 of its map), and each shadowed game light's.
+#[derive(PartialEq)]
+struct PropShadowViews {
+    cascades: Option<[M4; 2]>,
+    lights: Vec<M4>,
 }
 
 struct Cascades {
@@ -1523,6 +1667,7 @@ impl Renderer {
             shadow_map,
             shadow_layers_ready: false,
             static_shadows_vp: None,
+            prop_shadows_for: None,
             light_shadow_map,
             light_shadows_ready: false,
             ground_depth,
@@ -1535,6 +1680,7 @@ impl Renderer {
             world_cache: None,
             grass_grid: [0; 4],
             receivers: None,
+            water_statics: None,
             cache_ao_revision: 0,
             cache_age: 0,
             split_passes: false,
@@ -1617,6 +1763,10 @@ impl Renderer {
     }
     /// Converged fraction of the baked vertex AO in `[0, 1]` (it refines a slice per live
     /// frame after start and after world edits).
+    /// The props' shadow maps no longer hold the props there are: the next frame draws them again.
+    pub(super) fn forget_prop_shadows(&mut self) {
+        self.prop_shadows_for = None;
+    }
     pub fn ao_progress(&self) -> f32 {
         self.scene.ao.progress()
     }
@@ -1690,6 +1840,9 @@ impl Renderer {
             )?,
             reshade_depth: tex(device, width, height, Format::Depth32Float, depth_usage)?,
             cache_shadow: tex(device, width, height, HDR, rt)?,
+            cache_water: (output != Output::Still && device.limits().float32_readable)
+                .then(|| tex(device, width, height, WATER_STATICS_FORMAT, rt))
+                .transpose()?,
             refl,
             refl_hdr: tex(device, refl.0, refl.1, HDR, rt)?,
             refl_aux: tex(device, refl.0, refl.1, HDR, rt)?,
@@ -1771,6 +1924,7 @@ impl Renderer {
         let mut scene = vec![];
         let mut sky = vec![];
         let mut blades = vec![];
+        let mut water = None;
         for v in 0..2 {
             let reflection = if v == 0 { t.refl_hdr } else { self.dummy };
             let entries = [
@@ -1793,6 +1947,13 @@ impl Renderer {
                 blades.push(device.create_bind_group(p.grass, 0, &entries)?);
                 blades.push(device.create_bind_group(p.flower, 0, &entries)?);
                 blades.push(device.create_bind_group(p.particle, 0, &entries)?);
+                if let Some(kept) = t.cache_water {
+                    let moved = upload(device, RESHADE_BYTES, BufferUsage::UNIFORM)?;
+                    let more = [(17, buf(moved)), (19, Resource::Texture(kept))];
+                    let group =
+                        device.create_bind_group(p.water, 0, &[&entries[..], &more].concat())?;
+                    water = Some((group, moved));
+                }
             }
         }
         fn pair<T: Copy>(v: Vec<T>) -> [T; 2] {
@@ -1875,12 +2036,11 @@ impl Renderer {
             Resource::Texture(t.lit),
             Resource::TextureMip(t.bloom, 0),
         )?;
-        let tonemap_output = post(
-            device,
-            p.tonemap_output,
-            Resource::Texture(t.lit),
-            Resource::TextureMip(t.bloom, 0),
-        )?;
+        let [graded, plain] = p.tonemap_output.map(|pipe| {
+            let (lit, bloom) = (Resource::Texture(t.lit), Resource::TextureMip(t.bloom, 0));
+            post(device, pipe, lit, bloom)
+        });
+        let tonemap_output = [graded?, plain?];
         let tonemap_final = device.create_bind_group(
             p.tonemap_final,
             0,
@@ -1908,6 +2068,7 @@ impl Renderer {
             tiles_for: [None; 2],
             scene,
             sky,
+            water,
             grass,
             flower,
             particle,
@@ -1932,16 +2093,12 @@ impl Renderer {
                 .scene
                 .into_iter()
                 .chain(s.sky)
+                .chain(s.water.map(|w| w.0))
                 .chain([
                     s.grass, s.flower, s.particle, s.restore, s.mask, s.ssao, s.air,
                 ])
-                .chain([
-                    s.tonemap,
-                    s.tonemap_final,
-                    s.tonemap_output,
-                    s.paint,
-                    s.output,
-                ])
+                .chain(s.tonemap_output)
+                .chain([s.tonemap, s.tonemap_final, s.paint, s.output])
             {
                 device.destroy_bind_group(g);
             }
@@ -1954,6 +2111,7 @@ impl Renderer {
                 .chain(s.tiles)
                 .chain(s.index)
                 .chain([s.reshade])
+                .chain(s.water.map(|w| w.1))
             {
                 device.destroy_buffer(b);
             }
@@ -1981,6 +2139,7 @@ impl Renderer {
         ]
         .into_iter()
         .chain(old.still)
+        .chain(old.cache_water)
         {
             device.destroy_texture(t);
         }
@@ -2307,29 +2466,16 @@ impl Renderer {
         })
     }
 
-    /// What the GPU needs to shade again the cached picture's pixels that shadows of `moved`
-    /// (boxes where props were and are) can reach: each shadow map's footprint of what moved,
-    /// which `fs_reshade_mask` tests per pixel; the world's draws a footprint can reach; and the
-    /// region of the picture holding them and the reachable settled props. None when nothing
-    /// the picture holds is in reach. `key`: the key light shines and its cascades hold props.
-    fn reshade_plan(
-        &self,
-        moved: &[(V3, V3)],
-        settled: &[(V3, V3)],
-        eye: &Eye,
-        size: (u32, u32),
-        cas: &Cascades,
-        key: bool,
-    ) -> Option<ReshadePlan> {
-        let receivers = self.receivers.as_ref()?;
+    /// Where shadows of `moved` (boxes where props were and are) fall in each shadow map props
+    /// cast into ([`Renderer::prop_shadow_maps`]) that holds them: the key light's cascades when
+    /// `key` (it shines and they hold props), a game's shadowed lights'. Boxes too many for the
+    /// re-shade block are joined into one.
+    fn shadow_footprints(&self, moved: &[(V3, V3)], cas: &Cascades, key: bool) -> Vec<Footprint> {
         let maps = self.prop_shadow_maps(cas);
         let lights = self.game_lights.shadow_views().len().min(2);
         let active: Vec<usize> = (0..4)
             .filter(|&v| if v < 2 { key } else { v - 2 < lights })
             .collect();
-        if active.is_empty() {
-            return None;
-        }
         let boxes = if moved.len() * active.len() > MAX_RESHADE_ENTRIES {
             let all = moved.iter().copied().reduce(|a, b| {
                 (
@@ -2341,23 +2487,32 @@ impl Renderer {
         } else {
             moved.to_vec()
         };
-        let mut entries = vec![];
+        let mut footprints = vec![];
         for b in &boxes {
             for &v in &active {
                 let (m, margin, _) = &maps[v];
                 let (r, near, _) = map_bounds(*b, m);
                 let r = [r[0] - margin, r[1] - margin, r[2] + margin, r[3] + margin];
-                entries.push((v, r, near));
+                footprints.push((v, r, near));
             }
         }
-        // Whether a receiver can sample a footprint: its bounds in that map overlap the
-        // footprint and reach past its nearest depth.
-        let reached = |maps: &[([f32; 4], f32); 4]| {
-            entries.iter().any(|(v, er, near)| {
-                let (r, far) = &maps[*v];
-                r[0] <= er[2] && er[0] <= r[2] && r[1] <= er[3] && er[1] <= r[3] && *far >= *near
-            })
-        };
+        footprints
+    }
+
+    /// What the GPU needs to shade again the cached picture's pixels that moved props' shadows
+    /// (`footprints`, which `fs_reshade_mask` tests per pixel) can reach: the world's draws a
+    /// footprint can reach, and the region of the picture holding them and the reachable settled
+    /// props. None when nothing the picture holds is in reach.
+    fn reshade_plan(
+        &self,
+        footprints: &[Footprint],
+        settled: &[(V3, V3)],
+        eye: &Eye,
+        size: (u32, u32),
+        cas: &Cascades,
+    ) -> Option<ReshadePlan> {
+        let receivers = self.receivers.as_ref().filter(|_| !footprints.is_empty())?;
+        let maps = self.prop_shadow_maps(cas);
         let mut region: Option<Rect> = None;
         let mut grow = |r: Rect| region = Some(region.map_or(r, |a| union(a, r)));
         let draws: Vec<bool> = receivers
@@ -2365,7 +2520,7 @@ impl Renderer {
             .iter()
             .zip(&receivers.screen)
             .map(|(m, screen)| {
-                let hit = reached(m);
+                let hit = reached(footprints, m);
                 if hit {
                     screen.map(&mut grow);
                 }
@@ -2378,7 +2533,7 @@ impl Renderer {
                 let (r, _, far) = map_bounds((b.0.map(|x| x - grow), b.1.map(|x| x + grow)), m);
                 (r, far)
             });
-            if reached(&bounds) {
+            if reached(footprints, &bounds) {
                 screen_rect(&corners(*b), &eye.view_proj, size, 2.0).map(&mut grow);
             }
         }
@@ -2391,13 +2546,8 @@ impl Renderer {
                 *slot = lamps + k as u32 + 1;
             }
         }
-        let mut block = vec![entries.len() as u32, shadowed[0], shadowed[1], 0];
-        for (v, r, near) in &entries {
-            block.extend(r.map(f32::to_bits));
-            block.extend([near.to_bits(), (*v as f32).to_bits(), 0, 0]);
-        }
         Some(ReshadePlan {
-            block,
+            block: reshade_block(footprints, shadowed),
             draws,
             region,
         })
@@ -3125,39 +3275,101 @@ impl Renderer {
             // A still draws everything itself; the picture no longer follows the props.
             self.world_cache = None;
         }
+        // The views the props' shadow maps are drawn from this frame, and those maps as casters'
+        // moves are measured in.
+        let prop_views = PropShadowViews {
+            cascades: (env.key_intensity > 0.0 && has_prop_shadows).then_some(cas.mats),
+            lights: self.game_lights.shadow_views().to_vec(),
+        };
+        let cascade_maps = prop_views.cascades.iter().flatten();
+        let light_maps = prop_views.lights.iter();
+        let shadow_maps: Vec<ShadowMap> = cascade_maps
+            .map(|m| (*m, self.quality.shadow_size.max(16)))
+            .chain(light_maps.map(|m| (*m, self.quality.light_shadow_size.max(16))))
+            .collect();
         // The props the cached picture holds, and the regions of it to draw again: where props
-        // settled or left, and where the shadows of live ones moved over it.
+        // settled or left, and where the shadows of casters moved over it.
         let CacheChanges {
             regions,
             moved,
             settled,
+            casters_moved,
         } = if cached {
             let view = CacheView {
                 view_proj: &eye.view_proj,
                 size,
             };
-            track_cached_props(&mut self.props, rebuild, &view)
+            track_cached_props(
+                &mut self.props,
+                rebuild,
+                &view,
+                &shadow_maps,
+                SHADOW_DRIFT_TEXELS,
+            )
         } else {
             CacheChanges::default()
         };
         let regions = merge_regions(regions);
-        // The pixels of the picture moved props' shadows can reach, shaded again below.
-        let reshade = if cached && !rebuild && !moved.is_empty() {
-            if self.receivers.as_ref().is_none_or(|r| r.key != world_key) {
-                let maps = self.prop_shadow_maps(&cas);
-                self.receivers = Some(ReceiverBounds::new(
-                    world_key,
-                    &self.scene.draws,
-                    &maps,
-                    &eye.view_proj,
-                    size,
-                ));
-            }
-            let key = env.key_intensity > 0.0 && has_prop_shadows;
-            self.reshade_plan(&moved, &settled, &eye, size, &cas, key)
-        } else {
-            None
-        };
+        let key = env.key_intensity > 0.0 && has_prop_shadows;
+        // The props' shadow maps are kept while their views hold and no caster moved across
+        // them (props that cast none move freely): a frame draws its live props' shadows from
+        // them as they are, and the cached picture was shaded from them. A still draws them
+        // every frame.
+        let redraw_prop_shadows = !cached
+            || casters_moved
+            || first_shadow_layers
+            || first_light_shadows
+            || self.prop_shadows_for.as_ref() != Some(&prop_views);
+        // The pixels of the picture moved casters' shadows can reach, shaded again below, and
+        // the moved casters whose shadows can reach the water.
+        let (reshade, water_moved) =
+            if cached && !rebuild && redraw_prop_shadows && !moved.is_empty() {
+                if self.receivers.as_ref().is_none_or(|r| r.key != world_key) {
+                    let maps = self.prop_shadow_maps(&cas);
+                    self.receivers = Some(ReceiverBounds::new(
+                        world_key,
+                        &self.scene.draws,
+                        &maps,
+                        &eye.view_proj,
+                        size,
+                    ));
+                }
+                let footprints = self.shadow_footprints(&moved, &cas, key);
+                let water = self.receivers.as_ref().map_or(vec![], |r| {
+                    let reaches = |b: &(V3, V3)| {
+                        let f = self.shadow_footprints(&[*b], &cas, key);
+                        r.water.iter().any(|m| reached(&f, m))
+                    };
+                    moved.iter().copied().filter(reaches).collect()
+                });
+                let plan = self.reshade_plan(&footprints, &settled, &eye, size, &cas);
+                (plan, water)
+            } else {
+                (None, vec![])
+            };
+        // The water's lamp light and shadow, kept (`cache_water`) while the picture holds. A
+        // frame drawing the picture whole (as while the camera moves) computes them, as a still
+        // does; the first frame keeping it draws them whole. Later frames draw them again in the
+        // regions of the picture drawn again, and follow the props moved since whose shadows can
+        // reach the water: within those shadows' footprints the water computes them (`fs_water`,
+        // as `fs_reshade_mask` tests the picture's pixels), until too many have them drawn whole.
+        let keep_water = cached && !rebuild && self.targets.cache_water.is_some();
+        if !keep_water {
+            self.water_statics = None;
+        }
+        let water_whole = keep_water
+            && self.water_statics.as_mut().is_none_or(|boxes| {
+                boxes.extend(water_moved);
+                *boxes = merge_boxes(std::mem::take(boxes));
+                boxes.len() > MAX_WATER_MOVED
+            });
+        if water_whole {
+            self.water_statics = Some(vec![]);
+        }
+        let water_block = self
+            .water_statics
+            .as_ref()
+            .map(|boxes| reshade_block(&self.shadow_footprints(boxes, &cas, key), [0, 0]));
         let mut stats = FrameStats::default();
 
         // Shadow cascades: layers 0..2 cache static world depth; layers 2..4 hold dynamic props.
@@ -3220,7 +3432,7 @@ impl Renderer {
                 }
                 self.static_shadows_vp = Some(cas.mats);
             }
-            if has_prop_shadows || first_shadow_layers {
+            if redraw_prop_shadows && (has_prop_shadows || first_shadow_layers) {
                 for (layer, m) in cas.mats.iter().enumerate() {
                     enc.begin_pass(PassDesc {
                         colors: vec![],
@@ -3257,9 +3469,8 @@ impl Renderer {
         }
 
         // A game's shadowed lights: the props seen from each, on a layer apiece.
-        let views = self.game_lights.shadow_views();
-        for layer in 0..super::lights::MAX_SHADOWED_LIGHTS {
-            let light_vp = views.get(layer);
+        for layer in (0..super::lights::MAX_SHADOWED_LIGHTS).filter(|_| redraw_prop_shadows) {
+            let light_vp = prop_views.lights.get(layer);
             if light_vp.is_none() && !first_light_shadows {
                 continue;
             }
@@ -3277,6 +3488,12 @@ impl Renderer {
                 self.draw_prop_shadows(enc, slot_index, m);
             }
             enc.end_pass();
+        }
+        if redraw_prop_shadows {
+            self.prop_shadows_for = Some(prop_views);
+            commit_prop_shadows(&mut self.props);
+        } else {
+            stats.prop_shadows_kept = true;
         }
 
         // Rain and petals wrap around a box just ahead of the camera.
@@ -3342,6 +3559,7 @@ impl Renderer {
             total_draws += total;
             submitted_draws += submitted;
         };
+        let whole = [[0, 0, size.0, size.1]];
         // The cached picture: the world and the settled props, drawn whole or in regions (each
         // emptied, then drawn again within it).
         if rebuild || !regions.is_empty() {
@@ -3365,7 +3583,6 @@ impl Renderer {
                 colors: vec![target(t.cache_hdr), target(t.cache_aux), shadow_target],
                 depth: Some(target(t.cache_depth)),
             });
-            let whole = [[0, 0, size.0, size.1]];
             for r in if rebuild { &whole[..] } else { &regions[..] } {
                 if !rebuild {
                     enc.set_scissor(r[0], r[1], r[2] - r[0], r[3] - r[1]);
@@ -3420,6 +3637,51 @@ impl Renderer {
             enc.end_pass();
             stats.reshaded = true;
         }
+        // The water's kept lamp light and shadow, drawn whole or in the regions drawn again where
+        // the picture's depth (a copy) shows the water, the nearer of two waters keeping them; the
+        // main pass's water reads them where it is drawn, which lies within that.
+        let water_regions = match t.cache_water {
+            Some(kept) if water_whole => Some((kept, &whole[..])),
+            Some(kept) if keep_water && !regions.is_empty() => Some((kept, &regions[..])),
+            _ => None,
+        };
+        if let Some((kept, rects)) = water_regions {
+            enc.blit((t.cache_depth, 0, 0), (t.depth, 0, 0), Filter::Nearest);
+            enc.begin_pass(PassDesc {
+                colors: vec![Attachment {
+                    load: if water_whole {
+                        Load::Clear(clear)
+                    } else {
+                        Load::Load
+                    },
+                    ..Attachment::clear(kept, clear)
+                }],
+                depth: Some(Attachment {
+                    load: Load::Load,
+                    store: false,
+                    ..Attachment::clear(t.depth, clear)
+                }),
+            });
+            enc.set_pipeline(p.water_static);
+            enc.set_bind_group(0, slot.scene[0]);
+            for r in rects {
+                enc.set_scissor(r[0], r[1], r[2] - r[0], r[3] - r[1]);
+                let within = eye.within(r, size);
+                self.draw_world(enc, &mut push, &within, true, WorldPart::Water, None);
+            }
+            enc.end_pass();
+            stats.water_statics_whole = water_whole;
+            stats.water_statics_regions = if water_whole { 0 } else { rects.len() as u32 };
+        }
+        let water_kept = match (slot.water, &water_block) {
+            (Some((group, moved)), Some(block)) => {
+                device.write_buffer(moved, 0, &crate::gpu::u32_bytes(block))?;
+                stats.water_kept = true;
+                stats.water_footprints = block[0];
+                Some(group)
+            }
+            _ => None,
+        };
 
         // Main pass: world, sky, weather. A cached frame starts from the picture's depth, copied:
         // drawn from a shader instead, it would cost the GPU its early depth test for the rest of
@@ -3477,10 +3739,16 @@ impl Renderer {
         }
         // The water moves with the clock, so it is drawn every frame. Without an alpha test it
         // never discards, so the floor and the table in front of it hide it before it is
-        // shaded: behind the room it spans the whole view.
+        // shaded: behind the room it spans the whole view. It takes its lamp light and shadow
+        // from `cache_water` while they are kept.
         split(enc);
-        enc.set_pipeline(p.scene_opaque);
-        enc.set_bind_group(0, slot.scene[0]);
+        if let Some(group) = water_kept {
+            enc.set_pipeline(p.water);
+            enc.set_bind_group(0, group);
+        } else {
+            enc.set_pipeline(p.scene_opaque);
+            enc.set_bind_group(0, slot.scene[0]);
+        }
         count(self.draw_world(enc, &mut push, &eye, true, WorldPart::Water, None));
         split(enc);
         enc.set_pipeline(p.scene);
@@ -3688,13 +3956,14 @@ impl Renderer {
                 grade[12] = l.sharpen.max(0.0);
                 grade[13] = if self.quality.fxaa { 1.0 } else { 0.0 };
                 grade[14] = if encode_srgb { 1.0 } else { 0.0 };
+                let plain = usize::from(l.grade_is_identity());
                 Self::post_pass(
                     enc,
                     dest,
                     0,
                     Load::DontCare,
-                    p.tonemap_output,
-                    slot.tonemap_output,
+                    p.tonemap_output[plain],
+                    slot.tonemap_output[plain],
                     grade,
                 );
             }
@@ -3780,13 +4049,17 @@ impl Renderer {
 mod tests {
     use super::*;
     use crate::Vec3;
+    use crate::render::lights::{LightDesc, SpotCone};
     use crate::render::look::SurfaceModel;
     use crate::render::props::{MaterialDesc, MeshData};
     use crate::render::sky::{TimeOfDay, Weather};
-    use crate::world::{AlphaMode, Instance, Material, Mesh, Shading, Transform, World};
+    use crate::world::{
+        AlphaMode, Instance, Material, Mesh, PointLight, Shading, Transform, World,
+    };
     use ganbate_shader::{
-        CompileOptions, ShaderLibrary, SpecValue, compile_glsl_with_options,
-        compile_msl_with_options, compile_wgsl_with_options, compile_with_options,
+        BindingKind, CompileOptions, SampleType, ShaderLibrary, SpecValue, TextureView,
+        compile_glsl_with_options, compile_msl_with_options, compile_wgsl_with_options,
+        compile_with_options,
     };
 
     #[test]
@@ -3906,6 +4179,123 @@ mod tests {
         compile(SCENE, Stage::Fragment, "fs_main_cache").expect("fs_main_cache");
         compile(SCENE, Stage::Fragment, "fs_main_opaque_cache").expect("fs_main_opaque_cache");
         compile(POST, Stage::Fragment, "fs_clear").expect("fs_clear");
+    }
+
+    #[test]
+    fn the_cached_water_reads_its_light_within_webgl_units() {
+        let composed = ganbate_shader::compose(SCENE, &shader_modules()).expect("compose");
+        let glsl = |entry: &str, specialize: &[(&str, SpecValue)]| {
+            let opts = CompileOptions {
+                imports: &[],
+                specialize,
+            };
+            let c = compile_glsl_with_options(&composed, Stage::Fragment, entry, &opts)
+                .unwrap_or_else(|e| panic!("{entry}: {e}"));
+            let g = c.glsl.expect("glsl");
+            (
+                g.units.len() + g.storage.len(),
+                sorted_bindings(&c.bindings),
+            )
+        };
+        let (opaque_units, opaque) = glsl("fs_main_opaque", &[]);
+        let (water_units, water) = glsl("fs_water", &WATER_STATICS);
+        let (_, statics) = glsl("fs_water_static", &[]);
+        // Where props moved since its light was kept, the water computes it as `fs_main_opaque`
+        // does: it reads all that reads, plus the kept light (a unit) and the moved props'
+        // footprints (a uniform block).
+        assert!(
+            water_units == opaque_units + 1 && water_units <= 16,
+            "WebGL 2 fragment texture units: fs_water {water_units}, fs_main_opaque {opaque_units}"
+        );
+        let kept = [
+            (
+                0,
+                17,
+                BindingKind::UniformBuffer {
+                    size: RESHADE_BYTES as u32,
+                },
+            ),
+            (
+                0,
+                19,
+                BindingKind::Texture {
+                    view: TextureView::D2,
+                    sample: SampleType::Float,
+                },
+            ),
+        ]
+        .map(|(group, binding, kind)| ganbate_shader::Binding {
+            group,
+            binding,
+            kind,
+        });
+        assert_eq!(water, sorted_bindings(&[&opaque[..], &kept].concat()));
+        // The statics take the scene's group, which must not hold the target they draw into.
+        assert_eq!(statics, opaque);
+        for (entry, spec) in [("fs_water", &WATER_STATICS[..]), ("fs_water_static", &[])] {
+            let opts = CompileOptions {
+                imports: &[],
+                specialize: spec,
+            };
+            compile_specialized(SCENE, Stage::Fragment, entry, spec).expect(entry);
+            compile_msl_with_options(&composed, Stage::Fragment, entry, &opts).expect(entry);
+            compile_wgsl_with_options(&composed, Stage::Fragment, entry, &opts).expect(entry);
+        }
+    }
+
+    #[test]
+    fn moved_shadows_reach_the_water_in_view() {
+        let view_proj = mul(
+            &perspective(60f32.to_radians(), 4.0 / 3.0, 0.1),
+            &look_at([0.0, 2.0, 6.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+        );
+        // A light straight above.
+        let map = mul(
+            &ortho(-40.0, 40.0, -40.0, 40.0, -40.0, 40.0),
+            &look_at([0.0, 20.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, -1.0]),
+        );
+        let maps = [
+            (map, 0.1, 0.5),
+            (map, 0.1, 0.5),
+            (map, 0.1, 0.0),
+            (map, 0.1, 0.0),
+        ];
+        let draw = |lo: V3, hi: V3, water: bool| DrawItem {
+            first_index: 0,
+            count: 6,
+            material: 0,
+            water,
+            bounds: (lo, hi),
+            max_extent: 2.0,
+        };
+        let draws = [
+            draw([-4.0, -0.5, -4.0], [4.0, -0.4, 4.0], false),
+            draw([-3.0, 0.0, -3.0], [3.0, 0.0, 3.0], true),
+            // Behind the eye.
+            draw([-3.0, 0.0, 20.0], [3.0, 0.0, 26.0], true),
+        ];
+        let r = ReceiverBounds::new(7, &draws, &maps, &view_proj, (64, 48));
+        // The cached picture's re-shade never reaches the water; the water in view is apart.
+        let none = ([1.0, 1.0, -1.0, -1.0], f32::NEG_INFINITY);
+        assert_eq!(r.maps[1], [none; 4]);
+        assert_eq!(r.water.len(), 1);
+        let footprint = |lo: V3, hi: V3| {
+            let (rect, near, _) = map_bounds((lo, hi), &map);
+            vec![(0, rect, near)]
+        };
+        assert!(reached(
+            &footprint([1.0, 0.5, 1.0], [1.5, 1.0, 1.5]),
+            &r.water[0]
+        ));
+        // Beside the water, and under it.
+        assert!(!reached(
+            &footprint([20.0, 0.5, 1.0], [21.0, 1.0, 1.5]),
+            &r.water[0]
+        ));
+        assert!(!reached(
+            &footprint([1.0, -2.0, 1.0], [1.5, -1.5, 1.5]),
+            &r.water[0]
+        ));
     }
 
     #[test]
@@ -4350,5 +4740,621 @@ mod tests {
         let errs = device.validation_errors();
         assert!(errs.is_empty(), "validation errors: {errs:?}");
         renderer.destroy_props(&mut device);
+    }
+
+    /// One frame as RGBA8 sRGB: a still's linear readback encoded here, or a presented frame's
+    /// `Rgba8Srgb` `target` read back.
+    fn frame_srgb(
+        device: &mut Device<'_>,
+        r: &mut Renderer,
+        view: &View,
+        env: &Environment,
+        target: Option<(TextureId, BufferId)>,
+    ) -> Vec<u8> {
+        let mut enc = device.encoder();
+        r.encode(
+            device,
+            &mut enc,
+            view,
+            env,
+            [0.0; 2],
+            0,
+            target.map(|t| t.0),
+        )
+        .expect("encode");
+        if let Some((texture, buffer)) = target {
+            enc.copy_texture_to_buffer(texture, 0, 0, buffer, 0);
+        }
+        device.submit(enc).expect("submit");
+        if let Some((_, buffer)) = target {
+            return device.read_buffer(buffer).expect("read");
+        }
+        let linear = device
+            .read_buffer(r.targets.readback.expect("readback"))
+            .expect("read");
+        linear
+            .chunks_exact(2)
+            .map(|h| {
+                let v = f16_to_f32(u16::from_le_bytes([h[0], h[1]]));
+                (math::linear_to_srgb(v) * 255.0).round().clamp(0.0, 255.0) as u8
+            })
+            .collect()
+    }
+
+    /// A presented frame, whose water reads its lamp light and shadow as the cached picture
+    /// keeps them (`cache_water`), shows what a still (computing them) shows, to the step its
+    /// own sRGB encoding rounds differently: by day and at night under a lamp and a spot light,
+    /// and while a ball under the spot (its shadow on the water) moves every frame, as a
+    /// dealer's idle does, which the water follows without drawing what it keeps again. Held,
+    /// and while the ball settles into the picture, it does not change. The pond stands alone:
+    /// with nothing else in the picture no frame re-shades it (`fs_reshade_mask`, which llvmpipe
+    /// crashes on).
+    #[test]
+    fn the_cached_water_matches_the_water_computed_each_frame() {
+        let Ok(mut device) = Device::headless() else {
+            return;
+        };
+        let mut world = World::default();
+        world.materials.push(Material {
+            name: "pond".into(),
+            base_color: [0.12, 0.34, 0.42, 0.85],
+            roughness: 0.08,
+            shading: Shading::Water,
+            ..Material::default()
+        });
+        world.meshes.push(make_quad_mesh(0.0, 4.0));
+        world.instances.push(Instance {
+            mesh: 0,
+            transform: Transform(math::IDENTITY),
+        });
+        world.lights.push(PointLight {
+            position: Vec3(-1.2, 0.5, 0.8),
+            color: [1.0, 0.8, 0.6],
+            intensity: 6.0,
+            range: 4.0,
+        });
+        let look = Look::default();
+        let env = |hours| {
+            let time = TimeOfDay {
+                hours,
+                ..TimeOfDay::default()
+            };
+            Environment::resolve(&time, &Weather::default(), &look.palette, 1.0)
+        };
+        let (day, night) = (env(15.0), env(22.5));
+        let size = (80, 56);
+        // No mirror: a presented frame keeps the water's reflection while the world holds, so
+        // the ball's would stay where it was.
+        let quality = Quality {
+            reflection_scale: 0.0,
+            ..Quality::hybrid_stage()
+        };
+        let mut still = Renderer::new(
+            &mut device,
+            &world,
+            look.clone(),
+            quality,
+            size,
+            Output::Still,
+        )
+        .expect("still renderer");
+        let mut live = Renderer::new(
+            &mut device,
+            &world,
+            look.clone(),
+            quality,
+            size,
+            Output::Surface(Format::Rgba8Srgb),
+        )
+        .expect("presented renderer");
+        let target = device
+            .create_texture(&TextureDesc::new(
+                size.0,
+                size.1,
+                Format::Rgba8Srgb,
+                TextureUsage::COLOR_TARGET | TextureUsage::COPY_SRC,
+            ))
+            .expect("target");
+        let readback = device
+            .create_buffer(&BufferDesc {
+                size: u64::from(size.0 * size.1 * 4),
+                usage: BufferUsage::COPY_DST,
+                memory: Memory::Readback,
+            })
+            .expect("readback");
+        let out = Some((target, readback));
+        let ball_at = |x: f32| {
+            let mut m = math::IDENTITY;
+            (m[0], m[5], m[10]) = (0.35, 0.35, 0.35);
+            (m[12], m[13], m[14]) = (x, 0.6, 0.3);
+            m
+        };
+        let spot = LightDesc {
+            position: [0.0, 2.5, 0.3],
+            range: 6.0,
+            color: [0.9, 0.95, 1.0],
+            intensity: 30.0,
+            spot: Some(SpotCone {
+                direction: [0.0, -1.0, 0.0],
+                inner: 0.5,
+                outer: 0.8,
+            }),
+            follows_lamps: false,
+            shadow: 1.0,
+        };
+        let (sp, sn, suv, sidx) = sphere_prop_data();
+        let mut balls = vec![];
+        for r in [&mut still, &mut live] {
+            r.create_light(&spot).expect("spot");
+            let mesh = r
+                .create_prop_mesh(
+                    &mut device,
+                    &MeshData {
+                        positions: &sp,
+                        normals: &sn,
+                        uvs: &suv,
+                        indices: &sidx,
+                    },
+                )
+                .expect("ball mesh");
+            let material = r
+                .create_prop_material(
+                    &mut device,
+                    &MaterialDesc {
+                        name: "ball".into(),
+                        base_color: [0.8, 0.3, 0.2, 1.0],
+                        ..MaterialDesc::default()
+                    },
+                )
+                .expect("ball material");
+            balls.push(
+                r.create_prop_instance(mesh, material, &ball_at(-0.4))
+                    .expect("ball"),
+            );
+        }
+        live.finish_ao(&mut device).expect("ao");
+        let view = View {
+            name: "pond".into(),
+            eye: [0.0, 2.0, 4.2],
+            target: [0.0, 0.2, 0.0],
+            fov: 48.0,
+            ..View::default()
+        };
+
+        let differ = |a: &[u8], b: &[u8]| {
+            a.chunks_exact(4)
+                .zip(b.chunks_exact(4))
+                .flat_map(|(p, q)| (0..3).map(move |c| p[c].abs_diff(q[c])))
+                .max()
+                .unwrap_or(0)
+        };
+        // A frame drawing the picture whole computes the water's light; the next keeps it.
+        let computed = frame_srgb(&mut device, &mut still, &view, &day, None);
+        let first = frame_srgb(&mut device, &mut live, &view, &day, out);
+        let s = live.last_frame_stats();
+        assert!(!s.world_cached && !s.water_kept && !s.water_statics_whole);
+        let d = differ(&first, &computed);
+        assert!(
+            d <= 1,
+            "the frame drawing the cached picture differs by {d}"
+        );
+        let held = frame_srgb(&mut device, &mut live, &view, &day, out);
+        let s = live.last_frame_stats();
+        assert!(s.world_cached && s.water_kept && s.water_statics_whole);
+        assert!(
+            held == first,
+            "the first frame keeping the water's light changed"
+        );
+        let mut settled = false;
+        for _ in 0..10 {
+            let frame = frame_srgb(&mut device, &mut live, &view, &day, out);
+            let s = live.last_frame_stats();
+            assert!(s.water_kept && !s.water_statics_whole);
+            settled |= s.cache_regions > 0 && s.water_statics_regions > 0;
+            assert!(frame == first, "a frame changed as the ball settled");
+        }
+        assert!(settled, "the ball never settled into the picture");
+
+        // The ball leaves the picture and moves on every frame, back over where its shadow was.
+        let mut frames = vec![];
+        for x in [0.5, 0.2, 0.5, -0.4] {
+            for (r, ball) in [&mut still, &mut live].into_iter().zip(&balls) {
+                r.set_prop_instance(*ball, &ball_at(x), true).expect("move");
+            }
+            let moved = frame_srgb(&mut device, &mut still, &view, &day, None);
+            let frame = frame_srgb(&mut device, &mut live, &view, &day, out);
+            let s = live.last_frame_stats();
+            assert!(s.water_kept && !s.water_statics_whole && s.water_footprints > 0);
+            assert!(!s.reshaded);
+            let d = differ(&frame, &moved);
+            assert!(d <= 1, "the frame with the ball at {x} differs by {d}");
+            frames.push(moved);
+        }
+        assert!(
+            frames[0] != computed && frames[1] != frames[0],
+            "the ball did not move"
+        );
+        assert!(frames[3] == computed, "the ball did not return");
+
+        // At night the lamp and the spot light the water.
+        let computed = frame_srgb(&mut device, &mut still, &view, &night, None);
+        let frame = frame_srgb(&mut device, &mut live, &view, &night, out);
+        assert!(!live.last_frame_stats().water_kept);
+        let d = differ(&frame, &computed);
+        assert!(d <= 1, "the night frame differs by {d}");
+        let frame = frame_srgb(&mut device, &mut live, &view, &night, out);
+        let s = live.last_frame_stats();
+        assert!(s.water_kept && s.water_statics_whole);
+        let d = differ(&frame, &computed);
+        assert!(d <= 1, "the held night frame differs by {d}");
+        for (r, ball) in [&mut still, &mut live].into_iter().zip(&balls) {
+            r.set_prop_instance(*ball, &ball_at(0.3), true)
+                .expect("move");
+        }
+        let moved = frame_srgb(&mut device, &mut still, &view, &night, None);
+        assert!(moved != computed, "the ball's shadow did not move at night");
+        let frame = frame_srgb(&mut device, &mut live, &view, &night, out);
+        assert!(live.last_frame_stats().water_footprints > 0);
+        let d = differ(&frame, &moved);
+        assert!(
+            d <= 1,
+            "the night frame after the ball moved differs by {d}"
+        );
+
+        let errs = device.validation_errors();
+        assert!(errs.is_empty(), "validation errors: {errs:?}");
+        still.destroy_props(&mut device);
+        live.destroy_props(&mut device);
+    }
+
+    /// Draws a frame of a renderer presenting to `target` (an offscreen RGBA8 texture standing
+    /// in for the canvas) and reads it back.
+    fn present(
+        device: &mut Device<'_>,
+        r: &mut Renderer,
+        view: &View,
+        env: &Environment,
+        (target, readback): (TextureId, BufferId),
+    ) -> Vec<u8> {
+        let mut enc = device.encoder();
+        r.encode(device, &mut enc, view, env, [0.0; 2], 0, Some(target))
+            .expect("frame");
+        enc.copy_texture_to_buffer(target, 0, 0, readback, 0);
+        device.submit(enc).expect("submit");
+        device.read_buffer(readback).expect("read back")
+    }
+
+    /// An offscreen RGBA8 target standing in for a `size` canvas, and a buffer to read it into.
+    fn canvas(device: &mut Device<'_>, (w, h): (u32, u32)) -> (TextureId, BufferId) {
+        let usage = TextureUsage::COLOR_TARGET | TextureUsage::COPY_SRC;
+        let target = device
+            .create_texture(&TextureDesc::new(w, h, Format::Rgba8Unorm, usage))
+            .expect("target");
+        let readback = device
+            .create_buffer(&BufferDesc {
+                size: u64::from(w * h * 4),
+                usage: BufferUsage::COPY_DST,
+                memory: Memory::Readback,
+            })
+            .expect("readback");
+        (target, readback)
+    }
+
+    /// Of two pictures, the share of pixels where a channel differs by more than one 8-bit step,
+    /// and the largest difference.
+    fn off_by_more_than_a_step(a: &[u8], b: &[u8]) -> (f64, u8) {
+        let (mut off, mut largest) = (0usize, 0u8);
+        for (p, q) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+            let d = p
+                .iter()
+                .zip(q)
+                .map(|(x, y)| x.abs_diff(*y))
+                .max()
+                .unwrap_or(0);
+            off += usize::from(d > 1);
+            largest = largest.max(d);
+        }
+        (off as f64 / (a.len() / 4) as f64, largest)
+    }
+
+    /// A Look whose grade changes nothing is tone-mapped without grading, and the picture is the
+    /// one its grade gives: within one 8-bit step on 99.9 % of pixels of the same frame graded a
+    /// hair from the identity, which takes the full grade.
+    #[test]
+    fn an_identity_grade_is_skipped_without_changing_the_picture() {
+        let Ok(mut device) = Device::headless() else {
+            return;
+        };
+        let mut world = World::default();
+        world.materials.push(Material {
+            name: "floor".into(),
+            base_color: [0.6, 0.58, 0.55, 1.0],
+            ..Material::default()
+        });
+        world.meshes.push(make_quad_mesh(0.0, 4.0));
+        world.instances.push(Instance {
+            mesh: 0,
+            transform: Transform(math::IDENTITY),
+        });
+        let identity = Look {
+            painterly: 0.0,
+            saturation: 1.0,
+            contrast: 1.0,
+            lift: [0.0; 3],
+            gain: [1.0; 3],
+            ..Look::default()
+        };
+        assert!(identity.grade_is_identity() && !Look::default().grade_is_identity());
+        let size = (128, 96);
+        let mut r = Renderer::new(
+            &mut device,
+            &world,
+            identity.clone(),
+            Quality::realtime(),
+            size,
+            Output::Surface(Format::Rgba8Unorm),
+        )
+        .expect("renderer");
+        r.finish_ao(&mut device).expect("ao");
+        let (sp, sn, suv, sidx) = sphere_prop_data();
+        let sphere = r
+            .create_prop_mesh(
+                &mut device,
+                &MeshData {
+                    positions: &sp,
+                    normals: &sn,
+                    uvs: &suv,
+                    indices: &sidx,
+                },
+            )
+            .expect("mesh");
+        // A glowing ball by a matte one.
+        for (color, emissive, x) in [
+            ([0.2, 0.5, 0.9, 1.0], [6.0, 3.0, 1.0], 0.5),
+            ([0.8; 4], [0.0; 3], -0.6),
+        ] {
+            let material = r
+                .create_prop_material(
+                    &mut device,
+                    &MaterialDesc {
+                        name: "ball".into(),
+                        base_color: color,
+                        emissive,
+                        ..MaterialDesc::default()
+                    },
+                )
+                .expect("material");
+            let mut at = math::IDENTITY;
+            for k in [0, 5, 10] {
+                at[k] = 0.4;
+            }
+            at[12..15].copy_from_slice(&[x, 0.45, 0.0]);
+            r.create_prop_instance(sphere, material, &at).expect("ball");
+        }
+        let view = View {
+            name: "balls".into(),
+            eye: [0.0, 1.4, 2.6],
+            target: [0.0, 0.4, 0.0],
+            fov: 45.0,
+            ..View::default()
+        };
+        let env = Environment::resolve(
+            &TimeOfDay {
+                hours: 17.5,
+                ..TimeOfDay::default()
+            },
+            &Weather::default(),
+            &identity.palette,
+            1.0,
+        );
+        let out = canvas(&mut device, size);
+        let hair = 1.0 + f32::EPSILON;
+        for tonemap in ToneMap::ALL {
+            let identity = Look {
+                tonemap,
+                ..identity.clone()
+            };
+            r.set_look(identity.clone());
+            let plain = present(&mut device, &mut r, &view, &env, out);
+            for graded in [
+                Look {
+                    saturation: hair,
+                    ..identity.clone()
+                },
+                Look {
+                    contrast: hair,
+                    ..identity.clone()
+                },
+            ] {
+                assert!(!graded.grade_is_identity());
+                r.set_look(graded);
+                let full = present(&mut device, &mut r, &view, &env, out);
+                let (off, largest) = off_by_more_than_a_step(&plain, &full);
+                assert!(
+                    off <= 0.001,
+                    "{tonemap:?}: {:.3} % of pixels off by more than a step (up to {largest})",
+                    off * 100.0
+                );
+            }
+        }
+        let errs = device.validation_errors();
+        assert!(errs.is_empty(), "validation errors: {errs:?}");
+        r.destroy_props(&mut device);
+    }
+
+    /// The presented picture drawn through the caches frame after frame (the cached picture, the
+    /// kept props' shadow maps) against the same scene drawn whole: a second renderer whose
+    /// cached picture and props' shadow maps are thrown away before each of its frames. They
+    /// agree within one 8-bit step on 99.9 % of pixels while a prop that casts no shadow moves,
+    /// while a caster rests, is re-posed by a hair every frame (as a breathing character) and
+    /// moves a long way.
+    #[test]
+    fn cached_frames_match_frames_drawn_whole() {
+        use crate::render::lights::{LightDesc, SpotCone};
+        let Ok(mut device) = Device::headless() else {
+            return;
+        };
+        let mut world = World::default();
+        world.materials.push(Material {
+            name: "floor".into(),
+            base_color: [0.6, 0.58, 0.55, 1.0],
+            roughness: 0.8,
+            alpha: AlphaMode::Opaque,
+            shading: Shading::Standard,
+            ..Material::default()
+        });
+        world.meshes.push(make_quad_mesh(0.0, 4.0));
+        world.instances.push(Instance {
+            mesh: 0,
+            transform: Transform(math::IDENTITY),
+        });
+        // The fused tone-map output, as the table draws.
+        let look = Look {
+            painterly: 0.0,
+            ..Look::default()
+        };
+        let (w, h) = (128, 96);
+        let view = View {
+            name: "table".into(),
+            eye: [0.0, 1.9, 2.4],
+            target: [0.0, 0.7, 0.0],
+            fov: 45.0,
+            ..View::default()
+        };
+        let env = Environment::resolve(
+            &TimeOfDay {
+                hours: 15.0,
+                ..TimeOfDay::default()
+            },
+            &Weather::default(),
+            &look.palette,
+            1.0,
+        );
+        let (sp, sn, suv, sidx) = sphere_prop_data();
+        let place = |x: f32, z: f32, size: f32| {
+            let mut m = math::IDENTITY;
+            for k in [0, 5, 10] {
+                m[k] = size;
+            }
+            m[12..15].copy_from_slice(&[x, 1.15, z]);
+            m
+        };
+        // A table slab that settles into the cached picture, a figure over it casting shadows,
+        // a pawn that casts none, and a spot light casting shadows.
+        let make = |device: &mut Device<'_>| {
+            let mut r = Renderer::new(
+                device,
+                &world,
+                look.clone(),
+                Quality::realtime(),
+                (w, h),
+                Output::Surface(Format::Rgba8Unorm),
+            )
+            .expect("renderer");
+            r.finish_ao(device).expect("ao");
+            let sphere = r
+                .create_prop_mesh(
+                    device,
+                    &MeshData {
+                        positions: &sp,
+                        normals: &sn,
+                        uvs: &suv,
+                        indices: &sidx,
+                    },
+                )
+                .expect("mesh");
+            let mut material = |name: &str, base_color, casts_shadow| {
+                let desc = MaterialDesc {
+                    name: name.into(),
+                    base_color,
+                    casts_shadow,
+                    ..MaterialDesc::default()
+                };
+                r.create_prop_material(device, &desc).expect("material")
+            };
+            let wood = material("table", [0.5, 0.3, 0.2, 1.0], true);
+            let skin = material("figure", [0.8, 0.6, 0.5, 1.0], true);
+            let glass = material("pawn", [0.3, 0.5, 0.8, 1.0], false);
+            let mut top = math::IDENTITY;
+            top[0] = 1.2;
+            top[5] = 0.06;
+            top[10] = 0.8;
+            top[13] = 0.75;
+            r.create_prop_instance(sphere, wood, &top).expect("table");
+            let figure = r
+                .create_prop_instance(sphere, skin, &place(0.0, 0.1, 0.25))
+                .expect("figure");
+            let pawn = r
+                .create_prop_instance(sphere, glass, &place(-0.45, 0.2, 0.1))
+                .expect("pawn");
+            r.create_light(&LightDesc {
+                position: [0.3, 3.0, 0.4],
+                range: 8.0,
+                color: [1.0, 0.9, 0.8],
+                intensity: 6.0,
+                spot: Some(SpotCone {
+                    direction: [-0.1, -1.0, -0.1],
+                    inner: 0.35,
+                    outer: 0.6,
+                }),
+                follows_lamps: false,
+                shadow: 1.0,
+            })
+            .expect("spot");
+            (r, [figure, pawn], canvas(device, (w, h)))
+        };
+        let (mut cached, cached_props, cached_out) = make(&mut device);
+        let (mut whole, whole_props, whole_out) = make(&mut device);
+
+        // Draws a frame of both with the figure `figure` metres along and the pawn `pawn`
+        // metres along, compares them, and returns what the cached frame kept and drew.
+        let mut frame = |device: &mut Device<'_>, figure: f32, pawn: f32| {
+            for (r, [f, p]) in [(&mut cached, cached_props), (&mut whole, whole_props)] {
+                r.set_prop_instance(f, &place(figure, 0.1, 0.25), true)
+                    .expect("figure");
+                r.set_prop_instance(p, &place(pawn - 0.45, 0.2, 0.1), true)
+                    .expect("pawn");
+            }
+            let a = present(device, &mut cached, &view, &env, cached_out);
+            whole.world_cache = None;
+            whole.prop_shadows_for = None;
+            let b = present(device, &mut whole, &view, &env, whole_out);
+            let (off, largest) = off_by_more_than_a_step(&a, &b);
+            assert!(
+                off <= 0.001,
+                "figure at {figure} m, pawn at {pawn} m: {:.3} % of pixels off by more than a \
+                 step (up to {largest})",
+                off * 100.0
+            );
+            (cached.last_frame_stats(), a)
+        };
+
+        frame(&mut device, 0.0, 0.0);
+        // The pawn moves every frame and the table settles: the maps are kept.
+        for k in 1..12 {
+            let stats = frame(&mut device, 0.0, k as f32 * 1e-3).0;
+            assert!(stats.prop_shadows_kept && !stats.reshaded, "frame {k}");
+        }
+        // The figure re-posed by a hair (a twentieth of a millimetre) every frame: drawn again.
+        for k in 1..6 {
+            let stats = frame(&mut device, k as f32 * 5e-5, 0.0).0;
+            assert!(!stats.prop_shadows_kept, "hair {k}");
+        }
+        // Resting where the maps were last drawn, it settles into the cached picture under them.
+        for k in 0..12 {
+            let stats = frame(&mut device, 25e-5, 0.0).0;
+            assert!(stats.prop_shadows_kept && !stats.reshaded, "rest {k}");
+        }
+        // Moved a long way, its shadow moves over the cached picture, shaded again.
+        let before = frame(&mut device, 25e-5, 0.0).1;
+        let (stats, after) = frame(&mut device, 0.3, 0.0);
+        assert!(!stats.prop_shadows_kept && stats.reshaded);
+        assert!(off_by_more_than_a_step(&before, &after).0 > 0.01);
+
+        let errs = device.validation_errors();
+        assert!(errs.is_empty(), "validation errors: {errs:?}");
+        for r in [&mut cached, &mut whole] {
+            r.destroy_props(&mut device);
+        }
     }
 }

@@ -35,6 +35,8 @@ const PAIRS: &[(&str, &str, Option<&str>)] = &[
     (POST, "vs_fullscreen", Some("fs_bloom_down")),
     (POST, "vs_fullscreen", Some("fs_bloom_up")),
     (POST, "vs_fullscreen", Some("fs_tonemap")),
+    (POST, "vs_fullscreen", Some("fs_tonemap_output")),
+    (POST, "vs_fullscreen", Some("fs_tonemap_output_plain")),
     (POST, "vs_fullscreen", Some("fs_paint")),
     (POST, "vs_fullscreen", Some("fs_final")),
 ];

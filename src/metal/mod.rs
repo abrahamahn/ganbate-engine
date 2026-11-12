@@ -334,6 +334,7 @@ impl<'w> Gpu<'w> {
             uniform_offset_alignment: 256,
             storage_offset_alignment: 256,
             depth_filterable: false,
+            float32_readable: true,
             texture_compression_bc: self.bc_compression,
             texture_compression_astc: self.astc_compression,
         }

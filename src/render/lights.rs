@@ -4,8 +4,9 @@
 //! every hour unless it asks to follow the lamps (lit only as the evening lights the lamps).
 //!
 //! A spot can cast shadows: the opaque props the game places (their materials casting shadows)
-//! block its light, drawn each frame into a shadow map of its own seen from the light (a layer of
-//! the renderer's light shadow map, [`Quality::light_shadow_size`] texels a side). The cooked
+//! block its light, drawn into a shadow map of its own seen from the light (a layer of the
+//! renderer's light shadow map, [`Quality::light_shadow_size`] texels a side) whenever a caster
+//! moved or the light's view changed, and kept from frame to frame otherwise. The cooked
 //! world is lit by it but does not block it, as it blocks none of its lamps.
 //!
 //! The light buffer holds the world's lamps, then room for [`MAX_GAME_LIGHTS`] game lights; a

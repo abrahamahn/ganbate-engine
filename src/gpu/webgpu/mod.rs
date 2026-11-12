@@ -338,6 +338,7 @@ impl<'w> Gpu<'w> {
             storage_offset_alignment: u64::from(self.info.storage_align),
             // WebGPU samples depth32float only through comparison or non-filtering samplers.
             depth_filterable: false,
+            float32_readable: self.info.float32_filterable,
             texture_compression_bc: self.info.bc_compression,
             texture_compression_astc: self.info.astc_compression,
         }

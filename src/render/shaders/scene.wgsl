@@ -218,6 +218,29 @@ fn moved_footprint(map: u32, c: vec4f) -> bool {
   return false;
 }
 
+// Whether the key light's shadow lookups at `world`, moved off its surface along `n` as `shadow`
+// moves them, can see what moved.
+fn key_moved(world: vec3f, n: vec3f) -> bool {
+  let grow = 1.0 + 1.5 * (1.0 - abs(dot(n, frame.key_dir.xyz)));
+  let c0 = frame.shadow0 * vec4f(world + n * (frame.cascades.y * grow), 1.0);
+  let c1 = frame.shadow1 * vec4f(world + n * (frame.cascades.z * grow), 1.0);
+  return moved_footprint(0u, c0) || moved_footprint(1u, c1);
+}
+
+// Whether what moved since the water's lamp light and shadow were kept (`reshade`, bound to its
+// own block in `fs_water`) can have changed them at `world` (`n` as `shadow` takes it): the test
+// `fs_reshade_mask` makes before comparing shadows, but for points behind a game light, whose
+// lookups find none of its shadows (`light_shadow`) short of a few centimetres from the light.
+fn water_shadows_moved(world: vec3f, n: vec3f) -> bool {
+  if (reshade.head.x == 0u) {
+    return false;
+  }
+  let l0 = frame.light_shadow0 * vec4f(world, 1.0);
+  let l1 = frame.light_shadow1 * vec4f(world, 1.0);
+  return key_moved(world, n) || (l0.w > 0.0 && moved_footprint(2u, l0))
+    || (l1.w > 0.0 && moved_footprint(3u, l1));
+}
+
 // What a game light's shadow lets through to a surface, as `lamp_light` takes it (1 where the
 // light does not reach it, or casts no shadow).
 fn game_light_share(world: vec3f, n: vec3f, l: Light, frag: vec2f) -> f32 {
@@ -273,14 +296,9 @@ fn game_light_share(world: vec3f, n: vec3f, l: Light, frag: vec2f) -> f32 {
       }
     }
   }
-  if (was.w > 0.5) {
-    let grow = 1.0 + 1.5 * (1.0 - abs(dot(n, frame.key_dir.xyz)));
-    let c0 = frame.shadow0 * vec4f(world + n * (frame.cascades.y * grow), 1.0);
-    let c1 = frame.shadow1 * vec4f(world + n * (frame.cascades.z * grow), 1.0);
-    if ((moved_footprint(0u, c0) || moved_footprint(1u, c1))
-        && abs(shadow(world, n, length(frame.camera.xyz - world), frag.xy) - was.x) > changed) {
-      o.depth = 0.0;
-    }
+  if (was.w > 0.5 && key_moved(world, n)
+      && abs(shadow(world, n, length(frame.camera.xyz - world), frag.xy) - was.x) > changed) {
+    o.depth = 0.0;
   }
   return o;
 }
@@ -721,6 +739,17 @@ fn blended(c: vec4f) -> vec4f {
   return c;
 }
 
+// The water's lamp light and key-light shadow depend on where its surface lies and which way it
+// faces before its waves move it, so they hold while the cached picture holds: `fs_water_static`
+// writes them (lamps rgb, shadow a) to `cache_water` when the picture changes, and `fs_water`
+// (`shade_scene` with `WATER_STATICS` set) reads them there instead of looping over the lamps
+// and filtering the shadow maps every frame, but where props moved since can have changed
+// their shadows (`water_shadows_moved`), where it computes them.
+@group(0) @binding(19) var cache_water: texture_2d<f32>;
+const WATER_STATICS: bool = false;
+// The lamp light and shadow a pixel's shading took (rgb, a), for `fs_water_static`.
+var<private> lamps_and_shadow: vec4f;
+
 // The scene's surface shading. `cut` keeps the alpha test and the reflection's clip under the
 // water; without them (`fs_main_opaque`) the shader never discards, so the GPU can reject hidden
 // fragments before shading them (early depth, or a tiler's hidden-surface removal).
@@ -804,11 +833,25 @@ fn shade_scene(in: VsOut, front: bool, frag: vec4f, cut: bool) -> FsOut {
     }
   }
 
-  let sh = shadow(in.world, geo_n, dist, frag.xy);
+  let foliage = shading == 1;
+  var sh: f32;
+  var lamps: vec3f;
+  if (WATER_STATICS) {
+    if (water_shadows_moved(in.world, geo_n)) {
+      sh = shadow(in.world, geo_n, dist, frag.xy);
+      lamps = lamp_light(in.world, n, frag.xy, foliage);
+    } else {
+      let kept = textureLoad(cache_water, vec2i(frag.xy), 0);
+      lamps = kept.rgb;
+      sh = kept.a;
+    }
+  } else {
+    sh = shadow(in.world, geo_n, dist, frag.xy);
+    lamps = lamp_light(in.world, n, frag.xy, foliage);
+  }
   cast_shadows.x = sh;
   cast_shadows.w = 1.0;
-  let foliage = shading == 1;
-  let lamps = lamp_light(in.world, n, frag.xy, foliage);
+  lamps_and_shadow = vec4f(lamps, sh);
 
   if (shading == 2) {
     let t = frame.camera.w;
@@ -982,6 +1025,20 @@ fn cache_out(o: FsOut) -> CacheOut {
 
 @fragment fn fs_main_opaque_cache(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> CacheOut {
   return cache_out(shade_scene(in, front, frag, false));
+}
+
+// The water's lamp light and shadow, shaded as `fs_main_opaque` shades the water, into
+// `cache_water`.
+@fragment fn fs_water_static(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> @location(0) vec4f {
+  _ = shade_scene(in, front, frag, false);
+  return lamps_and_shadow;
+}
+
+// The water in a frame that keeps the cached picture, its lamp light and shadow read from
+// `cache_water` where no prop moved since they were kept (compiled with `WATER_STATICS`; its
+// group binds `reshade` to the water's own block).
+@fragment fn fs_water(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> FsOut {
+  return shade_scene(in, front, frag, false);
 }
 
 // ---------------------------------------------------------------- grass and flowers

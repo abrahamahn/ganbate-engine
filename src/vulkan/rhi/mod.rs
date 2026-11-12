@@ -411,6 +411,7 @@ impl<'w> Gpu<'w> {
             uniform_offset_alignment: l.minUniformBufferOffsetAlignment,
             storage_offset_alignment: l.minStorageBufferOffsetAlignment,
             depth_filterable: self.format_features(126) & resources::FEATURE_LINEAR != 0,
+            float32_readable: true,
             texture_compression_bc: self.features.bc_compression,
             texture_compression_astc: self.features.astc_compression,
         }
