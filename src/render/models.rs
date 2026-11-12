@@ -3,10 +3,10 @@
 //! instance has a pose ([`crate::anim::Pose`]) and one prop instance per primitive of every mesh
 //! node, and skinned or morphed primitives get meshes of their own. A skinned primitive follows
 //! its joints on the GPU ([`Renderer::set_prop_mesh_skin`]): [`Renderer::update_model_instance`]
-//! hands it the pose's joint matrices, and morphs a primitive's vertices on the CPU only when
-//! the weight of a target that moves them changed. A morphed primitive's moved vertices are
-//! gathered at the front of its vertices as it is uploaded ([`anim::gather_morphed`]), so a
-//! morph rewrites one short run of them.
+//! hands it the pose's joint matrices (one copy per skin, which all its primitives share), and
+//! morphs a primitive's vertices on the CPU only when the weight of a target that moves them
+//! changed. A morphed primitive's moved vertices are gathered at the front of its vertices as it
+//! is uploaded ([`anim::gather_morphed`]), so a morph rewrites one short run of them.
 //!
 //! Textures are the host's: it decodes the model's images (browsers decode PNG, JPEG and WebP
 //! natively) into prop textures and passes them in, one per image.
@@ -480,22 +480,21 @@ impl Renderer {
             .ok_or("the instance's model was destroyed")?
             .model;
         let globals = e.pose.globals(model);
-        // Each skin's joint matrices once, however many primitives follow them.
-        let mut skins: Vec<(usize, Vec<M4>)> = vec![];
-        let mut joints = vec![];
+        // Each skin's joint matrices once, shared by every primitive that follows them.
+        let mut skins: Vec<(usize, Vec<M4>, Vec<PropInstance>)> = vec![];
         let mut morphs = vec![];
         for (k, part) in e.parts.iter().enumerate() {
             let Some(own) = part.own else { continue };
             let p = &model.meshes[part.mesh].primitives[part.primitive];
             if let Some(s) = model.nodes[part.node].skin.filter(|_| !p.joints.is_empty()) {
-                let at = match skins.iter().position(|(skin, _)| *skin == s) {
-                    Some(at) => at,
-                    None => {
-                        skins.push((s, anim::joint_matrices(model, s, &globals)));
-                        skins.len() - 1
-                    }
-                };
-                joints.push((part.instance, at));
+                match skins.iter_mut().find(|(skin, ..)| *skin == s) {
+                    Some((.., parts)) => parts.push(part.instance),
+                    None => skins.push((
+                        s,
+                        anim::joint_matrices(model, s, &globals),
+                        vec![part.instance],
+                    )),
+                }
             }
             let weights = &e.pose.weights[part.node];
             if !p.targets.is_empty() && part.morphed != *weights {
@@ -528,8 +527,8 @@ impl Renderer {
                 part.morphed = weights;
             }
         }
-        for (instance, at) in joints {
-            self.set_prop_instance_joints(instance, &skins[at].1)?;
+        for (_, joints, parts) in &skins {
+            self.share_prop_instance_joints(parts, joints)?;
         }
         self.model_instance_entry(i)?.globals = globals;
         self.place_model_parts(i)

@@ -113,6 +113,8 @@ export interface GanbateCacheStats {
   readonly waterStaticsRegions: number;
   /** Footprints of moved props' shadows within which the water computed them. */
   readonly waterFootprints: number;
+  /** Pixels of the region moved props' shadows were sought in and shaded again within (0: none). */
+  readonly reshadePixels: number;
 }
 
 export interface GanbateStereoViews {

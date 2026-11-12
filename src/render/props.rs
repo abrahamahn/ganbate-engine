@@ -10,9 +10,14 @@
 //! their triangles for [`Renderer::pick`].
 //!
 //! A skinned mesh ([`Renderer::set_prop_mesh_skin`]) keeps its vertices' joints and weights in
-//! one buffer shared by every skinned mesh; each instance of it carries its joint matrices
-//! ([`Renderer::set_prop_instance_joints`]), which go to the frame slot's joint buffer, and the
-//! vertex stages move its vertices on the GPU (`skin_vertex` in common.wgsl).
+//! one buffer shared by every skinned mesh; each instance of it follows joint matrices
+//! ([`Renderer::set_prop_instance_joints`]; a model instance's skinned parts share their skin's),
+//! which go to the frame slot's joint buffer once a frame, and the vertex stages move its
+//! vertices on the GPU (`skin_vertex` in common.wgsl).
+//!
+//! An instance is posed again (its signature, bounds and shadow corners) only when it was set or
+//! what it depends on changed, and each frame slot rewrites only the rows of its buffers that
+//! differ from what they hold.
 //!
 //! Handles are generational: using one after its object was destroyed is an error, never a
 //! different object.
@@ -20,7 +25,7 @@ use std::collections::HashMap;
 
 use super::View;
 use super::look::SurfaceModel;
-use super::math::{self, M4, V3};
+use super::math::{self, Frustum, M4, V3};
 use super::renderer::{Fnv, Renderer};
 use super::scene::MaterialData;
 use crate::gpu::pool::Pool;
@@ -386,6 +391,93 @@ pub(super) struct MeshEntry {
     /// How far, at most, a vertex moved in model space since the props' shadow maps were last
     /// drawn (each update's largest move, summed).
     drift: f32,
+    /// What the next morph of the range the last one rewrote needs ([`Morph`]).
+    morph: Option<Morph>,
+}
+
+/// What a mesh keeps of the range its morphs rewrite (`first..end`), frame after frame, so that
+/// a morph visits only the range's vertices: the bounds and [`zeros`] of the vertices outside
+/// it, and for a skinned mesh the range's vertices each joint moves, as `(joint, vertex)` by
+/// joint, each joint's in the order [`joint_boxes`] meets them.
+struct Morph {
+    first: usize,
+    end: usize,
+    outside: (V3, V3),
+    outside_zeros: [u8; 3],
+    moves: Vec<(u32, u32)>,
+}
+
+impl Morph {
+    /// What morphs of `first..end` need of a mesh with these `positions` (the range's as
+    /// morphed) and, when skinned, the range's skin `records`.
+    fn new(positions: &[V3], first: usize, end: usize, records: Option<&[[f32; 4]]>) -> Self {
+        let (before, after) = (&positions[..first], &positions[end..]);
+        let ((blo, bhi), (alo, ahi)) = (bounds(before), bounds(after));
+        let mut moves = vec![];
+        for (v, pair) in records.unwrap_or(&[]).chunks_exact(2).enumerate() {
+            for (j, w) in pair[0].iter().zip(pair[1]) {
+                if w <= 0.0 {
+                    continue;
+                }
+                moves.push((*j as u32, v as u32));
+            }
+        }
+        moves.sort_by_key(|&(j, _)| j);
+        let (bz, az) = (zeros(before), zeros(after));
+        Self {
+            first,
+            end,
+            outside: (
+                std::array::from_fn(|k| blo[k].min(alo[k])),
+                std::array::from_fn(|k| bhi[k].max(ahi[k])),
+            ),
+            outside_zeros: std::array::from_fn(|k| bz[k] | az[k]),
+            moves,
+        }
+    }
+
+    /// The bounds of the mesh with the range at `moved`: those of the range and of the rest
+    /// joined, the bits [`bounds`] of all `positions` gives (which it makes when a bound of 0
+    /// could hold either zero).
+    fn bounds(&self, positions: &[V3], moved: &[V3]) -> (V3, V3) {
+        let ((olo, ohi), (mlo, mhi)) = (self.outside, bounds(moved));
+        let lo: V3 = std::array::from_fn(|k| olo[k].min(mlo[k]));
+        let hi: V3 = std::array::from_fn(|k| ohi[k].max(mhi[k]));
+        let unsure = (0..3).any(|k| lo[k] == 0.0 || hi[k] == 0.0) && {
+            let z = zeros(moved);
+            (0..3).any(|k| (self.outside_zeros[k] | z[k]) == 3 && (lo[k] == 0.0 || hi[k] == 0.0))
+        };
+        if unsure { bounds(positions) } else { (lo, hi) }
+    }
+
+    /// Widens `held` (a skinned mesh's joint boxes) to hold the range at `moved`, as joining
+    /// the [`joint_boxes`] of `moved` would; returns how many boxes changed.
+    fn widen(&self, held: &mut [Option<(V3, V3)>], moved: &[V3]) -> u32 {
+        let mut changed = 0;
+        for run in self.moves.chunk_by(|a, b| a.0 == b.0) {
+            let Some(h) = held.get_mut(run[0].0 as usize) else {
+                continue;
+            };
+            let first = moved[run[0].1 as usize];
+            let b = run.iter().fold((first, first), |b, &(_, v)| {
+                let p = moved[v as usize];
+                (
+                    std::array::from_fn(|k| b.0[k].min(p[k])),
+                    std::array::from_fn(|k| b.1[k].max(p[k])),
+                )
+            });
+            let was = *h;
+            let x = h.get_or_insert(b);
+            *x = (
+                std::array::from_fn(|k| x.0[k].min(b.0[k])),
+                std::array::from_fn(|k| x.1[k].max(b.1[k])),
+            );
+            if *h != was {
+                changed += 1;
+            }
+        }
+        changed
+    }
 }
 
 /// Where a skinned mesh's vertices' joints and weights lie in the shared skin records.
@@ -437,14 +529,22 @@ struct InstanceEntry {
     visible: bool,
     /// Pick layers (bits); 0 is never picked.
     pick: u32,
-    /// A skinned mesh's joint matrices for this instance (empty: drawn as modelled).
-    joints: Vec<M4>,
+    /// The joint matrices its skinned mesh follows (`None`: drawn as modelled), which other
+    /// instances can share ([`JointSet`]).
+    joints: Option<u32>,
+    /// Its place, visibility, tint, joints or material were set since it was last posed.
+    dirty: bool,
+    /// What it depends on beyond itself as of its last pose ([`stamp`]): it is posed
+    /// again when that changed or it is `dirty`, and otherwise stands as it was.
+    stamp: [u32; 4],
     /// What its picture depends on as of the last frame ([`signature`]), and for how many
     /// frames since then it has stayed the same.
     sig: u64,
     still: u32,
     /// Its world bounds as drawn this frame (none while hidden or incomplete).
     world_bounds: Option<(V3, V3)>,
+    /// Its mesh's box placed by its model, while shown: what fits the shadow cascades.
+    modelled: (V3, V3),
     /// Where its image and shadows lie in the cached picture, while it is drawn there.
     cached: Option<Rect>,
     shadow: ShadowTrack,
@@ -458,6 +558,8 @@ struct ShadowTrack {
     /// and the most any matrix placing them stretches a length.
     corners: Vec<V3>,
     stretch: f32,
+    /// Its [`shadow_key`] as posed.
+    key: u64,
     /// Its shadow as the maps hold it, while they hold one.
     drawn: Option<DrawnShadow>,
 }
@@ -467,6 +569,39 @@ struct DrawnShadow {
     key: u64,
     corners: Vec<V3>,
     bounds: (V3, V3),
+}
+
+/// Joint matrices one or more instances follow: every skinned part of a model instance shares
+/// its skin's, so they are set, compared and written to the frame's joint buffer once.
+struct JointSet {
+    matrices: Vec<M4>,
+    /// Counts changes to the matrices; `digest` hashes them as of revision `digested`.
+    revision: u32,
+    digest: u64,
+    digested: Option<u32>,
+    /// Instances that follow it (it goes with the last).
+    users: u32,
+    /// Its first row in the joint rows of frame `placed` ([`Renderer::prepare_props`]).
+    first: u32,
+    placed: u64,
+}
+
+/// The joint matrices an instance follows.
+fn joints_of<'a>(sets: &'a Pool<JointSet>, inst: &InstanceEntry) -> &'a [M4] {
+    inst.joints
+        .and_then(|id| sets.get(id))
+        .map_or(&[], |s| &s.matrices[..])
+}
+
+/// A hash of joint matrices, a number at a time (bijective in each, so one changed number
+/// always changes it).
+fn digest_matrices(matrices: &[M4]) -> u64 {
+    matrices
+        .as_flattened()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325 ^ matrices.len() as u64, |h, x| {
+            (h ^ u64::from(x.to_bits())).wrapping_mul(0x0100_0000_01b3)
+        })
 }
 
 /// One instanced draw of this frame: instances `first..first + count` of the buffer.
@@ -480,6 +615,10 @@ pub(super) struct Batch {
     /// Its instances are drawn into the cached picture rather than over it each frame.
     settled: bool,
 }
+
+/// Runs of a batch's instances drawn apart at most ([`Renderer::instance_runs`]); a batch whose
+/// instances in view lie in more is drawn whole.
+const MAX_INSTANCE_RUNS: usize = 4;
 
 /// Which opaque prop batches a draw takes: all of them, those in the cached picture, or those
 /// drawn over it each frame.
@@ -514,21 +653,28 @@ const SETTLE_FRAMES: u32 = 8;
 /// fiftieth of a texel up to 0.1 %. So the maps are kept only while every caster stands still.
 pub(super) const SHADOW_DRIFT_TEXELS: f32 = 0.0;
 
+/// Hashes the bytes of `values` (as [`f32_bytes`] gives them, without making them).
+fn hash_f32s(h: &mut Fnv, values: &[f32]) {
+    for v in values {
+        h.write(&v.to_le_bytes());
+    }
+}
+
 /// What an instance's picture depends on besides the frame: where and how it is drawn, its
-/// joints, and its mesh, material and textures as they stand.
+/// joints (`joints`, their [`digest_matrices`]; 0 without), and its mesh, material and textures
+/// as they stand.
 fn signature(
     inst: &InstanceEntry,
+    joints: u64,
     mesh: &MeshEntry,
     mat: &MaterialEntry,
     edits: &HashMap<u32, u32>,
 ) -> u64 {
     let mut h = Fnv::new();
     h.write(&[u8::from(inst.visible)]);
-    h.write(&f32_bytes(&inst.model));
-    h.write(&f32_bytes(&inst.tint));
-    for j in &inst.joints {
-        h.write(&f32_bytes(j));
-    }
+    hash_f32s(&mut h, &inst.model);
+    hash_f32s(&mut h, &inst.tint);
+    h.write(&joints.to_le_bytes());
     for n in [inst.mesh.0, mesh.revision, inst.material.0, mat.revision] {
         h.write(&n.to_le_bytes());
     }
@@ -558,10 +704,10 @@ fn casts(inst: &InstanceEntry, mat: &MaterialEntry) -> bool {
     inst.world_bounds.is_some() && mat.layer() == Layer::Opaque && mat.desc.casts_shadow
 }
 
-/// Whether an instance's mesh is drawn moved by its joints (as `prepare_props` writes it).
-fn skinned(inst: &InstanceEntry, mesh: &MeshEntry) -> bool {
+/// Whether a mesh is drawn moved by an instance's `joints` (as `prepare_props` writes it).
+fn skinned(joints: &[M4], mesh: &MeshEntry) -> bool {
     mesh.skin
-        .is_some_and(|s| inst.joints.len() > usize::from(s.max_joint))
+        .is_some_and(|s| joints.len() > usize::from(s.max_joint))
 }
 
 /// What decides a caster's shadow as a whole rather than by how far it moved: its mesh and the
@@ -569,19 +715,22 @@ fn skinned(inst: &InstanceEntry, mesh: &MeshEntry) -> bool {
 /// and an alpha-tested material's cutoff, alpha and texture.
 fn shadow_key(
     inst: &InstanceEntry,
+    joints: &[M4],
     mesh: &MeshEntry,
     mat: &MaterialEntry,
     edits: &HashMap<u32, u32>,
 ) -> u64 {
+    let skinned = skinned(joints, mesh);
     let mut h = Fnv::new();
-    for n in [inst.mesh.0, mesh.shape, u32::from(skinned(inst, mesh))] {
+    for n in [inst.mesh.0, mesh.shape, u32::from(skinned)] {
         h.write(&n.to_le_bytes());
     }
-    if !skinned(inst, mesh) {
-        h.write(&f32_bytes(&[mesh.min, mesh.max].concat()));
+    if !skinned {
+        hash_f32s(&mut h, &mesh.min);
+        hash_f32s(&mut h, &mesh.max);
     }
     if let Some(cutoff) = mat.desc.alpha_cutoff {
-        h.write(&f32_bytes(&[cutoff, mat.desc.base_color[3]]));
+        hash_f32s(&mut h, &[cutoff, mat.desc.base_color[3]]);
         if let Some(t) = mat.desc.base_texture {
             h.write(&t.0.to_le_bytes());
             h.write(&edits.get(&t.0).copied().unwrap_or(0).to_le_bytes());
@@ -596,19 +745,11 @@ fn shadow_key(
 /// its joints' boxes when skinned, weights summing to one), and the matrices placing a box are
 /// affine, so none moved farther than those corners did, plus its mesh's morphing stretched by
 /// the matrices placing it now.
-fn shadow_drift(
-    inst: &InstanceEntry,
-    mesh: &MeshEntry,
-    mat: &MaterialEntry,
-    edits: &HashMap<u32, u32>,
-) -> Option<f32> {
+fn shadow_drift(inst: &InstanceEntry, mesh: &MeshEntry, mat: &MaterialEntry) -> Option<f32> {
     let track = &inst.shadow;
     match (&track.drawn, casts(inst, mat)) {
         (None, false) => None,
-        (Some(d), true)
-            if d.key == shadow_key(inst, mesh, mat, edits)
-                && d.corners.len() == track.corners.len() =>
-        {
+        (Some(d), true) if d.key == track.key && d.corners.len() == track.corners.len() => {
             Some(farthest_move(&d.corners, &track.corners) + track.stretch * mesh.drift)
         }
         _ => Some(f32::INFINITY),
@@ -761,7 +902,6 @@ pub(super) fn track_cached_props(
         instances,
         meshes,
         materials,
-        texture_edits,
         ..
     } = props;
     for (_, inst) in instances.iter_mut() {
@@ -783,7 +923,7 @@ pub(super) fn track_cached_props(
         }
         let drift = meshes
             .get(inst.mesh.0)
-            .and_then(|mesh| shadow_drift(inst, mesh, mat, texture_edits));
+            .and_then(|mesh| shadow_drift(inst, mesh, mat));
         if let Some(drift) = drift.filter(|d| *d != 0.0) {
             let then = inst.shadow.drawn.as_ref().map(|d| d.bounds);
             let reach = then.into_iter().chain(inst.world_bounds).reduce(|a, b| {
@@ -826,7 +966,6 @@ pub(super) fn commit_prop_shadows(props: &mut Props) {
         instances,
         meshes,
         materials,
-        texture_edits,
         vacated_boxes,
         ..
     } = props;
@@ -837,8 +976,8 @@ pub(super) fn commit_prop_shadows(props: &mut Props) {
             materials.get(inst.material.0),
             inst.world_bounds,
         ) {
-            (Some(mesh), Some(mat), Some(bounds)) if casts(inst, mat) => {
-                Some((shadow_key(inst, mesh, mat, texture_edits), bounds))
+            (Some(_), Some(mat), Some(bounds)) if casts(inst, mat) => {
+                Some((inst.shadow.key, bounds))
             }
             _ => None,
         };
@@ -891,15 +1030,15 @@ fn joint_boxes(positions: &[V3], records: &[[f32; 4]]) -> Vec<Option<(V3, V3)>> 
 /// are its world bounds): its mesh's box placed by its model, or for one drawn skinned each
 /// joint's share of the mesh moved by that joint. Returns the most any of those placements
 /// stretches a length.
-fn posed_corners(inst: &InstanceEntry, mesh: &MeshEntry, out: &mut Vec<V3>) -> f32 {
+fn posed_corners(inst: &InstanceEntry, joints: &[M4], mesh: &MeshEntry, out: &mut Vec<V3>) -> f32 {
     let mut stretch = 0.0f32;
     let mut place = |out: &mut Vec<V3>, m: &M4, b: (V3, V3)| {
         out.extend(corners(b).map(|p| math::transform_point(m, p)));
         stretch = stretch.max(max_stretch(m));
     };
     out.clear();
-    if skinned(inst, mesh) {
-        for (joint, b) in inst.joints.iter().zip(&mesh.joint_boxes) {
+    if skinned(joints, mesh) {
+        for (joint, b) in joints.iter().zip(&mesh.joint_boxes) {
             if let Some(b) = b {
                 place(out, &math::mul(&inst.model, joint), *b);
             }
@@ -920,6 +1059,44 @@ fn max_stretch(m: &M4) -> f32 {
         .map(|a| cols.iter().map(|b| math::dot(*a, *b).abs()).sum::<f32>())
         .fold(0.0, f32::max)
         .sqrt()
+}
+
+/// Writes to `buffer` the rows of `data` (`row` numbers each) that differ from `held`, what it
+/// holds: runs of changed rows, joined across a few unchanged ones between them (fewer, larger
+/// writes). `held` then holds `data`, and `data` what `held` held.
+fn write_changed(
+    device: &mut Device<'_>,
+    buffer: BufferId,
+    held: &mut Vec<f32>,
+    data: &mut Vec<f32>,
+    row: usize,
+) -> Result<()> {
+    const GAP: usize = 4;
+    let rows = data.len() / row;
+    let at = |r: usize| r * row..(r + 1) * row;
+    let changed = |r: usize| {
+        held.get(at(r))
+            .is_none_or(|old| !same_bits(old, &data[at(r)]))
+    };
+    let mut r = 0;
+    while r < rows {
+        if !changed(r) {
+            r += 1;
+            continue;
+        }
+        let (start, mut end) = (r, r + 1);
+        r = end;
+        while r < rows && r - end <= GAP {
+            if changed(r) {
+                end = r + 1;
+            }
+            r += 1;
+        }
+        let bytes = f32_bytes(&data[start * row..end * row]);
+        device.write_buffer(buffer, (start * row * 4) as u64, &bytes)?;
+    }
+    std::mem::swap(held, data);
+    Ok(())
 }
 
 /// A game's prop shader: its compiled stages and the overlay pipelines made from them so far.
@@ -952,6 +1129,9 @@ fn depth_index(desc: &MaterialDesc) -> usize {
 pub(super) struct PropSlot {
     buffer: BufferId,
     joints: BufferId,
+    /// What the buffers hold ([`write_changed`]).
+    rows: Vec<f32>,
+    joint_rows: Vec<f32>,
     /// Main view and reflection (`@group(0)` of the prop scene pipeline).
     scene: [BindGroupId; 2],
     shadow: BindGroupId,
@@ -968,13 +1148,17 @@ pub(super) struct Props {
     shaders: Pool<PropShaderEntry>,
     textures: Pool<TextureId>,
     instances: Pool<InstanceEntry>,
+    joint_sets: Pool<JointSet>,
+    /// Frames prepared so far (which places each joint set's rows once a frame).
+    frames: u64,
     slots: Vec<Option<PropSlot>>,
     capacity: u32,
     /// Joint matrices each slot's joint buffer holds.
     joint_capacity: u32,
     /// Edits of each prop texture's pixels (by handle), which the pictures of the props using
-    /// it follow.
+    /// it follow, and how many times any texture was edited or destroyed ([`stamp`]).
     texture_edits: HashMap<u32, u32>,
+    texture_epoch: u32,
     /// Regions of the cached picture held by instances destroyed since the last frame.
     vacated: Vec<Rect>,
     /// Where the shadow maps hold casters destroyed since they were drawn (their shadows are
@@ -986,43 +1170,117 @@ pub(super) struct Props {
     skin_buffer: Option<(BufferId, u32)>,
     skin_dirty: bool,
     batches: Vec<Batch>,
+    /// Each of this frame's instances' world bounds, in the order the instance buffer holds them.
+    placed: Vec<(V3, V3)>,
+    /// This frame's instance and joint rows as `prepare_props` makes them (kept to reuse).
+    rows: Vec<f32>,
+    joint_rows: Vec<f32>,
     /// World bounds of this frame's visible instances.
     bounds: Option<(V3, V3)>,
 }
 
+/// What an instance depends on beyond itself: its mesh's, material's and joints' revisions
+/// and, when the material has textures, how many times prop textures were edited.
+fn stamp(
+    mesh: &MeshEntry,
+    mat: &MaterialEntry,
+    joints: Option<&JointSet>,
+    texture_epoch: u32,
+) -> [u32; 4] {
+    let d = &mat.desc;
+    let textured = [d.base_texture, d.normal_texture, d.emissive_texture]
+        .iter()
+        .any(Option::is_some);
+    [
+        mesh.revision,
+        mat.revision,
+        joints.map_or(0, |j| j.revision),
+        if textured { texture_epoch } else { 0 },
+    ]
+}
+
+/// Whether two runs of numbers hold the same bits.
+fn same_bits(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
+/// A mesh's box placed by `model`.
+fn modelled_bounds(model: &M4, mesh: &MeshEntry) -> (V3, V3) {
+    let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+    for p in corners((mesh.min, mesh.max)) {
+        let w = math::transform_point(model, p);
+        for k in 0..3 {
+            lo[k] = lo[k].min(w[k]);
+            hi[k] = hi[k].max(w[k]);
+        }
+    }
+    (lo, hi)
+}
+
 impl Props {
     /// What each instance's picture depends on now and how long that has held, where its
-    /// vertices lie as drawn ([`posed_corners`]) and its world bounds.
+    /// vertices lie as drawn ([`posed_corners`]) and its world bounds. Only instances that were
+    /// set since, or whose mesh, material or textures changed, are posed again: the rest stand
+    /// as they were, one more frame the same.
     fn pose_instances(&mut self) {
         let Self {
             instances,
             meshes,
             materials,
+            joint_sets,
             texture_edits,
+            texture_epoch,
             ..
         } = self;
+        for (_, set) in joint_sets.iter_mut() {
+            if set.digested != Some(set.revision) {
+                set.digest = digest_matrices(&set.matrices);
+                set.digested = Some(set.revision);
+            }
+        }
         for (_, inst) in instances.iter_mut() {
             let (Some(m), Some(mat)) = (meshes.get(inst.mesh.0), materials.get(inst.material.0))
             else {
                 inst.world_bounds = None;
                 inst.still = 0;
+                inst.dirty = true;
                 continue;
             };
-            let sig = signature(inst, m, mat, texture_edits);
+            let set = inst.joints.and_then(|id| joint_sets.get(id));
+            let stamp = stamp(m, mat, set, *texture_epoch);
+            if !inst.dirty && stamp == inst.stamp {
+                inst.still = inst.still.saturating_add(1);
+                continue;
+            }
+            inst.dirty = false;
+            inst.stamp = stamp;
+            let joints = set.map_or(&[][..], |s| &s.matrices[..]);
+            let sig = signature(inst, set.map_or(0, |s| s.digest), m, mat, texture_edits);
             inst.still = if sig == inst.sig {
                 inst.still.saturating_add(1)
             } else {
                 0
             };
             inst.sig = sig;
+            inst.shadow.key = shadow_key(inst, joints, m, mat, texture_edits);
             inst.world_bounds = None;
             if inst.visible {
                 let mut posed = std::mem::take(&mut inst.shadow.corners);
-                inst.shadow.stretch = posed_corners(inst, m, &mut posed);
+                inst.shadow.stretch = posed_corners(inst, joints, m, &mut posed);
                 inst.world_bounds = Some(bounds(&posed));
                 inst.shadow.corners = posed;
+                inst.modelled = modelled_bounds(&inst.model, m);
             }
         }
+    }
+
+    /// This frame's batches and prop bounds as a hash, for a benchmark to show two builds
+    /// decide alike.
+    #[cfg(test)]
+    pub(super) fn digest(&self) -> u64 {
+        let mut h = Fnv::new();
+        h.write(format!("{:?} {:?}", self.batches, self.bounds).as_bytes());
+        h.finish()
     }
 
     /// Removes an instance; what it held in the cached picture is drawn again.
@@ -1030,7 +1288,108 @@ impl Props {
         if let Some(i) = self.instances.remove(id) {
             self.vacated.extend(i.cached);
             self.vacated_boxes.extend(i.shadow.drawn.map(|d| d.bounds));
+            self.release_joints(i.joints);
         }
+    }
+
+    /// An error unless instance `id` lives and `count` joint matrices can skin it: none (drawn
+    /// as modelled), or more than the highest joint its skinned mesh's vertices use.
+    fn check_joints(&self, id: u32, count: usize) -> Result<()> {
+        let i = self
+            .instances
+            .get(id)
+            .ok_or_else(|| format!("{:?} was destroyed", PropInstance(id)))?;
+        if count > 0
+            && let Some(skin) = self.meshes.get(i.mesh.0).and_then(|m| m.skin)
+            && count <= usize::from(skin.max_joint)
+        {
+            return Err(format!(
+                "set_prop_instance_joints: {count} matrices for joint {}",
+                skin.max_joint
+            ));
+        }
+        Ok(())
+    }
+
+    /// One user fewer for a joint set, which goes with its last.
+    fn release_joints(&mut self, set: Option<u32>) {
+        if let Some(id) = set
+            && let Some(s) = self.joint_sets.get_mut(id)
+        {
+            s.users -= 1;
+            if s.users == 0 {
+                self.joint_sets.remove(id);
+            }
+        }
+    }
+
+    /// Writes `joints` into a set, counting a change when they differ from what it holds.
+    fn write_joints(&mut self, id: u32, joints: &[M4]) {
+        if let Some(s) = self.joint_sets.get_mut(id)
+            && !same_bits(s.matrices.as_flattened(), joints.as_flattened())
+        {
+            s.matrices.clear();
+            s.matrices.extend_from_slice(joints);
+            s.revision = s.revision.wrapping_add(1);
+        }
+    }
+
+    /// Makes `ids` (live instances) follow one joint set holding `joints` (`[]`: none, drawn as
+    /// modelled): the one they follow already when it is theirs alone, or a new one.
+    fn share_joints(&mut self, ids: &[u32], joints: &[M4]) -> Result<()> {
+        if let Some(&id) = ids.iter().find(|&&id| self.instances.get(id).is_none()) {
+            return Err(format!("{:?} was destroyed", PropInstance(id)));
+        }
+        if ids.is_empty() {
+            return Ok(());
+        }
+        // The set is theirs alone when its users are `ids`: as many as they, each following it,
+        // none named twice (else another user could hide behind the count).
+        let distinct = ids.iter().enumerate().all(|(k, id)| !ids[..k].contains(id));
+        let theirs = ids
+            .first()
+            .and_then(|&id| self.instances.get(id)?.joints)
+            .filter(|&set| {
+                distinct
+                    && self
+                        .joint_sets
+                        .get(set)
+                        .is_some_and(|s| s.users as usize == ids.len())
+                    && ids.iter().all(|&id| {
+                        self.instances
+                            .get(id)
+                            .is_some_and(|i| i.joints == Some(set))
+                    })
+            });
+        if let Some(set) = theirs.filter(|_| !joints.is_empty()) {
+            self.write_joints(set, joints);
+            return Ok(());
+        }
+        let set = if joints.is_empty() {
+            None
+        } else {
+            Some(self.joint_sets.insert(JointSet {
+                matrices: joints.to_vec(),
+                revision: 0,
+                digest: 0,
+                digested: None,
+                users: 0,
+                first: 0,
+                placed: 0,
+            })?)
+        };
+        for &id in ids {
+            let Some(i) = self.instances.get_mut(id).filter(|i| i.joints != set) else {
+                continue;
+            };
+            let old = std::mem::replace(&mut i.joints, set);
+            i.dirty = true;
+            if let Some(s) = set.and_then(|s| self.joint_sets.get_mut(s)) {
+                s.users += 1;
+            }
+            self.release_joints(old);
+        }
+        Ok(())
     }
 }
 
@@ -1046,12 +1405,17 @@ fn normal_matrix(m: &M4) -> M4 {
     t
 }
 
-/// The farthest any point moved from `from` to `to`.
+/// The farthest any point moved from `from` to `to` (the square root of the largest squared
+/// move: the largest of the moves' lengths, with one root).
 fn farthest_move(from: &[V3], to: &[V3]) -> f32 {
     from.iter()
         .zip(to)
-        .map(|(a, b)| math::length(math::sub(*a, *b)))
+        .map(|(a, b)| {
+            let d = math::sub(*a, *b);
+            math::dot(d, d)
+        })
         .fold(0.0, f32::max)
+        .sqrt()
 }
 
 pub(super) fn bounds(points: &[V3]) -> (V3, V3) {
@@ -1064,6 +1428,21 @@ pub(super) fn bounds(points: &[V3]) -> (V3, V3) {
         }
     }
     (min, max)
+}
+
+/// Per axis, the zeros among `points` (1: +0, 2: -0). Bounds joined from parts are the bits
+/// [`bounds`] of all of them gives, in any order, but where a bound is 0 and both zeros are
+/// there: which one it holds then depends on the order they are met in.
+fn zeros(points: &[V3]) -> [u8; 3] {
+    let mut zeros = [0u8; 3];
+    for p in points {
+        for k in 0..3 {
+            if p[k] == 0.0 {
+                zeros[k] |= 1 << (p[k].to_bits() >> 31);
+            }
+        }
+    }
+    zeros
 }
 
 /// Interleaved position, normal, uv (the world vertex layout).
@@ -1211,7 +1590,7 @@ impl Props {
             let tip = math::transform_point(&inv, math::add(origin, dir));
             let d = math::sub(tip, o);
             // A skinned prop is tested where its joints have moved it, as it is drawn.
-            let skinned = self.skinned_positions(mesh, &inst.joints);
+            let skinned = self.skinned_positions(mesh, joints_of(&self.joint_sets, inst));
             let (positions, (min, max)) = match &skinned {
                 Some(p) => (&p[..], bounds(p)),
                 None => (&mesh.positions[..], (mesh.min, mesh.max)),
@@ -1400,6 +1779,7 @@ impl Renderer {
         fill(device, t)?;
         let edits = self.props.texture_edits.entry(texture.0).or_default();
         *edits = edits.wrapping_add(1);
+        self.props.texture_epoch = self.props.texture_epoch.wrapping_add(1);
         device.generate_mips(t)
     }
 
@@ -1409,6 +1789,7 @@ impl Renderer {
             device.destroy_texture(t);
         }
         self.props.texture_edits.remove(&texture.0);
+        self.props.texture_epoch = self.props.texture_epoch.wrapping_add(1);
     }
 
     pub fn create_prop_mesh(
@@ -1460,6 +1841,7 @@ impl Renderer {
             joint_boxes: vec![],
             shape: 0,
             drift: 0.0,
+            morph: None,
         };
         Ok(PropMesh(self.props.meshes.insert(entry)?))
     }
@@ -1511,6 +1893,7 @@ impl Renderer {
             m.revision = m.revision.wrapping_add(1);
             m.shape = m.shape.wrapping_add(1);
             m.joint_boxes = boxes;
+            m.morph = None;
             m.skin = Some(SkinRange {
                 first,
                 count: (n * 2) as u32,
@@ -1567,6 +1950,7 @@ impl Renderer {
         m.drift += farthest_move(&m.positions, positions);
         m.positions.copy_from_slice(positions);
         (m.min, m.max) = bounds(positions);
+        m.morph = None;
         m.revision = m.revision.wrapping_add(1);
         if let Some(skin) = m.skin {
             let records = &self.props.skin_records;
@@ -1604,37 +1988,36 @@ impl Renderer {
         if positions.is_empty() {
             return Ok(());
         }
-        let mut data = Vec::with_capacity(positions.len() * 8);
-        for ((p, n), uv) in positions.iter().zip(normals).zip(&m.uvs[first..end]) {
-            data.extend_from_slice(p);
-            data.extend_from_slice(n);
-            data.extend_from_slice(uv);
+        let mut data = vec![0.0f32; positions.len() * 8];
+        let vertices = positions.iter().zip(normals).zip(&m.uvs[first..end]);
+        for (d, ((p, n), uv)) in data.chunks_exact_mut(8).zip(vertices) {
+            d[..3].copy_from_slice(p);
+            d[3..6].copy_from_slice(n);
+            d[6..].copy_from_slice(uv);
         }
         device.write_buffer(m.vertices, first as u64 * 32, &f32_bytes(&data))?;
         m.drift += farthest_move(&m.positions[first..end], positions);
         m.positions[first..end].copy_from_slice(positions);
-        (m.min, m.max) = bounds(&m.positions);
         m.revision = m.revision.wrapping_add(1);
-        // A morph each frame: its joints' bounds only widen to hold the moved vertices (they
-        // stay bounds; a full update makes them afresh).
-        if let Some(skin) = m.skin {
-            let records = &self.props.skin_records;
-            let at = skin.first as usize + first * 2;
-            let moved = joint_boxes(positions, &records[at..at + positions.len() * 2]);
-            for (held, b) in m.joint_boxes.iter_mut().zip(moved) {
-                if let Some(b) = b {
-                    let was = *held;
-                    let h = held.get_or_insert(b);
-                    *h = (
-                        std::array::from_fn(|k| h.0[k].min(b.0[k])),
-                        std::array::from_fn(|k| h.1[k].max(b.1[k])),
-                    );
-                    if *held != was {
-                        m.shape = m.shape.wrapping_add(1);
-                    }
-                }
+        // What morphs of this range need, found once while it is morphed frame after frame.
+        let morph = match m.morph.take() {
+            Some(morph) if (morph.first, morph.end) == (first, end) => morph,
+            _ => {
+                let records = m.skin.map(|skin| {
+                    let at = skin.first as usize + first * 2;
+                    &self.props.skin_records[at..at + positions.len() * 2]
+                });
+                Morph::new(&m.positions, first, end, records)
             }
+        };
+        (m.min, m.max) = morph.bounds(&m.positions, positions);
+        // Its joints' bounds only widen to hold the moved vertices (they stay bounds; a full
+        // update makes them afresh).
+        if m.skin.is_some() {
+            let changed = morph.widen(&mut m.joint_boxes, positions);
+            m.shape = m.shape.wrapping_add(changed);
         }
+        m.morph = Some(morph);
         Ok(())
     }
 
@@ -1918,10 +2301,13 @@ impl Renderer {
             tint: [1.0; 4],
             visible: true,
             pick: 1,
-            joints: vec![],
+            joints: None,
+            dirty: true,
+            stamp: [0; 4],
             sig: 0,
             still: 0,
             world_bounds: None,
+            modelled: ([0.0; 3], [0.0; 3]),
             cached: None,
             shadow: ShadowTrack::default(),
         };
@@ -1937,27 +2323,25 @@ impl Renderer {
         instance: PropInstance,
         joints: &[M4],
     ) -> Result<()> {
+        self.share_prop_instance_joints(&[instance], joints)
+    }
+
+    /// [`Self::set_prop_instance_joints`] for several distinct instances at once, which then
+    /// share one copy of the matrices (every skinned part of a model instance follows its
+    /// skin's): set, compared and written to the frame's joint buffer once.
+    pub(super) fn share_prop_instance_joints(
+        &mut self,
+        instances: &[PropInstance],
+        joints: &[M4],
+    ) -> Result<()> {
         if joints.iter().flatten().any(|x| !x.is_finite()) {
             return Err("set_prop_instance_joints: values must be finite".into());
         }
-        let i = self
-            .props
-            .instances
-            .get_mut(instance.0)
-            .ok_or_else(|| format!("{instance:?} was destroyed"))?;
-        if !joints.is_empty()
-            && let Some(skin) = self.props.meshes.get(i.mesh.0).and_then(|m| m.skin)
-            && joints.len() <= usize::from(skin.max_joint)
-        {
-            return Err(format!(
-                "set_prop_instance_joints: {} matrices for joint {}",
-                joints.len(),
-                skin.max_joint
-            ));
+        let ids: Vec<u32> = instances.iter().map(|i| i.0).collect();
+        for &id in &ids {
+            self.props.check_joints(id, joints.len())?;
         }
-        i.joints.clear();
-        i.joints.extend_from_slice(joints);
-        Ok(())
+        self.props.share_joints(&ids, joints)
     }
 
     /// Moves an instance and shows or hides it.
@@ -1975,8 +2359,12 @@ impl Renderer {
         if i.model != *model {
             i.model = *model;
             i.normal = normal_matrix(model);
+            i.dirty = true;
         }
-        i.visible = visible;
+        if i.visible != visible {
+            i.visible = visible;
+            i.dirty = true;
+        }
         Ok(())
     }
 
@@ -1994,7 +2382,10 @@ impl Renderer {
             .instances
             .get_mut(instance.0)
             .ok_or_else(|| format!("{instance:?} was destroyed"))?;
-        i.material = material;
+        if i.material != material {
+            i.material = material;
+            i.dirty = true;
+        }
         Ok(())
     }
 
@@ -2004,11 +2395,15 @@ impl Renderer {
         if tint.iter().any(|x| !x.is_finite()) {
             return Err("set_prop_instance_tint: values must be finite".into());
         }
-        self.props
+        let i = self
+            .props
             .instances
             .get_mut(instance.0)
-            .ok_or_else(|| format!("{instance:?} was destroyed"))?
-            .tint = tint;
+            .ok_or_else(|| format!("{instance:?} was destroyed"))?;
+        if !same_bits(&i.tint, &tint) {
+            i.tint = tint;
+            i.dirty = true;
+        }
         Ok(())
     }
 
@@ -2201,9 +2596,9 @@ impl Renderer {
         self.props.pose_instances();
         let mut lo = [f32::INFINITY; 3];
         let mut hi = [f32::NEG_INFINITY; 3];
-        let mut live: Vec<Live> = Vec::new();
+        let mut live: Vec<Live> = Vec::with_capacity(self.props.rows.capacity() / 40);
         for (_, inst) in self.props.instances.iter() {
-            let (Some(mat), Some(m), true) = (
+            let (Some(mat), Some(_), true) = (
                 self.props.materials.get(inst.material.0),
                 self.props.meshes.get(inst.mesh.0),
                 inst.world_bounds.is_some(),
@@ -2211,14 +2606,7 @@ impl Renderer {
                 continue;
             };
             // The frame's prop bounds (which fit the shadow cascades) as modelled, not posed.
-            let (mut blo, mut bhi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
-            for p in corners((m.min, m.max)) {
-                let w = math::transform_point(&inst.model, p);
-                for k in 0..3 {
-                    blo[k] = blo[k].min(w[k]);
-                    bhi[k] = bhi[k].max(w[k]);
-                }
-            }
+            let (blo, bhi) = inst.modelled;
             let layer = mat.layer();
             if layer != Layer::Overlay {
                 for k in 0..3 {
@@ -2254,9 +2642,17 @@ impl Renderer {
                 .then(a.far.total_cmp(&b.far))
                 .then((a.material, a.mesh).cmp(&(b.material, b.mesh)))
         });
-        let mut batches: Vec<Batch> = Vec::new();
-        let mut data: Vec<f32> = Vec::with_capacity(live.len() * 40);
-        let mut joint_data: Vec<f32> = Vec::new();
+        let mut batches = std::mem::take(&mut self.props.batches);
+        let mut placed = std::mem::take(&mut self.props.placed);
+        let mut data = std::mem::take(&mut self.props.rows);
+        let mut joint_data = std::mem::take(&mut self.props.joint_rows);
+        batches.clear();
+        placed.clear();
+        placed.extend(live.iter().map(|l| l.inst.world_bounds.unwrap_or_default()));
+        data.clear();
+        joint_data.clear();
+        self.props.frames += 1;
+        let frame = self.props.frames;
         for (n, l) in live.iter().enumerate() {
             match batches.last_mut() {
                 Some(b)
@@ -2281,13 +2677,19 @@ impl Renderer {
             data.extend_from_slice(&l.inst.normal);
             data.extend_from_slice(&l.inst.tint);
             let skin = self.props.meshes.get(l.mesh).and_then(|m| m.skin);
-            match skin {
-                Some(range) if l.inst.joints.len() > usize::from(range.max_joint) => {
-                    let first = (joint_data.len() / 16) as f32;
-                    for j in &l.inst.joints {
-                        joint_data.extend_from_slice(j);
+            let set = l
+                .inst
+                .joints
+                .and_then(|id| self.props.joint_sets.get_mut(id));
+            match (skin, set) {
+                (Some(range), Some(set)) if set.matrices.len() > usize::from(range.max_joint) => {
+                    // A set's matrices go to the joint rows once a frame, for all who follow it.
+                    if set.placed != frame {
+                        set.placed = frame;
+                        set.first = (joint_data.len() / 16) as u32;
+                        joint_data.extend_from_slice(set.matrices.as_flattened());
                     }
-                    data.extend_from_slice(&[first, range.first as f32, 1.0, 0.0]);
+                    data.extend_from_slice(&[set.first as f32, range.first as f32, 1.0, 0.0]);
                 }
                 _ => data.extend_from_slice(&[0.0; 4]),
             }
@@ -2295,6 +2697,7 @@ impl Renderer {
         let count = live.len() as u32;
         drop(live);
         self.props.batches = batches;
+        self.props.placed = placed;
         self.props.bounds = (lo[0] <= hi[0]).then_some((lo, hi));
         self.make_prop_shader_pipelines(device)?;
         // The shared skin records: rewritten when a skinned mesh came or went, and grown (with
@@ -2342,14 +2745,12 @@ impl Renderer {
         if self.props.slots[slot].is_none() {
             self.props.slots[slot] = Some(self.create_prop_slot(device, slot)?);
         }
-        if let Some(s) = &self.props.slots[slot] {
-            if !data.is_empty() {
-                device.write_buffer(s.buffer, 0, &f32_bytes(&data))?;
-            }
-            if !joint_data.is_empty() {
-                device.write_buffer(s.joints, 0, &f32_bytes(&joint_data))?;
-            }
+        if let Some(s) = &mut self.props.slots[slot] {
+            write_changed(device, s.buffer, &mut s.rows, &mut data, 40)?;
+            write_changed(device, s.joints, &mut s.joint_rows, &mut joint_data, 16)?;
         }
+        self.props.rows = data;
+        self.props.joint_rows = joint_data;
         Ok(())
     }
 
@@ -2449,6 +2850,8 @@ impl Renderer {
         Ok(PropSlot {
             buffer,
             joints,
+            rows: vec![],
+            joint_rows: vec![],
             scene: [scene[0], scene[1]],
             shadow,
             overlay,
@@ -2548,14 +2951,47 @@ impl Renderer {
         push
     }
 
+    /// The runs (first, count) of the `count` instances from `first` (their world bounds in
+    /// `placed`) whose bounds `within` sees, and how many there are: all of them as one without
+    /// it, and as one too where those it sees lie in more than [`MAX_INSTANCE_RUNS`] runs (those
+    /// it does not see draw no pixel inside it).
+    fn instance_runs(
+        placed: &[(V3, V3)],
+        first: u32,
+        count: u32,
+        within: Option<&Frustum>,
+    ) -> ([(u32, u32); MAX_INSTANCE_RUNS], usize) {
+        let mut runs = [(first, count); MAX_INSTANCE_RUNS];
+        let Some(f) = within else {
+            return (runs, 1);
+        };
+        let mut n = 0;
+        for i in first..first + count {
+            let (lo, hi) = placed[i as usize];
+            if !f.intersects_aabb(lo, hi) {
+                continue;
+            }
+            if n > 0 && runs[n - 1].0 + runs[n - 1].1 == i {
+                runs[n - 1].1 += 1;
+            } else if n == MAX_INSTANCE_RUNS {
+                return ([(first, count); MAX_INSTANCE_RUNS], 1);
+            } else {
+                runs[n] = (i, 1);
+                n += 1;
+            }
+        }
+        (runs, n)
+    }
+
     /// Draws this frame's opaque prop batches in `set` with the scene shading (`view` 0 main,
-    /// 1 reflection).
+    /// 1 reflection): of their instances, those `within` sees (all without it).
     pub(super) fn draw_props(
         &self,
         enc: &mut crate::gpu::Encoder,
         slot: usize,
         view: usize,
         set: PropSet,
+        within: Option<&Frustum>,
     ) {
         let Some(Some(s)) = self.props.slots.get(slot) else {
             return;
@@ -2595,14 +3031,20 @@ impl Renderer {
                 if view == 1 && mat.data.params[3] == 2.0 {
                     continue;
                 }
+                let (runs, n) = Self::instance_runs(&self.props.placed, b.first, b.count, within);
+                if n == 0 {
+                    continue;
+                }
                 if bound != Some(b.material) {
                     enc.set_bind_group(1, mat.group);
                     bound = Some(b.material);
                 }
-                enc.push_constants(&f32_bytes(&Self::prop_push(mat, b.first, false)));
                 enc.set_vertex_buffer(mesh.vertices, 0);
                 enc.set_index_buffer(mesh.indices, 0);
-                enc.draw_indexed(mesh.index_count, b.count, 0, 0, 0);
+                for &(first, count) in &runs[..n] {
+                    enc.push_constants(&f32_bytes(&Self::prop_push(mat, first, false)));
+                    enc.draw_indexed(mesh.index_count, count, 0, 0, 0);
+                }
             }
         }
     }
@@ -2713,8 +3155,10 @@ impl Renderer {
             device.destroy_texture(t);
         }
         self.props.instances.drain();
+        self.props.joint_sets.drain();
         self.forget_prop_shadows();
         self.props.batches.clear();
+        self.props.placed.clear();
         self.props.vacated.clear();
         self.props.vacated_boxes.clear();
         self.props.texture_edits.clear();
@@ -2725,6 +3169,39 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A batch's instances in view are drawn in runs, at most `MAX_INSTANCE_RUNS`; more runs, or
+    /// no frustum, draw the batch whole, and none in view draws nothing.
+    #[test]
+    fn instance_runs_draw_what_is_in_view_in_few_runs() {
+        // Looking down -z from the origin: an instance 5 m ahead ('x') is in view, one 50 m
+        // aside ('.') is not. The batch starts at instance 1.
+        let view = math::mul(
+            &math::perspective(1.0, 1.0, 0.1),
+            &math::look_at([0.0; 3], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]),
+        );
+        let seen = Frustum::from_view_proj(&view);
+        let at = |x: f32| ([x - 0.1, -0.1, -5.1], [x + 0.1, 0.1, -4.9]);
+        let placed = |pattern: &str| -> Vec<(V3, V3)> {
+            let x = |c| if c == 'x' { 0.0 } else { 50.0 };
+            std::iter::once(at(50.0))
+                .chain(pattern.chars().map(|c| at(x(c))))
+                .collect()
+        };
+        let runs = |pattern: &str, within| {
+            let (runs, n) =
+                Renderer::instance_runs(&placed(pattern), 1, pattern.len() as u32, within);
+            runs[..n].to_vec()
+        };
+        assert_eq!(runs("x.xx..x", None), [(1, 7)]);
+        assert_eq!(runs("x.xx..x", Some(&seen)), [(1, 1), (3, 2), (7, 1)]);
+        assert_eq!(
+            runs("xx.x.x.x", Some(&seen)),
+            [(1, 2), (4, 1), (6, 1), (8, 1)]
+        );
+        assert_eq!(runs("xx.x.x.x.x", Some(&seen)), [(1, 10)]);
+        assert_eq!(runs("....", Some(&seen)), []);
+    }
 
     #[test]
     fn material_from_json() {
@@ -2815,6 +3292,7 @@ mod tests {
             joint_boxes: vec![],
             shape: 0,
             drift: 0.0,
+            morph: None,
         }
     }
 
@@ -2845,26 +3323,17 @@ mod tests {
         mesh.joint_boxes = joint_boxes(&mesh.positions, &records);
         let model = translation_matrix(10.0, 0.0, 0.0);
         let inst = InstanceEntry {
-            mesh: PropMesh::from_raw(1),
-            material: PropMaterial::from_raw(1),
             model,
             normal: normal_matrix(&model),
-            tint: [1.0; 4],
-            visible: true,
-            pick: 0,
-            joints: vec![math::IDENTITY, translation_matrix(0.0, 3.0, 0.0)],
-            sig: 0,
-            still: 0,
-            world_bounds: None,
-            cached: None,
-            shadow: ShadowTrack::default(),
+            ..instance_entry(PropMesh::from_raw(1), PropMaterial::from_raw(1))
         };
+        let joints = [math::IDENTITY, translation_matrix(0.0, 3.0, 0.0)];
         let mut posed = vec![];
-        assert_eq!(posed_corners(&inst, &mesh, &mut posed), 1.0);
+        assert_eq!(posed_corners(&inst, &joints, &mesh, &mut posed), 1.0);
         assert_eq!(bounds(&posed), ([10.0, 0.0, 0.0], [11.0, 3.0, 0.0]));
     }
 
-    fn instance_entry(mesh: PropMesh, material: PropMaterial, joints: Vec<M4>) -> InstanceEntry {
+    fn instance_entry(mesh: PropMesh, material: PropMaterial) -> InstanceEntry {
         InstanceEntry {
             mesh,
             material,
@@ -2873,13 +3342,23 @@ mod tests {
             tint: [1.0; 4],
             visible: true,
             pick: 0,
-            joints,
+            joints: None,
+            dirty: true,
+            stamp: [0; 4],
             sig: 0,
             still: 0,
             world_bounds: None,
+            modelled: ([0.0; 3], [0.0; 3]),
             cached: None,
             shadow: ShadowTrack::default(),
         }
+    }
+
+    /// An instance to change, marked as set (as the renderer's setters mark it).
+    fn edit(props: &mut Props, id: u32) -> &mut InstanceEntry {
+        let i = props.instances.get_mut(id).unwrap();
+        i.dirty = true;
+        i
     }
 
     #[test]
@@ -2946,14 +3425,14 @@ mod tests {
                 }))
                 .unwrap(),
         );
-        let rest = vec![math::IDENTITY; 2];
         let figure = props
             .instances
-            .insert(instance_entry(quad, caster, rest.clone()))
+            .insert(instance_entry(quad, caster))
             .unwrap();
+        props.share_joints(&[figure], &[math::IDENTITY; 2]).unwrap();
         let pillar = props
             .instances
-            .insert(instance_entry(plain, shadeless, vec![]))
+            .insert(instance_entry(plain, shadeless))
             .unwrap();
         let eye = math::mul(
             &math::perspective(1.0, 1.0, 0.1),
@@ -2969,8 +3448,8 @@ mod tests {
             track_cached_props(props, false, &view, &[map], 0.5)
         };
         let lift = |props: &mut Props, texels: f32| {
-            let joints = &mut props.instances.get_mut(figure).unwrap().joints;
-            joints[1] = translation_matrix(0.0, texels * texel, 0.0);
+            let joints = [math::IDENTITY, translation_matrix(0.0, texels * texel, 0.0)];
+            props.share_joints(&[figure], &joints).unwrap();
         };
 
         // A caster appearing counts; the maps then hold it.
@@ -2998,7 +3477,7 @@ mod tests {
         commit_prop_shadows(&mut props);
 
         // A prop that casts no shadow moves freely.
-        props.instances.get_mut(pillar).unwrap().model = translation_matrix(1.0, 0.0, 0.0);
+        edit(&mut props, pillar).model = translation_matrix(1.0, 0.0, 0.0);
         let shadeless_move = frame(&mut props);
         assert!(!shadeless_move.casters_moved && shadeless_move.moved.is_empty());
 
@@ -3010,11 +3489,11 @@ mod tests {
 
         // Hidden, shown and destroyed, it counts each time; while the whole picture is drawn
         // again too.
-        props.instances.get_mut(figure).unwrap().visible = false;
+        edit(&mut props, figure).visible = false;
         assert!(frame(&mut props).casters_moved);
         commit_prop_shadows(&mut props);
         assert!(!frame(&mut props).casters_moved);
-        props.instances.get_mut(figure).unwrap().visible = true;
+        edit(&mut props, figure).visible = true;
         props.pose_instances();
         assert!(track_cached_props(&mut props, true, &view, &[map], 0.5).casters_moved);
         commit_prop_shadows(&mut props);
@@ -3054,19 +3533,10 @@ mod tests {
             props
                 .instances
                 .insert(InstanceEntry {
-                    mesh,
-                    material: opaque_mat,
                     model: near_model,
                     normal: normal_matrix(&near_model),
-                    tint: [1.0; 4],
-                    visible: true,
                     pick: 0b0001,
-                    joints: Vec::new(),
-                    sig: 0,
-                    still: 0,
-                    world_bounds: None,
-                    cached: None,
-                    shadow: ShadowTrack::default(),
+                    ..instance_entry(mesh, opaque_mat)
                 })
                 .unwrap(),
         );
@@ -3076,19 +3546,10 @@ mod tests {
             props
                 .instances
                 .insert(InstanceEntry {
-                    mesh,
-                    material: opaque_mat,
                     model: far_model,
                     normal: normal_matrix(&far_model),
-                    tint: [1.0; 4],
-                    visible: true,
                     pick: 0b0010,
-                    joints: Vec::new(),
-                    sig: 0,
-                    still: 0,
-                    world_bounds: None,
-                    cached: None,
-                    shadow: ShadowTrack::default(),
+                    ..instance_entry(mesh, opaque_mat)
                 })
                 .unwrap(),
         );
@@ -3127,19 +3588,10 @@ mod tests {
             props
                 .instances
                 .insert(InstanceEntry {
-                    mesh,
-                    material: overlay_mat,
                     model: overlay_model,
                     normal: normal_matrix(&overlay_model),
-                    tint: [1.0; 4],
-                    visible: true,
                     pick: 0b0100,
-                    joints: Vec::new(),
-                    sig: 0,
-                    still: 0,
-                    world_bounds: None,
-                    cached: None,
-                    shadow: ShadowTrack::default(),
+                    ..instance_entry(mesh, overlay_mat)
                 })
                 .unwrap(),
         );
@@ -3324,6 +3776,222 @@ mod tests {
         );
         assert!(canvas_clear([0.5, f32::NAN, 0.5, 1.0], true).is_err());
         assert!(canvas_clear([0.5, 0.5, 0.5, f32::INFINITY], false).is_err());
+    }
+
+    #[test]
+    fn instances_share_joint_sets_until_the_last_of_them_goes() {
+        let mut props = Props::default();
+        let mesh = PropMesh(props.meshes.insert(z_quad_mesh_entry(0.5)).unwrap());
+        let mat = PropMaterial(
+            props
+                .materials
+                .insert(dummy_material_entry(MaterialDesc::default()))
+                .unwrap(),
+        );
+        let ids: Vec<u32> = (0..3)
+            .map(|_| props.instances.insert(instance_entry(mesh, mat)).unwrap())
+            .collect();
+        let pose = |y: f32| [math::IDENTITY, translation_matrix(0.0, y, 0.0)];
+        let set_of = |props: &Props, id: u32| props.instances.get(id).unwrap().joints;
+        let users = |props: &Props, set: u32| props.joint_sets.get(set).map(|s| s.users);
+
+        // One set for all three, written in place while it is theirs alone.
+        props.share_joints(&ids, &pose(1.0)).unwrap();
+        let set = set_of(&props, ids[0]).unwrap();
+        props.share_joints(&ids, &pose(2.0)).unwrap();
+        assert!(ids.iter().all(|&id| set_of(&props, id) == Some(set)));
+        assert_eq!(users(&props, set), Some(3));
+
+        // Given the same matrices of its own, an instance stays the same frame to frame.
+        props.pose_instances();
+        let still = props.instances.get(ids[0]).unwrap().still;
+        props.share_joints(&ids[..1], &pose(2.0)).unwrap();
+        props.pose_instances();
+        assert_eq!(props.instances.get(ids[0]).unwrap().still, still + 1);
+        let own = set_of(&props, ids[0]).unwrap();
+        assert_ne!(own, set);
+        assert_eq!(users(&props, set), Some(2));
+
+        // Named twice, an instance counts once; a set goes with the last instance following it.
+        props
+            .share_joints(&[ids[1], ids[1], ids[2]], &pose(4.0))
+            .unwrap();
+        let shared = set_of(&props, ids[1]).unwrap();
+        assert_eq!(users(&props, shared), Some(2));
+        assert_eq!(users(&props, set), None);
+
+        // One of two users named twice is not the set's every user: the other keeps its joints.
+        let matrices = |props: &Props, id: u32| {
+            joints_of(&props.joint_sets, props.instances.get(id).unwrap()).to_vec()
+        };
+        props.share_joints(&[ids[1], ids[1]], &pose(6.0)).unwrap();
+        assert_eq!(matrices(&props, ids[1]), pose(6.0));
+        assert_eq!(matrices(&props, ids[2]), pose(4.0));
+        assert_eq!(set_of(&props, ids[2]), Some(shared));
+        assert_eq!(users(&props, shared), Some(1));
+        props.share_joints(&ids[1..], &pose(4.0)).unwrap();
+        let shared = set_of(&props, ids[1]).unwrap();
+        assert_eq!(users(&props, shared), Some(2));
+        props.share_joints(&ids[..1], &[]).unwrap();
+        assert_eq!((set_of(&props, ids[0]), users(&props, own)), (None, None));
+        props.share_joints(&[], &pose(5.0)).unwrap();
+        props.remove_instance(ids[1]);
+        props.remove_instance(ids[2]);
+        assert_eq!(props.joint_sets.iter().count(), 0);
+    }
+
+    fn bound_bits((lo, hi): (V3, V3)) -> [u32; 6] {
+        std::array::from_fn(|k| if k < 3 { lo[k] } else { hi[k - 3] }.to_bits())
+    }
+
+    #[test]
+    fn a_morph_finds_the_bounds_and_joint_boxes_a_whole_scan_gives() {
+        let wave = |i: usize| {
+            let t = i as f32;
+            [(t * 0.37).sin(), (t * 1.3).cos() - 0.5, t * 0.01 - 0.2]
+        };
+        let points: Vec<V3> = (0..50).map(wave).collect();
+        for (first, end) in [(0, 5), (0, 50), (17, 30), (45, 50)] {
+            let morph = Morph::new(&points, first, end, None);
+            let found = morph.bounds(&points, &points[first..end]);
+            assert_eq!(
+                bound_bits(found),
+                bound_bits(bounds(&points)),
+                "{first}..{end}"
+            );
+        }
+        // A bound of 0 holds the zero the points hold; with both zeros there the whole scan
+        // decides. A -0 inside the bounds is no matter.
+        let left: Vec<V3> = points
+            .iter()
+            .map(|p| [-p[0].abs() - 0.1, p[1], p[2]])
+            .collect();
+        for signs in [[0.0, 0.0, -0.0], [0.0, -0.0, -0.0], [-0.0, -0.0, -0.0]] {
+            let mut zeros = left.clone();
+            zeros[3][0] = signs[0];
+            zeros[40][0] = signs[1];
+            zeros[12][1] = signs[2];
+            for (first, end) in [(0, 5), (40, 41), (10, 20), (0, 50)] {
+                let morph = Morph::new(&zeros, first, end, None);
+                let found = morph.bounds(&zeros, &zeros[first..end]);
+                assert_eq!(
+                    bound_bits(found),
+                    bound_bits(bounds(&zeros)),
+                    "{signs:?} {first}..{end}"
+                );
+            }
+        }
+
+        // Each vertex on two to four joints, one twice, some weighing nothing, one past the
+        // boxes held; the boxes held missing one joint.
+        let records: Vec<[f32; 4]> = (0..50)
+            .flat_map(|v| {
+                let j = (v % 6) as f32;
+                [
+                    [j, j + 1.0, j, 7.0],
+                    [0.5, if v % 3 == 0 { 0.0 } else { 0.25 }, 0.25, 0.1],
+                ]
+            })
+            .collect();
+        let mut held = joint_boxes(&points, &records);
+        held.truncate(7);
+        held[2] = None;
+        let moved: Vec<V3> = (0..50).map(|i| math::scale(wave(i + 3), 1.2)).collect();
+        let mut expected = held.clone();
+        let mut changes = 0;
+        for (h, b) in expected.iter_mut().zip(joint_boxes(&moved, &records)) {
+            if let Some(b) = b {
+                let was = *h;
+                let x = h.get_or_insert(b);
+                *x = (
+                    std::array::from_fn(|k| x.0[k].min(b.0[k])),
+                    std::array::from_fn(|k| x.1[k].max(b.1[k])),
+                );
+                changes += u32::from(*h != was);
+            }
+        }
+        let morph = Morph::new(&moved, 0, 50, Some(&records));
+        assert_eq!(morph.widen(&mut held, &moved), changes);
+        assert!(changes > 0);
+        let bits = |b: &[Option<(V3, V3)>]| -> Vec<Option<[u32; 6]>> {
+            b.iter().map(|b| b.map(bound_bits)).collect()
+        };
+        assert_eq!(bits(&held), bits(&expected));
+    }
+
+    /// A mesh morphed over a range frame after frame, over another range and whole keeps the
+    /// bounds a scan of all its vertices gives, to the bit.
+    #[test]
+    fn morphed_meshes_keep_the_bounds_of_all_their_vertices() {
+        use crate::render::{Look, Output, Quality};
+        use crate::world::World;
+
+        let Ok(mut device) = Device::headless() else {
+            return;
+        };
+        let mut r = Renderer::new(
+            &mut device,
+            &World::default(),
+            Look::default(),
+            Quality::low_cost(),
+            (16, 16),
+            Output::Still,
+        )
+        .expect("headless renderer");
+        let positions: Vec<V3> = (0..40)
+            .map(|i| [i as f32 * 0.1 - 2.0, (i % 7) as f32, -(i as f32)])
+            .collect();
+        let normals = vec![[0.0, 1.0, 0.0]; 40];
+        let indices: Vec<u32> = (0..39).flat_map(|i| [i, i + 1, 0]).collect();
+        let mesh = r
+            .create_prop_mesh(
+                &mut device,
+                &MeshData {
+                    positions: &positions,
+                    normals: &normals,
+                    uvs: &[],
+                    indices: &indices,
+                },
+            )
+            .expect("mesh");
+        let check = |r: &Renderer, what: &str| {
+            let m = r.props.meshes.get(mesh.0).unwrap();
+            assert_eq!(
+                bound_bits((m.min, m.max)),
+                bound_bits(bounds(&m.positions)),
+                "{what}"
+            );
+        };
+        // The morphed range holds the lowest x at first, then pulls in, then reaches past
+        // every other vertex, then rests on 0 beside a vertex at -0.
+        for (k, shift) in [0.0, 0.5, 1.0, -3.0, 2.0].into_iter().enumerate() {
+            let moved: Vec<V3> = positions[0..5]
+                .iter()
+                .map(|p| [p[0] + shift, p[1] * 2.0, p[2]])
+                .collect();
+            r.update_prop_mesh_range(&mut device, mesh, 0, &moved, &normals[0..5])
+                .expect("morph");
+            check(&r, &format!("morph {k}"));
+        }
+        let other: Vec<V3> = positions[10..14]
+            .iter()
+            .map(|p| [p[0], p[1] + 9.0, p[2]])
+            .collect();
+        r.update_prop_mesh_range(&mut device, mesh, 10, &other, &normals[10..14])
+            .expect("another range");
+        check(&r, "another range");
+        let zeros: Vec<V3> = positions[0..5].iter().map(|p| [p[0], 0.0, p[2]]).collect();
+        let mut whole = positions.clone();
+        whole[20][1] = -0.0;
+        r.update_prop_mesh(&mut device, mesh, &whole, &normals)
+            .expect("whole");
+        check(&r, "whole");
+        for k in 0..2 {
+            r.update_prop_mesh_range(&mut device, mesh, 0, &zeros, &normals[0..5])
+                .expect("zeros");
+            check(&r, &format!("zeros {k}"));
+        }
+        r.destroy_props(&mut device);
     }
 
     #[test]
