@@ -3822,7 +3822,7 @@ mod tests {
         // Room for 30: the most each can keep so that all fit, the short lists whole.
         let cap = cluster_cap([4, 50, 50].into_iter(), 30);
         assert_eq!(cap, 13);
-        assert!(4 + 13 + 13 <= 30 && 4 + 14 + 14 > 30);
+        assert!(4 + 2 * cap <= 30 && 4 + 2 * (cap + 1) > 30);
         assert_eq!(cluster_cap([5, 5].into_iter(), 0), 0);
     }
 
