@@ -616,12 +616,15 @@ pub unsafe extern "C" fn ganbate_rt_frame_stats(out: *mut u8) -> u32 {
     })
 }
 
-/// Writes what the last frame did with the room's cached picture as three words at `out`: 1 when
-/// it started from the picture as it was (0: drew it whole), the regions of it drawn again, and 1
-/// when pixels of it that moved props' shadows reach were shaded again.
+/// Writes what the last frame did with the room's cached picture as seven words at `out`: 1 when
+/// it started from the picture as it was (0: drew it whole), the regions of it drawn again, 1
+/// when pixels of it that moved props' shadows reach were shaded again; then 1 when the water
+/// read its lamp light and shadow as kept with the picture (0: computed them), 1 when those were
+/// drawn whole, the regions of them drawn again, and the footprints of moved props' shadows
+/// within which the water computed them.
 ///
 /// # Safety
-/// `out` must address 12 writable bytes.
+/// `out` must address 28 writable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ganbate_rt_cache_stats(out: *mut u8) -> u32 {
     with(0, |rt| {
@@ -633,13 +636,17 @@ pub unsafe extern "C" fn ganbate_rt_cache_stats(out: *mut u8) -> u32 {
             u32::from(s.world_cached),
             s.cache_regions,
             u32::from(s.reshaded),
+            u32::from(s.water_kept),
+            u32::from(s.water_statics_whole),
+            s.water_statics_regions,
+            s.water_footprints,
         ];
-        let mut buf = [0u8; 12];
+        let mut buf = [0u8; 28];
         for (i, w) in words.iter().enumerate() {
             buf[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
         }
-        // SAFETY: the caller passes 12 writable bytes.
-        unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), out, 12) };
+        // SAFETY: the caller passes 28 writable bytes.
+        unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), out, 28) };
         Ok(1)
     })
 }

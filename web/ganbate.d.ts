@@ -105,6 +105,14 @@ export interface GanbateCacheStats {
   readonly regions: number;
   /** Pixels of it that moved props' shadows reach were shaded again. */
   readonly reshaded: boolean;
+  /** The water read its lamp light and shadow as kept with the picture (false: computed them). */
+  readonly waterKept: boolean;
+  /** The water's kept lamp light and shadow were drawn whole. */
+  readonly waterStaticsWhole: boolean;
+  /** Regions of them drawn again, with the picture's. */
+  readonly waterStaticsRegions: number;
+  /** Footprints of moved props' shadows within which the water computed them. */
+  readonly waterFootprints: number;
 }
 
 export interface GanbateStereoViews {

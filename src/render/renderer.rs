@@ -20,7 +20,8 @@ use super::math::{
     perspective, reflect_y, scale, sub, transform,
 };
 use super::props::{
-    CacheChanges, CacheView, PropSet, Rect, corners, screen_rect, track_cached_props, union,
+    CacheChanges, CacheView, PropSet, Rect, corners, merge_boxes, screen_rect, track_cached_props,
+    union,
 };
 use super::scene::{DrawItem, GpuScene};
 use super::sky::Environment;
@@ -69,6 +70,10 @@ impl Fnv {
 const MAX_RESHADE_ENTRIES: usize = 32;
 /// Bytes of the re-shade block (`Reshade` in scene.wgsl): a count, then two vec4s an entry.
 const RESHADE_BYTES: u64 = 16 + MAX_RESHADE_ENTRIES as u64 * 32;
+/// Boxes of props moved since the water's lamp light and shadow were kept that the water follows
+/// (`fs_water` computes them within their shadows' footprints), at most: a footprint in each of
+/// the four maps fits the re-shade block. More have them drawn whole again.
+const MAX_WATER_MOVED: usize = MAX_RESHADE_ENTRIES / 4;
 
 /// Where each world draw lies, for re-shading the cached picture ([`Renderer::reshade_plan`]):
 /// in each shadow map props cast into (the key light's cascades 0, 1, grown by the offset its
@@ -80,7 +85,7 @@ struct ReceiverBounds {
     maps: Vec<[([f32; 4], f32); 4]>,
     screen: Vec<Option<Rect>>,
     /// Where the water draws in view lie in the shadow maps: the water's kept lamp light and
-    /// shadow (`cache_water`) are drawn again when moved props' shadows reach one.
+    /// shadow (`cache_water`) follow the moved props whose shadows can reach one.
     water: Vec<[([f32; 4], f32); 4]>,
 }
 
@@ -96,6 +101,18 @@ fn reached(footprints: &[Footprint], maps: &[([f32; 4], f32); 4]) -> bool {
         let (r, far) = &maps[*v];
         r[0] <= fr[2] && fr[0] <= r[2] && r[1] <= fr[3] && fr[1] <= r[3] && *far >= *near
     })
+}
+
+/// The `Reshade` block (scene.wgsl) for `footprints`: their count and the light buffer index + 1
+/// of a game's light casting into each shadow layer (`shadowed`, 0: none), then per footprint
+/// its rect, nearest depth and map.
+fn reshade_block(footprints: &[Footprint], shadowed: [u32; 2]) -> Vec<u32> {
+    let mut block = vec![footprints.len() as u32, shadowed[0], shadowed[1], 0];
+    for (v, r, near) in footprints {
+        block.extend(r.map(f32::to_bits));
+        block.extend([near.to_bits(), (*v as f32).to_bits(), 0, 0]);
+    }
+    block
 }
 
 /// Slices of view depth per doubling of it (`CLUSTER_SLICES` from `CLUSTER_NEAR` to `CLUSTER_FAR`).
@@ -409,6 +426,16 @@ pub struct FrameStats {
     pub cache_regions: u32,
     /// Pixels of the cached picture that moved props' shadows can reach were shaded again.
     pub reshaded: bool,
+    /// The water read its lamp light and shadow as kept with the cached picture (`cache_water`)
+    /// rather than computing them, as a still does.
+    pub water_kept: bool,
+    /// The water's kept lamp light and shadow were drawn whole this frame.
+    pub water_statics_whole: bool,
+    /// Regions of them drawn again this frame, with the cached picture's.
+    pub water_statics_regions: u32,
+    /// Footprints of the shadows of props moved since they were drawn whole (one shadow map
+    /// apiece), within which the water computes them.
+    pub water_footprints: u32,
     /// The painterly filter ran (it is skipped where it would change nothing).
     pub painted: bool,
 }
@@ -446,7 +473,7 @@ pub(super) struct Pipelines {
     /// them.
     scene_opaque: PipelineId,
     /// The water in a frame that keeps the cached picture (`fs_water`): `scene_opaque` with its
-    /// lamp light and shadow read from `cache_water`.
+    /// lamp light and shadow read from `cache_water` where no prop moved since they were kept.
     water: PipelineId,
     /// Draws the water's lamp light and shadow into `cache_water` (`fs_water_static`).
     water_static: PipelineId,
@@ -516,8 +543,9 @@ pub(super) struct Targets {
     /// The shadows moved props can change, as the cached picture was shaded with them
     /// (`CacheOut::shadow`).
     cache_shadow: TextureId,
-    /// The water's lamp light and shadow where the cached picture shows it (`fs_water_static`).
-    cache_water: TextureId,
+    /// The water's lamp light and shadow where the cached picture shows it (`fs_water_static`),
+    /// for a presented view on a device that reads 32-bit float textures.
+    cache_water: Option<TextureId>,
     refl: (u32, u32),
     pub(super) refl_hdr: TextureId,
     refl_aux: TextureId,
@@ -547,8 +575,10 @@ pub(super) struct Slot {
     tiles_for: [Option<u64>; 2],
     scene: [BindGroupId; 2],
     sky: [BindGroupId; 2],
-    /// The water's group in a frame that keeps the cached picture (`fs_water`).
-    water: BindGroupId,
+    /// The water's group in a frame that keeps the cached picture (`fs_water`, with `cache_water`)
+    /// and the `Reshade` block it binds: the footprints of props moved since its lamp light and
+    /// shadow were kept.
+    water: Option<(BindGroupId, BufferId)>,
     grass: BindGroupId,
     flower: BindGroupId,
     particle: BindGroupId,
@@ -575,6 +605,10 @@ pub struct Renderer {
     grass_grid: [u32; 4],
     /// The world's draws' bounds for re-shading the cached picture, as of `world_cache`.
     receivers: Option<ReceiverBounds>,
+    /// The water's lamp light and shadow kept with the cached picture (`cache_water`): `None`
+    /// until drawn whole for it as it stands; then the boxes of props moved since that the water
+    /// follows (within their shadows' footprints `fs_water` computes them).
+    water_statics: Option<Vec<(V3, V3)>>,
     /// The AO refinement the cached world shows, and the frames since it was drawn.
     cache_ao_revision: u64,
     cache_age: u32,
@@ -655,19 +689,13 @@ fn compile_specialized(
 }
 
 /// `fs_water` as the water's pipeline compiles it: its lamp light and shadow read from
-/// `cache_water` rather than computed.
+/// `cache_water` where no prop moved since they were kept, computed elsewhere.
 const WATER_STATICS: [(&str, SpecValue); 1] = [("WATER_STATICS", SpecValue::Bool(true))];
 
-/// `cache_water`'s format: 32-bit floats hand the water the very values computing them gives,
-/// so its frames match those that compute them byte for byte (16-bit floats moved some pixels
-/// a few steps); 16-bit where a device cannot read 32-bit float textures.
-fn water_statics_format(device: &Device<'_>) -> Format {
-    if device.limits().float32_readable {
-        Format::Rgba32Float
-    } else {
-        HDR
-    }
-}
+/// `cache_water`'s format: 32-bit floats hand the water the very values computing them gives, so
+/// its frames match those that compute them byte for byte (16-bit floats moved some pixels a few
+/// steps). Devices that cannot read them (WebGPU without `float32-filterable`) compute them.
+const WATER_STATICS_FORMAT: Format = Format::Rgba32Float;
 
 /// The scene shader with a game's prop shader (`shade`) and the overlay entry point that calls it.
 pub(super) fn prop_shader_source(user: &str) -> Result<String> {
@@ -861,7 +889,7 @@ impl Pipelines {
             cull: Cull::None,
             front_ccw: true,
             depth: Some(reverse_depth(Compare::Greater, true)),
-            colors: vec![color(water_statics_format(device), Blend::Replace)],
+            colors: vec![color(WATER_STATICS_FORMAT, Blend::Replace)],
         })?;
         let vs = compile(SCENE, Stage::Vertex, "vs_prop")?;
         let prop_vs = vs.clone();
@@ -1627,6 +1655,7 @@ impl Renderer {
             world_cache: None,
             grass_grid: [0; 4],
             receivers: None,
+            water_statics: None,
             cache_ao_revision: 0,
             cache_age: 0,
             split_passes: false,
@@ -1758,7 +1787,6 @@ impl Renderer {
         let max_levels = 32 - bloom_size.0.min(bloom_size.1).leading_zeros();
         let bloom_levels = q.bloom_levels.clamp(1, max_levels.max(1));
         let depth_usage = TextureUsage::DEPTH_TARGET | TextureUsage::SAMPLED;
-        let water_format = water_statics_format(device);
         let mut t = Targets {
             width,
             height,
@@ -1783,7 +1811,9 @@ impl Renderer {
             )?,
             reshade_depth: tex(device, width, height, Format::Depth32Float, depth_usage)?,
             cache_shadow: tex(device, width, height, HDR, rt)?,
-            cache_water: tex(device, width, height, water_format, rt)?,
+            cache_water: (output != Output::Still && device.limits().float32_readable)
+                .then(|| tex(device, width, height, WATER_STATICS_FORMAT, rt))
+                .transpose()?,
             refl,
             refl_hdr: tex(device, refl.0, refl.1, HDR, rt)?,
             refl_aux: tex(device, refl.0, refl.1, HDR, rt)?,
@@ -1864,7 +1894,8 @@ impl Renderer {
         };
         let mut scene = vec![];
         let mut sky = vec![];
-        let mut main_view = vec![];
+        let mut blades = vec![];
+        let mut water = None;
         for v in 0..2 {
             let reflection = if v == 0 { t.refl_hdr } else { self.dummy };
             let entries = [
@@ -1884,11 +1915,16 @@ impl Renderer {
             scene.push(device.create_bind_group(p.scene, 0, &entries)?);
             sky.push(device.create_bind_group(p.sky, 0, &entries[..1])?);
             if v == 0 {
-                main_view.push(device.create_bind_group(p.grass, 0, &entries)?);
-                main_view.push(device.create_bind_group(p.flower, 0, &entries)?);
-                main_view.push(device.create_bind_group(p.particle, 0, &entries)?);
-                let water = [&entries[..], &[(19, Resource::Texture(t.cache_water))]].concat();
-                main_view.push(device.create_bind_group(p.water, 0, &water)?);
+                blades.push(device.create_bind_group(p.grass, 0, &entries)?);
+                blades.push(device.create_bind_group(p.flower, 0, &entries)?);
+                blades.push(device.create_bind_group(p.particle, 0, &entries)?);
+                if let Some(kept) = t.cache_water {
+                    let moved = upload(device, RESHADE_BYTES, BufferUsage::UNIFORM)?;
+                    let more = [(17, buf(moved)), (19, Resource::Texture(kept))];
+                    let group =
+                        device.create_bind_group(p.water, 0, &[&entries[..], &more].concat())?;
+                    water = Some((group, moved));
+                }
             }
         }
         fn pair<T: Copy>(v: Vec<T>) -> [T; 2] {
@@ -1896,8 +1932,7 @@ impl Renderer {
         }
         let (frame, tiles, index) = (pair(frame), pair(tiles), pair(index));
         let (scene, sky) = (pair(scene), pair(sky));
-        let (grass, flower, particle, water) =
-            (main_view[0], main_view[1], main_view[2], main_view[3]);
+        let (grass, flower, particle) = (blades[0], blades[1], blades[2]);
         let post = |d: &mut Device<'_>, pipe, src: Resource, extra: Resource| {
             d.create_bind_group(
                 pipe,
@@ -2030,8 +2065,9 @@ impl Renderer {
                 .scene
                 .into_iter()
                 .chain(s.sky)
+                .chain(s.water.map(|w| w.0))
                 .chain([
-                    s.water, s.grass, s.flower, s.particle, s.restore, s.mask, s.ssao, s.air,
+                    s.grass, s.flower, s.particle, s.restore, s.mask, s.ssao, s.air,
                 ])
                 .chain([
                     s.tonemap,
@@ -2052,6 +2088,7 @@ impl Renderer {
                 .chain(s.tiles)
                 .chain(s.index)
                 .chain([s.reshade])
+                .chain(s.water.map(|w| w.1))
             {
                 device.destroy_buffer(b);
             }
@@ -2068,7 +2105,6 @@ impl Renderer {
             old.cache_depth,
             old.reshade_depth,
             old.cache_shadow,
-            old.cache_water,
             old.refl_hdr,
             old.refl_aux,
             old.refl_depth,
@@ -2080,6 +2116,7 @@ impl Renderer {
         ]
         .into_iter()
         .chain(old.still)
+        .chain(old.cache_water)
         {
             device.destroy_texture(t);
         }
@@ -2486,13 +2523,8 @@ impl Renderer {
                 *slot = lamps + k as u32 + 1;
             }
         }
-        let mut block = vec![footprints.len() as u32, shadowed[0], shadowed[1], 0];
-        for (v, r, near) in footprints {
-            block.extend(r.map(f32::to_bits));
-            block.extend([near.to_bits(), (*v as f32).to_bits(), 0, 0]);
-        }
         Some(ReshadePlan {
-            block,
+            block: reshade_block(footprints, shadowed),
             draws,
             region,
         })
@@ -3236,9 +3268,10 @@ impl Renderer {
             CacheChanges::default()
         };
         let regions = merge_regions(regions);
-        // The pixels of the picture moved props' shadows can reach, shaded again below, and
-        // whether those shadows reach the water (its kept lamp light and shadow then follow).
-        let (reshade, water_shadows_moved) = if cached && !rebuild && !moved.is_empty() {
+        let key = env.key_intensity > 0.0 && has_prop_shadows;
+        // The pixels of the picture moved props' shadows can reach, shaded again below, and the
+        // moved props whose shadows can reach the water.
+        let (reshade, water_moved) = if cached && !rebuild && !moved.is_empty() {
             if self.receivers.as_ref().is_none_or(|r| r.key != world_key) {
                 let maps = self.prop_shadow_maps(&cas);
                 self.receivers = Some(ReceiverBounds::new(
@@ -3249,17 +3282,42 @@ impl Renderer {
                     size,
                 ));
             }
-            let key = env.key_intensity > 0.0 && has_prop_shadows;
             let footprints = self.shadow_footprints(&moved, &cas, key);
-            let water = self
-                .receivers
-                .as_ref()
-                .is_some_and(|r| r.water.iter().any(|m| reached(&footprints, m)));
+            let water = self.receivers.as_ref().map_or(vec![], |r| {
+                let reaches = |b: &(V3, V3)| {
+                    let f = self.shadow_footprints(&[*b], &cas, key);
+                    r.water.iter().any(|m| reached(&f, m))
+                };
+                moved.iter().copied().filter(reaches).collect()
+            });
             let plan = self.reshade_plan(&footprints, &settled, &eye, size, &cas);
             (plan, water)
         } else {
-            (None, false)
+            (None, vec![])
         };
+        // The water's lamp light and shadow, kept (`cache_water`) while the picture holds. A
+        // frame drawing the picture whole (as while the camera moves) computes them, as a still
+        // does; the first frame keeping it draws them whole. Later frames draw them again in the
+        // regions of the picture drawn again, and follow the props moved since whose shadows can
+        // reach the water: within those shadows' footprints the water computes them (`fs_water`,
+        // as `fs_reshade_mask` tests the picture's pixels), until too many have them drawn whole.
+        let keep_water = cached && !rebuild && self.targets.cache_water.is_some();
+        if !keep_water {
+            self.water_statics = None;
+        }
+        let water_whole = keep_water
+            && self.water_statics.as_mut().is_none_or(|boxes| {
+                boxes.extend(water_moved);
+                *boxes = merge_boxes(std::mem::take(boxes));
+                boxes.len() > MAX_WATER_MOVED
+            });
+        if water_whole {
+            self.water_statics = Some(vec![]);
+        }
+        let water_block = self
+            .water_statics
+            .as_ref()
+            .map(|boxes| reshade_block(&self.shadow_footprints(boxes, &cas, key), [0, 0]));
         let mut stats = FrameStats::default();
 
         // Shadow cascades: layers 0..2 cache static world depth; layers 2..4 hold dynamic props.
@@ -3522,18 +3580,15 @@ impl Renderer {
             enc.end_pass();
             stats.reshaded = true;
         }
-        // The water's lamp light and shadow (`cache_water`) follow the cached picture: drawn whole
-        // with it or where moved props' shadows reach the water, and in the regions drawn again.
-        // They are drawn where the picture's depth (a copy) shows the water, the nearer of two
-        // waters keeping them; the main pass's water reads them where it is drawn, which lies
-        // within that.
-        let water_whole = rebuild || water_shadows_moved;
-        let water_regions = if water_whole {
-            &whole[..]
-        } else {
-            &regions[..]
+        // The water's kept lamp light and shadow, drawn whole or in the regions drawn again where
+        // the picture's depth (a copy) shows the water, the nearer of two waters keeping them; the
+        // main pass's water reads them where it is drawn, which lies within that.
+        let water_regions = match t.cache_water {
+            Some(kept) if water_whole => Some((kept, &whole[..])),
+            Some(kept) if keep_water && !regions.is_empty() => Some((kept, &regions[..])),
+            _ => None,
         };
-        if !water_regions.is_empty() {
+        if let Some((kept, rects)) = water_regions {
             enc.blit((t.cache_depth, 0, 0), (t.depth, 0, 0), Filter::Nearest);
             enc.begin_pass(PassDesc {
                 colors: vec![Attachment {
@@ -3542,7 +3597,7 @@ impl Renderer {
                     } else {
                         Load::Load
                     },
-                    ..Attachment::clear(t.cache_water, clear)
+                    ..Attachment::clear(kept, clear)
                 }],
                 depth: Some(Attachment {
                     load: Load::Load,
@@ -3552,13 +3607,24 @@ impl Renderer {
             });
             enc.set_pipeline(p.water_static);
             enc.set_bind_group(0, slot.scene[0]);
-            for r in water_regions {
+            for r in rects {
                 enc.set_scissor(r[0], r[1], r[2] - r[0], r[3] - r[1]);
                 let within = eye.within(r, size);
                 self.draw_world(enc, &mut push, &within, true, WorldPart::Water, None);
             }
             enc.end_pass();
+            stats.water_statics_whole = water_whole;
+            stats.water_statics_regions = if water_whole { 0 } else { rects.len() as u32 };
         }
+        let water_kept = match (slot.water, &water_block) {
+            (Some((group, moved)), Some(block)) => {
+                device.write_buffer(moved, 0, &crate::gpu::u32_bytes(block))?;
+                stats.water_kept = true;
+                stats.water_footprints = block[0];
+                Some(group)
+            }
+            _ => None,
+        };
 
         // Main pass: world, sky, weather. A cached frame starts from the picture's depth, copied:
         // drawn from a shader instead, it would cost the GPU its early depth test for the rest of
@@ -3616,12 +3682,12 @@ impl Renderer {
         }
         // The water moves with the clock, so it is drawn every frame. Without an alpha test it
         // never discards, so the floor and the table in front of it hide it before it is
-        // shaded: behind the room it spans the whole view. A cached frame's water takes its lamp
-        // light and shadow from `cache_water`.
+        // shaded: behind the room it spans the whole view. It takes its lamp light and shadow
+        // from `cache_water` while they are kept.
         split(enc);
-        if cached {
+        if let Some(group) = water_kept {
             enc.set_pipeline(p.water);
-            enc.set_bind_group(0, slot.water);
+            enc.set_bind_group(0, group);
         } else {
             enc.set_pipeline(p.scene_opaque);
             enc.set_bind_group(0, slot.scene[0]);
@@ -3933,8 +3999,9 @@ mod tests {
         AlphaMode, Instance, Material, Mesh, PointLight, Shading, Transform, World,
     };
     use ganbate_shader::{
-        CompileOptions, ShaderLibrary, SpecValue, compile_glsl_with_options,
-        compile_msl_with_options, compile_wgsl_with_options, compile_with_options,
+        BindingKind, CompileOptions, SampleType, ShaderLibrary, SpecValue, TextureView,
+        compile_glsl_with_options, compile_msl_with_options, compile_wgsl_with_options,
+        compile_with_options,
     };
 
     #[test]
@@ -4057,7 +4124,7 @@ mod tests {
     }
 
     #[test]
-    fn the_cached_water_reads_its_light_in_fewer_webgl_units() {
+    fn the_cached_water_reads_its_light_within_webgl_units() {
         let composed = ganbate_shader::compose(SCENE, &shader_modules()).expect("compose");
         let glsl = |entry: &str, specialize: &[(&str, SpecValue)]| {
             let opts = CompileOptions {
@@ -4075,33 +4142,37 @@ mod tests {
         let (opaque_units, opaque) = glsl("fs_main_opaque", &[]);
         let (water_units, water) = glsl("fs_water", &WATER_STATICS);
         let (_, statics) = glsl("fs_water_static", &[]);
+        // Where props moved since its light was kept, the water computes it as `fs_main_opaque`
+        // does: it reads all that reads, plus the kept light (a unit) and the moved props'
+        // footprints (a uniform block).
         assert!(
-            water_units < opaque_units && opaque_units <= 16,
+            water_units == opaque_units + 1 && water_units <= 16,
             "WebGL 2 fragment texture units: fs_water {water_units}, fs_main_opaque {opaque_units}"
         );
-        let reads = |b: &[ganbate_shader::Binding], group, binding| {
-            b.iter().any(|b| (b.group, b.binding) == (group, binding))
-        };
-        // The kept light replaces the lights, their lists and the shadow maps.
-        assert!(reads(&water, 0, 19));
-        for binding in [1, 2, 3, 4, 14] {
-            assert!(
-                !reads(&water, 0, binding),
-                "fs_water reads binding {binding}"
-            );
-        }
-        // Materials bind the same group to both; the statics take the scene's group, which must
-        // not hold the target they draw into.
-        let group = |b: &[ganbate_shader::Binding], g| {
-            b.iter()
-                .filter(|b| b.group == g)
-                .copied()
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            group(&water, MATERIAL_GROUP),
-            group(&opaque, MATERIAL_GROUP)
-        );
+        let kept = [
+            (
+                0,
+                17,
+                BindingKind::UniformBuffer {
+                    size: RESHADE_BYTES as u32,
+                },
+            ),
+            (
+                0,
+                19,
+                BindingKind::Texture {
+                    view: TextureView::D2,
+                    sample: SampleType::Float,
+                },
+            ),
+        ]
+        .map(|(group, binding, kind)| ganbate_shader::Binding {
+            group,
+            binding,
+            kind,
+        });
+        assert_eq!(water, sorted_bindings(&[&opaque[..], &kept].concat()));
+        // The statics take the scene's group, which must not hold the target they draw into.
         assert_eq!(statics, opaque);
         for (entry, spec) in [("fs_water", &WATER_STATICS[..]), ("fs_water_static", &[])] {
             let opts = CompileOptions {
@@ -4655,9 +4726,11 @@ mod tests {
     /// A presented frame, whose water reads its lamp light and shadow as the cached picture
     /// keeps them (`cache_water`), shows what a still (computing them) shows, to the step its
     /// own sRGB encoding rounds differently: by day and at night under a lamp and a spot light,
-    /// and after a ball under the spot (its shadow on the water) moves. Held, and while the ball
-    /// settles into the picture, it does not change. The pond stands alone: with nothing else in
-    /// the picture no frame re-shades it (`fs_reshade_mask`, which llvmpipe crashes on).
+    /// and while a ball under the spot (its shadow on the water) moves every frame, as a
+    /// dealer's idle does, which the water follows without drawing what it keeps again. Held,
+    /// and while the ball settles into the picture, it does not change. The pond stands alone:
+    /// with nothing else in the picture no frame re-shades it (`fs_reshade_mask`, which llvmpipe
+    /// crashes on).
     #[test]
     fn the_cached_water_matches_the_water_computed_each_frame() {
         let Ok(mut device) = Device::headless() else {
@@ -4797,40 +4870,78 @@ mod tests {
                 .max()
                 .unwrap_or(0)
         };
+        // A frame drawing the picture whole computes the water's light; the next keeps it.
         let computed = frame_srgb(&mut device, &mut still, &view, &day, None);
         let first = frame_srgb(&mut device, &mut live, &view, &day, out);
-        assert!(!live.last_frame_stats().world_cached);
+        let s = live.last_frame_stats();
+        assert!(!s.world_cached && !s.water_kept && !s.water_statics_whole);
         let d = differ(&first, &computed);
         assert!(
             d <= 1,
             "the frame drawing the cached picture differs by {d}"
         );
         let held = frame_srgb(&mut device, &mut live, &view, &day, out);
-        assert!(live.last_frame_stats().world_cached);
-        assert!(held == first, "a held frame changed");
+        let s = live.last_frame_stats();
+        assert!(s.world_cached && s.water_kept && s.water_statics_whole);
+        assert!(
+            held == first,
+            "the first frame keeping the water's light changed"
+        );
         let mut settled = false;
         for _ in 0..10 {
             let frame = frame_srgb(&mut device, &mut live, &view, &day, out);
-            settled |= live.last_frame_stats().cache_regions > 0;
+            let s = live.last_frame_stats();
+            assert!(s.water_kept && !s.water_statics_whole);
+            settled |= s.cache_regions > 0 && s.water_statics_regions > 0;
             assert!(frame == first, "a frame changed as the ball settled");
         }
         assert!(settled, "the ball never settled into the picture");
 
-        for (r, ball) in [&mut still, &mut live].into_iter().zip(&balls) {
-            r.set_prop_instance(*ball, &ball_at(0.5), true)
-                .expect("move");
+        // The ball leaves the picture and moves on every frame, back over where its shadow was.
+        let mut frames = vec![];
+        for x in [0.5, 0.2, 0.5, -0.4] {
+            for (r, ball) in [&mut still, &mut live].into_iter().zip(&balls) {
+                r.set_prop_instance(*ball, &ball_at(x), true).expect("move");
+            }
+            let moved = frame_srgb(&mut device, &mut still, &view, &day, None);
+            let frame = frame_srgb(&mut device, &mut live, &view, &day, out);
+            let s = live.last_frame_stats();
+            assert!(s.water_kept && !s.water_statics_whole && s.water_footprints > 0);
+            assert!(!s.reshaded);
+            let d = differ(&frame, &moved);
+            assert!(d <= 1, "the frame with the ball at {x} differs by {d}");
+            frames.push(moved);
         }
-        let moved = frame_srgb(&mut device, &mut still, &view, &day, None);
-        assert!(moved != computed, "the ball did not move");
-        let frame = frame_srgb(&mut device, &mut live, &view, &day, out);
-        assert!(!live.last_frame_stats().reshaded);
-        let d = differ(&frame, &moved);
-        assert!(d <= 1, "the frame after the ball moved differs by {d}");
+        assert!(
+            frames[0] != computed && frames[1] != frames[0],
+            "the ball did not move"
+        );
+        assert!(frames[3] == computed, "the ball did not return");
 
+        // At night the lamp and the spot light the water.
         let computed = frame_srgb(&mut device, &mut still, &view, &night, None);
         let frame = frame_srgb(&mut device, &mut live, &view, &night, out);
+        assert!(!live.last_frame_stats().water_kept);
         let d = differ(&frame, &computed);
         assert!(d <= 1, "the night frame differs by {d}");
+        let frame = frame_srgb(&mut device, &mut live, &view, &night, out);
+        let s = live.last_frame_stats();
+        assert!(s.water_kept && s.water_statics_whole);
+        let d = differ(&frame, &computed);
+        assert!(d <= 1, "the held night frame differs by {d}");
+        for (r, ball) in [&mut still, &mut live].into_iter().zip(&balls) {
+            r.set_prop_instance(*ball, &ball_at(0.3), true)
+                .expect("move");
+        }
+        let moved = frame_srgb(&mut device, &mut still, &view, &night, None);
+        assert!(moved != computed, "the ball's shadow did not move at night");
+        let frame = frame_srgb(&mut device, &mut live, &view, &night, out);
+        assert!(live.last_frame_stats().water_footprints > 0);
+        let d = differ(&frame, &moved);
+        assert!(
+            d <= 1,
+            "the night frame after the ball moved differs by {d}"
+        );
 
         let errs = device.validation_errors();
         assert!(errs.is_empty(), "validation errors: {errs:?}");
