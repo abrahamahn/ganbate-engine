@@ -1,10 +1,18 @@
 use super::*;
 
-pub(super) fn shader_modules() -> [(&'static str, &'static str); 2] {
-    let (common_mod, brdf_mod) = COMMON
-        .split_once("// --- module: brdf ---")
-        .expect("brdf module delimiter in common.wgsl");
-    [("common", common_mod), ("brdf", brdf_mod)]
+pub(super) fn shader_modules() -> [(&'static str, &'static str); 4] {
+    [
+        ("common", COMMON),
+        ("brdf", BRDF),
+        ("scene_detail", SCENE_DETAIL),
+        ("scene_grass", SCENE_GRASS),
+    ]
+}
+
+/// Expands the stylized renderer's `#import` library (`common`, `brdf`, `scene_detail`,
+/// `scene_grass`) into `body`.
+pub fn compose_shader(body: &str) -> Result<String> {
+    ganbate_shader::compose(body, &shader_modules()).map_err(|e| e.to_string())
 }
 
 pub(super) fn compile(body: &str, stage: Stage, entry: &str) -> Result<Compiled> {
@@ -18,7 +26,7 @@ pub(super) fn compile_specialized(
     entry: &str,
     specialize: &[(&str, SpecValue)],
 ) -> Result<Compiled> {
-    let source = ganbate_shader::compose(body, &shader_modules()).map_err(|e| e.to_string())?;
+    let source = compose_shader(body)?;
     crate::gpu::compile_shader_specialized(&source, stage, entry, specialize)
 }
 

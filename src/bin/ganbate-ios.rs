@@ -19,9 +19,10 @@ fn main() {
 
 #[cfg(target_os = "ios")]
 mod app {
+    use ganbate_engine::cli::{FlyCamera, load_look_or_default, load_world, views_or_overview};
     use ganbate_engine::gpu::Device;
     use ganbate_engine::render::{
-        Environment, LookFile, Output, Quality, Renderer, TimeOfDay, View, Weather, math,
+        Environment, Output, Quality, Renderer, TimeOfDay, View, Weather, math,
     };
     use ganbate_engine::window::ios::{Input, TouchPhase, Window};
     use std::time::Instant;
@@ -31,42 +32,13 @@ mod app {
     /// Metres of travel per pixel of two-finger drag.
     const MOVE: f32 = 0.02;
 
-    struct Fly {
-        pos: math::V3,
-        yaw: f32,
-        pitch: f32,
-    }
-    impl Fly {
-        fn from_view(v: &View) -> Self {
-            let d = math::normalize(math::sub(v.target, v.eye));
-            Self {
-                pos: v.eye,
-                yaw: d[0].atan2(-d[2]),
-                pitch: d[1].clamp(-1.0, 1.0).asin(),
-            }
-        }
-        fn forward(&self) -> math::V3 {
-            let c = self.pitch.cos();
-            [c * self.yaw.sin(), self.pitch.sin(), -c * self.yaw.cos()]
-        }
-        fn view(&self, fov: f32) -> View {
-            View {
-                name: "free".into(),
-                eye: self.pos,
-                target: math::add(self.pos, math::scale(self.forward(), 30.0)),
-                fov,
-                ..View::default()
-            }
-        }
-    }
-
     struct App {
         window: &'static Window,
         device: Device<'static>,
         renderer: Renderer,
         views: Vec<View>,
         view_index: usize,
-        fly: Fly,
+        fly: FlyCamera,
         fov: f32,
         time: TimeOfDay,
         weather_index: usize,
@@ -103,13 +75,9 @@ mod app {
         fn new(window: &'static Window) -> Result<Self, String> {
             let world_path = Window::resource("world.gbew")
                 .ok_or("world.gbew is missing from the app bundle (see build-ios.sh)")?;
-            let world = ganbate_engine::assets::cooked::decode(
-                &ganbate_engine::assets::read_asset(&world_path)?,
-            )?;
-            let file = match Window::resource("look.json") {
-                Some(p) => LookFile::parse(&ganbate_engine::assets::read_asset(&p)?)?,
-                None => LookFile::default(),
-            };
+            let world = load_world(&world_path)?;
+            let look_res = Window::resource("look.json");
+            let file = load_look_or_default(look_res.as_deref())?;
             let mut device = Device::for_window(window)?;
             let (size, format) = (device.surface_size(), device.surface_format());
             let renderer = Renderer::new(
@@ -120,23 +88,7 @@ mod app {
                 size,
                 Output::Surface(format),
             )?;
-            let views = if file.views.is_empty() {
-                let (lo, hi) = renderer.bounds();
-                let c = [
-                    (lo[0] + hi[0]) * 0.5,
-                    (lo[1] + hi[1]) * 0.5,
-                    (lo[2] + hi[2]) * 0.5,
-                ];
-                vec![View {
-                    name: "overview".into(),
-                    eye: [c[0] + 40.0, c[1] + 25.0, c[2] + 40.0],
-                    target: c,
-                    fov: 50.0,
-                    ..View::default()
-                }]
-            } else {
-                file.views.clone()
-            };
+            let views = views_or_overview(&file, renderer.bounds(), 50.0);
             let buttons = [
                 window.add_button("Time +1h"),
                 window.add_button("Weather"),
@@ -150,7 +102,7 @@ mod app {
             );
             Ok(Self {
                 window,
-                fly: Fly::from_view(&views[0]),
+                fly: FlyCamera::from_view(&views[0]),
                 fov: views[0].fov,
                 views,
                 view_index: 0,
@@ -223,7 +175,7 @@ mod app {
                 Input::Button(b) if b == self.buttons[2] => {
                     self.view_index = (self.view_index + 1) % self.views.len();
                     let v = &self.views[self.view_index];
-                    self.fly = Fly::from_view(v);
+                    self.fly = FlyCamera::from_view(v);
                     self.fov = v.fov;
                     self.window.set_button_title(self.buttons[2], &v.name);
                 }

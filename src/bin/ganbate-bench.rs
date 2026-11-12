@@ -386,15 +386,16 @@ fn run_compute_benchmarks() {
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     use ganbate_engine::{
-        Camera, assets,
+        Camera,
+        cli::{Args, load_world},
         timing::Distribution,
         vulkan::{VulkanRenderer, bench},
     };
-    let mut args = std::env::args().skip(1);
+    let mut args = Args::from_env();
     let (mut w, mut h, mut warmup, mut frames) = (1920, 1080, 40, 240);
     let mut scene_path = None;
     let mut compute = false;
-    while let Some(flag) = args.next() {
+    while let Some(flag) = args.next_arg() {
         if flag == "--help" {
             println!(
                 "ganbate-bench [--scene world.gbew] [--width 1920] [--height 1080] [--warmup 40] [--frames 240] [--compute]"
@@ -405,18 +406,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             compute = true;
             continue;
         }
-        let value = args.next().ok_or("missing option value")?;
         match flag.as_str() {
-            "--scene" => scene_path = Some(value),
-            "--width" => w = value.parse()?,
-            "--height" => h = value.parse()?,
-            "--warmup" => warmup = value.parse()?,
-            "--frames" => frames = value.parse()?,
+            "--scene" => scene_path = Some(args.path(&flag)?),
+            "--width" => w = args.parsed(&flag)?,
+            "--height" => h = args.parsed(&flag)?,
+            "--warmup" => warmup = args.parsed(&flag)?,
+            "--frames" => frames = args.parsed(&flag)?,
             _ => return Err(format!("unknown option {flag}").into()),
         }
     }
     let scene = if let Some(path) = scene_path {
-        assets::cooked::decode(&assets::read_asset(std::path::Path::new(&path))?)?.scene()?
+        load_world(&path)?.scene()?
     } else {
         demo::gallery(0.65)
     };

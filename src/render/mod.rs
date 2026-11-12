@@ -44,5 +44,5 @@ pub use props::{
     BlendMode, MaterialDesc, MeshData, PROP_SHADER_PARAMS, Pick, PropInstance, PropMaterial,
     PropMesh, PropShader, PropTexture, WorldPick,
 };
-pub use renderer::{FrameStats, Output, Quality, Renderer};
+pub use renderer::{FrameStats, Output, Quality, Renderer, compose_shader};
 pub use sky::{Environment, Palette, SkyKey, TimeOfDay, Weather};

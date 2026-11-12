@@ -7,9 +7,10 @@
 //!            [--surface MODEL] [--tonemap stylized|agx|aces] [--ev100 EV]
 //!            [--sequence START_HOURS END_HOURS FRAMES]   (a time-lapse of one view, numbered
 //!                                                         frames in --out-dir)
+use ganbate_engine::cli::{Args, load_look_or_default, load_world, overview_view};
 use ganbate_engine::gpu::Device;
 use ganbate_engine::render::{
-    Environment, LookFile, Output, Quality, Renderer, SurfaceModel, ToneMap, View, Weather,
+    Environment, Output, Quality, Renderer, SurfaceModel, ToneMap, View, Weather,
 };
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -22,7 +23,7 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let mut args = std::env::args().skip(1);
+    let mut args = Args::from_env();
     let mut scene = None;
     let mut look_path = None;
     let mut view_name = None;
@@ -39,49 +40,42 @@ fn run() -> Result<(), String> {
     let mut tonemap_override = None;
     let mut ev100_override = None;
     let mut sequence: Option<(f32, f32, u32)> = None;
-    while let Some(a) = args.next() {
-        let mut val = || args.next().ok_or(format!("{a} needs a value"));
+    while let Some(a) = args.next_arg() {
         match a.as_str() {
-            "--scene" => scene = Some(PathBuf::from(val()?)),
-            "--look" => look_path = Some(PathBuf::from(val()?)),
-            "--view" => view_name = Some(val()?),
+            "--scene" => scene = Some(args.path(&a)?),
+            "--look" => look_path = Some(args.path(&a)?),
+            "--view" => view_name = Some(args.value(&a)?),
             "--all-views" => all_views = true,
-            "--time" => hours = Some(val()?.parse::<f32>().map_err(|e| e.to_string())?),
-            "--weather" => weather = Some(val()?),
-            "--width" => width = val()?.parse().map_err(|e| format!("--width: {e}"))?,
-            "--height" => height = val()?.parse().map_err(|e| format!("--height: {e}"))?,
-            "--samples" => samples = val()?.parse().map_err(|e| format!("--samples: {e}"))?,
-            "--seconds" => seconds = val()?.parse().map_err(|e| format!("--seconds: {e}"))?,
-            "--out" => out = PathBuf::from(val()?),
-            "--out-dir" => out_dir = Some(PathBuf::from(val()?)),
+            "--time" => hours = Some(args.parsed::<f32>(&a)?),
+            "--weather" => weather = Some(args.value(&a)?),
+            "--width" => width = args.parsed(&a)?,
+            "--height" => height = args.parsed(&a)?,
+            "--samples" => samples = args.parsed(&a)?,
+            "--seconds" => seconds = args.parsed(&a)?,
+            "--out" => out = args.path(&a)?,
+            "--out-dir" => out_dir = Some(args.path(&a)?),
             "--realtime-quality" => realtime = true,
             "--hybrid-quality" => hybrid = true,
             "--surface" => {
-                let s = val()?;
+                let s = args.value(&a)?;
                 surface_override = Some(
                     SurfaceModel::parse(&s)
                         .ok_or_else(|| format!("--surface: unknown surface model {s:?}"))?,
                 );
             }
             "--tonemap" => {
-                let s = val()?;
+                let s = args.value(&a)?;
                 tonemap_override = Some(
                     ToneMap::parse(&s)
                         .ok_or_else(|| format!("--tonemap: unknown tonemap {s:?}"))?,
                 );
             }
-            "--ev100" => {
-                ev100_override = Some(val()?.parse::<f32>().map_err(|e| format!("--ev100: {e}"))?);
-            }
+            "--ev100" => ev100_override = Some(args.parsed::<f32>(&a)?),
             "--sequence" => {
-                let a: f32 = val()?
-                    .parse()
-                    .map_err(|e| format!("--sequence start: {e}"))?;
-                let b: f32 = val()?.parse().map_err(|e| format!("--sequence end: {e}"))?;
-                let n: u32 = val()?
-                    .parse()
-                    .map_err(|e| format!("--sequence frames: {e}"))?;
-                sequence = Some((a, b, n.max(2)));
+                let start: f32 = args.parsed("--sequence start")?;
+                let end: f32 = args.parsed("--sequence end")?;
+                let frames: u32 = args.parsed("--sequence frames")?;
+                sequence = Some((start, end, frames.max(2)));
             }
             _ => return Err(format!("unknown argument {a}")),
         }
@@ -91,12 +85,8 @@ fn run() -> Result<(), String> {
         return Err("--sequence renders one view (--view NAME) into --out-dir".into());
     }
     let started = Instant::now();
-    let world =
-        ganbate_engine::assets::cooked::decode(&ganbate_engine::assets::read_asset(&scene)?)?;
-    let mut file = match &look_path {
-        Some(p) => LookFile::parse(&ganbate_engine::assets::read_asset(p)?)?,
-        None => LookFile::default(),
-    };
+    let world = load_world(&scene)?;
+    let mut file = load_look_or_default(look_path.as_deref())?;
     if let Some(h) = hours {
         file.time.hours = h;
     }
@@ -153,20 +143,7 @@ fn run() -> Result<(), String> {
     } else if let Some(v) = file.views.first() {
         vec![v.clone()]
     } else {
-        let (lo, hi) = renderer.bounds();
-        let c = [
-            (lo[0] + hi[0]) * 0.5,
-            (lo[1] + hi[1]) * 0.5,
-            (lo[2] + hi[2]) * 0.5,
-        ];
-        let r = ((hi[0] - lo[0]).powi(2) + (hi[2] - lo[2]).powi(2)).sqrt() * 0.4;
-        vec![View {
-            name: "overview".into(),
-            eye: [c[0] + r, c[1] + r * 0.6, c[2] + r],
-            target: c,
-            fov: 45.0,
-            ..View::default()
-        }]
+        vec![overview_view(renderer.bounds(), 45.0)]
     };
     if let Some((start, end, frames)) = sequence {
         let dir = out_dir.clone().ok_or("--sequence needs --out-dir")?;

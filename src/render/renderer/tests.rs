@@ -68,7 +68,11 @@ fn lamp_clusters_slice_view_depth_in_log_steps() {
 
 #[test]
 fn grass_spacing_matches_the_shader() {
-    assert!(SCENE.contains(&format!("const GRASS_SPACING = {GRASS_SPACING};")));
+    assert!(
+        compose_shader(SCENE)
+            .unwrap()
+            .contains(&format!("const GRASS_SPACING = {GRASS_SPACING};"))
+    );
 }
 
 #[test]

@@ -3,6 +3,7 @@
 pub mod anim;
 #[cfg(target_vendor = "apple")]
 mod apple;
+pub mod cli;
 pub mod gpu;
 #[cfg(target_vendor = "apple")]
 mod metal;

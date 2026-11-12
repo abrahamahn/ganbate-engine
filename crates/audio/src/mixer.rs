@@ -173,11 +173,7 @@ pub fn synthesize_fallback_take(asset_id: &str, sample_rate: u32, duration_ms: f
     let sr = sample_rate.max(8_000);
     let len =
         (((duration_ms.clamp(20.0, 10_000.0) * 0.001) * (sr as f32)).round() as usize).max(16);
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for b in asset_id.bytes() {
-        hash ^= u64::from(b);
-        hash = hash.wrapping_mul(0x0100_0000_01b3);
-    }
+    let hash = ganbate_core::digest::fnv1a64(asset_id.as_bytes());
     let mut rng = AudioRng::seeded(hash);
     let base_freq = 160.0 + ((hash & 0xff) as f32) * 3.2;
     let mut frames = Vec::with_capacity(len);

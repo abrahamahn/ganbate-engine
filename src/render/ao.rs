@@ -20,30 +20,22 @@ const SIDECAR_VERSION: u32 = 1;
 /// What a sidecar must have been baked for: each instance's mesh with its vertex count and
 /// bounds, where the instance stands, and whether it is shown and drawn (FNV-1a).
 fn fingerprint(edit: &WorldEdit) -> u64 {
-    fn put(h: &mut u64, bytes: &[u8]) {
-        for b in bytes {
-            *h = (*h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
-        }
-    }
-    let mut h = 0xcbf2_9ce4_8422_2325;
-    put(&mut h, &(edit.instances.len() as u32).to_le_bytes());
+    let mut h = crate::digest::Fnv1a64::new();
+    h.write(&(edit.instances.len() as u32).to_le_bytes());
     for inst in &edit.instances {
         let mesh = &edit.meshes[inst.mesh as usize];
-        put(&mut h, &inst.mesh.to_le_bytes());
-        put(&mut h, &(mesh.positions.len() as u32).to_le_bytes());
+        h.write(&inst.mesh.to_le_bytes());
+        h.write(&(mesh.positions.len() as u32).to_le_bytes());
         let (lo, hi) = mesh.bounds;
         for v in lo.iter().chain(&hi).chain(&inst.transform) {
-            put(&mut h, &v.to_le_bytes());
+            h.write(&v.to_le_bytes());
         }
-        put(
-            &mut h,
-            &[
-                u8::from(inst.visible),
-                u8::from(inst.first_vertex.is_some()),
-            ],
-        );
+        h.write(&[
+            u8::from(inst.visible),
+            u8::from(inst.first_vertex.is_some()),
+        ]);
     }
-    h
+    h.finish()
 }
 
 /// Reads a sidecar front to back.

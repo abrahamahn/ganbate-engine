@@ -6,8 +6,8 @@
 use std::process::Command;
 
 use ganbate_engine::gpu::shader::{Stage, compile_glsl};
+use ganbate_engine::render::compose_shader;
 
-const COMMON: &str = include_str!("../src/render/shaders/common.wgsl");
 const SCENE: &str = include_str!("../src/render/shaders/scene.wgsl");
 const WORLD_FX: &str = include_str!("../src/render/shaders/world_fx.wgsl");
 const POST: &str = include_str!("../src/render/shaders/post.wgsl");
@@ -82,7 +82,7 @@ fn renderer_shaders_compile_and_link_as_glsl_es() {
     let dump = std::env::var_os("GANBATE_GLSL_DUMP").map(std::path::PathBuf::from);
     let mut failures = Vec::new();
     for &(body, vs_entry, fs_entry) in PAIRS {
-        let source = format!("{COMMON}\n{body}");
+        let source = compose_shader(body).expect("compose shader");
         let vs = compile_glsl(&source, Stage::Vertex, vs_entry)
             .unwrap_or_else(|e| panic!("{vs_entry}: {e}"))
             .glsl
@@ -127,7 +127,8 @@ fn prop_shaders_compile_and_link_as_glsl_es() {
         let soft = textureSampleBias(base_tex, material_sampler, in.uv, 2.0);
         return vec4f(mix(in.p1.rgb, soft.rgb, in.p4.x), ring * lit * in.tint.a);
     }";
-    let source = format!("{COMMON}\n{SCENE}\n{PROP_SHADER_INPUT}\n{user}\n{PROP_SHADER}");
+    let raw = format!("{SCENE}\n{PROP_SHADER_INPUT}\n{user}\n{PROP_SHADER}");
+    let source = compose_shader(&raw).expect("compose prop shader");
     let vs = compile_glsl(&source, Stage::Vertex, "vs_prop")
         .unwrap_or_else(|e| panic!("vs_prop: {e}"))
         .glsl

@@ -1,5 +1,5 @@
 //! The stylized renderer's shaders as Metal Shading Language: every entry point of
-//! `src/render/shaders` (with `common.wgsl` prepended, as the renderer does) must emit MSL,
+//! `src/render/shaders` (composed with the renderer's `#import` library) must emit MSL,
 //! and, when `clang++` is available, compile against ganbate-shader's stand-in `metal_stdlib`.
 //! A compile check on Linux, not a Metal run.
 
@@ -7,8 +7,8 @@
 mod check;
 
 use ganbate_engine::gpu::shader::{MslIndex, compile_msl, entry_points};
+use ganbate_engine::render::compose_shader;
 
-const COMMON: &str = include_str!("../src/render/shaders/common.wgsl");
 const SHADERS: [(&str, &str); 3] = [
     (
         "scene.wgsl",
@@ -30,7 +30,7 @@ fn renderer_shaders_emit_msl_that_compiles() {
     let mut failures = Vec::new();
     let mut count = 0;
     for (name, body) in SHADERS {
-        let source = format!("{COMMON}\n{body}");
+        let source = compose_shader(body).expect("compose shader");
         for (entry, stage) in entry_points(&source).unwrap() {
             let tag = format!("{name}:{entry}");
             let msl = match compile_msl(&source, stage, &entry) {

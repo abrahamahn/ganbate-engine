@@ -1,5 +1,6 @@
 //! SHA-256 (content addresses of cooked and published files), SHA-1 and base64 (the WebSocket
-//! handshake), written from FIPS 180-4 and RFC 4648.
+//! handshake), and 64-bit FNV-1a (deterministic non-cryptographic runtime fingerprints), written
+//! from FIPS 180-4 and RFC 4648.
 
 /// Incremental SHA-256.
 #[derive(Clone)]
@@ -253,6 +254,48 @@ pub fn base64_decode(text: &str) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Incremental 64-bit FNV-1a non-cryptographic hasher for deterministic runtime cache keys and
+/// procedural seeds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fnv1a64(u64);
+
+impl Default for Fnv1a64 {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Fnv1a64 {
+    pub const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    pub const PRIME: u64 = 0x0100_0000_01b3;
+
+    #[inline]
+    pub const fn new() -> Self {
+        Self(Self::OFFSET_BASIS)
+    }
+
+    #[inline]
+    pub fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(Self::PRIME);
+        }
+    }
+
+    #[inline]
+    pub const fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+/// Computes the 64-bit FNV-1a hash of `bytes`.
+#[inline]
+pub fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut h = Fnv1a64::new();
+    h.write(bytes);
+    h.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,5 +365,12 @@ mod tests {
         assert!(base64_decode("====").is_err());
         assert!(base64_decode("Zm=v").is_err());
         assert!(base64_decode("Zm9$").is_err());
+    }
+
+    #[test]
+    fn fnv1a64_known_answers() {
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
     }
 }

@@ -46,12 +46,7 @@ fn u64_words(v: u64) -> [u32; 2] {
 
 #[inline]
 fn hash_bytes(data: &[u8]) -> usize {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for &b in data {
-        h ^= u64::from(b);
-        h = h.wrapping_mul(0x0100_0000_01b3);
-    }
-    h as usize
+    crate::digest::fnv1a64(data) as usize
 }
 
 /// Push-constant blocks of one submission, deduplicated without per-block `Vec<u8>` allocations.

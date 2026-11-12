@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Verifies ganbate-engine's directory topology, crate naming (no redundant `ganbate-` folder
-// prefixes under `crates/`), zero external Cargo dependencies, and `web/` structure.
+// prefixes under `crates/`), zero external Cargo dependencies, `web/` structure, and per-file
+// source line-count budgets so monolithic files cannot regress.
 
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
@@ -152,6 +153,54 @@ function checkWebTopology() {
   }
 }
 
+const MAX_PROD_SOURCE_LINES = 1900;
+const MAX_TEST_SOURCE_LINES = 2500;
+const MAX_SHADER_LINES = 1000;
+const SOURCE_EXT_RE = /\.(rs|ts|tsx|wgsl|mjs|cjs)$/;
+const SKIP_WALK_DIRS = new Set(['.git', '.github', 'artifacts', 'dist', 'node_modules', 'target']);
+
+function isTestSourcePath(relPosix) {
+  return (
+    relPosix.startsWith('tests/') ||
+    relPosix.startsWith('web/test/') ||
+    relPosix.includes('/tests/') ||
+    relPosix.endsWith('/tests.rs') ||
+    /\.test\.[a-z]+$/.test(relPosix)
+  );
+}
+
+function checkSourceLineBudgets() {
+  let checked = 0;
+  function walk(absDir) {
+    for (const entry of readdirSync(absDir, { withFileTypes: true })) {
+      if (SKIP_WALK_DIRS.has(entry.name)) continue;
+      const absPath = path.join(absDir, entry.name);
+      if (entry.isDirectory()) {
+        walk(absPath);
+        continue;
+      }
+      if (!entry.isFile() || !SOURCE_EXT_RE.test(entry.name)) continue;
+      checked += 1;
+      const relPosix = path.relative(REPO_ROOT, absPath).split(path.sep).join('/');
+      const text = readFileSync(absPath, 'utf8');
+      const lines = text.split(/\r?\n/).length - (text.endsWith('\n') ? 1 : 0);
+      if (entry.name.endsWith('.wgsl')) {
+        if (lines > MAX_SHADER_LINES) {
+          errors.push(`WGSL shader exceeds ${MAX_SHADER_LINES}-line ceiling (${lines} lines): ${relPosix}`);
+        }
+      } else if (isTestSourcePath(relPosix)) {
+        if (lines > MAX_TEST_SOURCE_LINES) {
+          errors.push(`Test file exceeds ${MAX_TEST_SOURCE_LINES}-line ceiling (${lines} lines): ${relPosix}`);
+        }
+      } else if (lines > MAX_PROD_SOURCE_LINES) {
+        errors.push(`Source file exceeds ${MAX_PROD_SOURCE_LINES}-line ceiling (${lines} lines): ${relPosix}`);
+      }
+    }
+  }
+  walk(REPO_ROOT);
+  return checked;
+}
+
 checkRootTopology();
 checkCratesTopology();
 checkZeroExternalCargoDeps('Cargo.toml');
@@ -159,6 +208,7 @@ for (const crate of EXPECTED_CRATES) {
   checkZeroExternalCargoDeps(`crates/${crate}/Cargo.toml`);
 }
 checkWebTopology();
+const checkedFiles = checkSourceLineBudgets();
 
 if (errors.length > 0) {
   console.error(`ganbate-engine topology audit failed (${errors.length} issue(s)):`);
@@ -169,5 +219,5 @@ if (errors.length > 0) {
 }
 
 console.log(
-  `ganbate-engine topology audit passed (7 top-level pillars, ${EXPECTED_CRATES.length} clean crates, 0 external Cargo deps, React+TS web/ layout).`,
+  `ganbate-engine topology audit passed (7 top-level pillars, ${EXPECTED_CRATES.length} clean crates, 0 external Cargo deps, React+TS web/ layout, ${checkedFiles} source files within LOC budgets).`,
 );

@@ -27,6 +27,9 @@ use super::scene::{DrawItem, GpuScene};
 use super::sky::Environment;
 
 const COMMON: &str = include_str!("../shaders/common.wgsl");
+const BRDF: &str = include_str!("../shaders/brdf.wgsl");
+const SCENE_DETAIL: &str = include_str!("../shaders/scene_detail.wgsl");
+const SCENE_GRASS: &str = include_str!("../shaders/scene_grass.wgsl");
 const SCENE: &str = include_str!("../shaders/scene.wgsl");
 const WORLD_FX: &str = include_str!("../shaders/world_fx.wgsl");
 const POST: &str = include_str!("../shaders/post.wgsl");
@@ -51,20 +54,7 @@ const AO_CACHE_REFRESH_FRAMES: u32 = 15;
 const CAMERA_SECONDS: usize = 5 * 64 + 12;
 
 /// FNV-1a over bytes: a fingerprint of what the cached world was drawn for.
-pub(in crate::render) struct Fnv(u64);
-impl Fnv {
-    pub(in crate::render) fn new() -> Self {
-        Self(0xcbf2_9ce4_8422_2325)
-    }
-    pub(in crate::render) fn write(&mut self, bytes: &[u8]) {
-        for b in bytes {
-            self.0 = (self.0 ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3);
-        }
-    }
-    pub(in crate::render) fn finish(&self) -> u64 {
-        self.0
-    }
-}
+pub(in crate::render) use crate::digest::Fnv1a64 as Fnv;
 
 /// Vertex AO samples a live frame may bake (each casts `AoConfig::rays` rays): about 3 ms in
 /// wasm, inside a 120 Hz frame. Nearest the camera first, so what is in view settles first.
@@ -754,5 +744,6 @@ mod pipelines;
 mod tests;
 
 use cache::*;
+pub use pipelines::compose_shader;
 use pipelines::*;
 pub(in crate::render) use pipelines::{prop_shader_pipeline, prop_shader_stage};

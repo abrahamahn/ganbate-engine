@@ -5,28 +5,27 @@ mod demo;
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1);
+    use ganbate_engine::cli::{Args, load_world};
+    use std::path::Path;
+
+    let mut args = Args::from_env();
     let (mut limit, mut scene_path) = (None, None);
     let mut look_path: Option<String> = None;
     let mut high = false;
     let mut size = (1600u32, 900u32);
-    while let Some(flag) = args.next() {
+    while let Some(flag) = args.next_arg() {
         match flag.as_str() {
-            "--look" => look_path = Some(args.next().ok_or("missing look file path")?),
+            "--look" => look_path = Some(args.value(&flag)?),
             "--high" => high = true,
-            "--size" => {
-                let v = args.next().ok_or("missing WxH")?;
-                let (w, h) = v.split_once('x').ok_or("size must be WxH")?;
-                size = (w.parse()?, h.parse()?);
-            }
+            "--size" => size = args.size_wxh(&flag)?,
             "--frames" => {
-                let n = args.next().ok_or("missing frame count")?.parse::<u64>()?;
+                let n = args.parsed::<u64>(&flag)?;
                 if n == 0 {
                     return Err("frame count must be positive".into());
                 }
                 limit = Some(n);
             }
-            "--scene" => scene_path = Some(args.next().ok_or("missing cooked scene path")?),
+            "--scene" => scene_path = Some(args.value(&flag)?),
             "--help" => {
                 println!(
                     "ganbate-player [--frames N] [--scene world.gbew] [--look look.json] [--high] [--size WxH]\n\
@@ -39,9 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     if let Some(p) = &scene_path {
-        let world = ganbate_engine::assets::cooked::decode(&ganbate_engine::assets::read_asset(
-            std::path::Path::new(p),
-        )?)?;
+        let world = load_world(Path::new(p))?;
         if look_path.is_some() || !world.materials.is_empty() {
             return stylized::run(world, look_path.as_deref(), limit, high, size, p);
         }
@@ -139,46 +136,18 @@ fn observatory(_: Option<String>, _: Option<u64>) -> Result<(), Box<dyn std::err
 /// The stylized renderer in a window: fly around, scrub the time of day, change the weather.
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
 mod stylized {
+    use ganbate_engine::cli::{FlyCamera, load_look_or_default, views_or_overview};
     use ganbate_engine::gpu::Device;
     use ganbate_engine::render::{
-        Environment, LookFile, Output, Quality, Renderer, TimeOfDay, View, Weather, math,
+        Environment, Output, Quality, Renderer, TimeOfDay, Weather, math,
     };
     use ganbate_engine::window::{Event, Key, Window};
     use std::collections::HashSet;
+    use std::path::Path;
     use std::time::{Duration, Instant};
 
     pub const HELP: &str = "With a Look file: W/A/S/D fly, Q/E down/up, arrows or left-drag look, \
 Shift faster, 1-9 views, T/G time +/-, C day cycle, Y next weather, P pause motion, H help, Esc quit.";
-
-    struct Fly {
-        pos: math::V3,
-        yaw: f32,
-        pitch: f32,
-    }
-    impl Fly {
-        fn from_view(v: &View) -> Self {
-            let d = math::normalize(math::sub(v.target, v.eye));
-            Self {
-                pos: v.eye,
-                yaw: d[0].atan2(-d[2]),
-                pitch: d[1].clamp(-1.0, 1.0).asin(),
-            }
-        }
-        fn forward(&self) -> math::V3 {
-            let c = self.pitch.cos();
-            [c * self.yaw.sin(), self.pitch.sin(), -c * self.yaw.cos()]
-        }
-        fn view(&self, fov: f32) -> View {
-            // The target sits 30 m ahead: the renderer sizes shadow cascades from it.
-            View {
-                name: "free".into(),
-                eye: self.pos,
-                target: math::add(self.pos, math::scale(self.forward(), 30.0)),
-                fov,
-                ..View::default()
-            }
-        }
-    }
 
     fn clock(hours: f32) -> String {
         let m = (hours.rem_euclid(24.0) * 60.0).round() as u32 % (24 * 60);
@@ -193,12 +162,7 @@ Shift faster, 1-9 views, T/G time +/-, C day cycle, Y next weather, P pause moti
         size: (u32, u32),
         scene_name: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let file = match look_path {
-            Some(p) => LookFile::parse(&ganbate_engine::assets::read_asset(
-                std::path::Path::new(p),
-            )?)?,
-            None => LookFile::default(),
-        };
+        let file = load_look_or_default(look_path.map(Path::new))?;
         let window = Window::new("Ganbate Player", size.0, size.1)?;
         let mut device = Device::for_window(&window)?;
         let quality = if high {
@@ -215,24 +179,8 @@ Shift faster, 1-9 views, T/G time +/-, C day cycle, Y next weather, P pause moti
             surface_size,
             Output::Surface(surface_format),
         )?;
-        let views = if file.views.is_empty() {
-            let (lo, hi) = renderer.bounds();
-            let c = [
-                (lo[0] + hi[0]) * 0.5,
-                (lo[1] + hi[1]) * 0.5,
-                (lo[2] + hi[2]) * 0.5,
-            ];
-            vec![View {
-                name: "overview".into(),
-                eye: [c[0] + 40.0, c[1] + 25.0, c[2] + 40.0],
-                target: c,
-                fov: 50.0,
-                ..View::default()
-            }]
-        } else {
-            file.views.clone()
-        };
-        let mut fly = Fly::from_view(&views[0]);
+        let views = views_or_overview(&file, renderer.bounds(), 50.0);
+        let mut fly = FlyCamera::from_view(&views[0]);
         let mut fov = views[0].fov;
         let mut time: TimeOfDay = file.time;
         let presets = Weather::PRESETS;
@@ -263,7 +211,7 @@ Shift faster, 1-9 views, T/G time +/-, C day cycle, Y next weather, P pause moti
                         match k {
                             Key::Char(d @ b'1'..=b'9') => {
                                 if let Some(v) = views.get((d - b'1') as usize) {
-                                    fly = Fly::from_view(v);
+                                    fly = FlyCamera::from_view(v);
                                     fov = v.fov;
                                 }
                             }
