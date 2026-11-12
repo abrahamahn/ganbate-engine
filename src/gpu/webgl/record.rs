@@ -21,6 +21,7 @@
 //! * `COPY_BUFFER` src, src offset, dst, dst offset, size
 //! * `COPY_TEXTURE` texture, mip, layer, width, height, buffer, offset
 //! * `BLIT` src texture, mip, layer, dst texture, mip, layer, filter (0 nearest, 1 linear)
+//! * `COPY_DEPTH` src texture, mip, layer, dst texture, mip, layer, width, height (a depth blit)
 use super::ffi::SURFACE;
 use super::*;
 use crate::gpu::{Command, Encoder, Load, PassView, Span, TransferCmd};
@@ -41,6 +42,7 @@ const DRAW_INDEXED: u32 = 13;
 const COPY_BUFFER: u32 = 14;
 const COPY_TEXTURE: u32 = 15;
 const BLIT: u32 = 16;
+const COPY_DEPTH: u32 = 17;
 
 /// Marks a texture unit holding a storage buffer's data texture in [`Host::units`].
 const STORAGE_UNIT: u32 = 1 << 31;
@@ -857,7 +859,22 @@ impl Gpu<'_> {
             return Err("blit: WebGL 2 cannot blit between layers of one mip".into());
         }
         if s.desc.format.is_depth() || d.desc.format.is_depth() {
-            return Err("blit: WebGL 2 blits colour textures only".into());
+            // A depth blit is a whole-subresource copy (blitFramebuffer's depth needs a
+            // same-format, same-size, Nearest copy).
+            let size = s.desc.mip_size(src_mip);
+            if s.desc.format != d.desc.format
+                || size != d.desc.mip_size(dst_mip)
+                || filter != Filter::Nearest
+            {
+                return Err(
+                    "blit: depth blits need identical formats and sizes and Nearest filtering"
+                        .into(),
+                );
+            }
+            out.extend([
+                COPY_DEPTH, s.js, src_mip, src_layer, d.js, dst_mip, dst_layer, size.0, size.1,
+            ]);
+            return Ok(());
         }
         if filter == Filter::Linear && is_float32(s.desc.format) && !self.info.float_linear {
             return Err(format!(

@@ -49,17 +49,15 @@ fn linear_depth(d: f32) -> f32 {
 struct Restored {
   @location(0) color: vec4f,
   @location(1) aux: vec4f,
-  @builtin(frag_depth) depth: f32,
 };
 
-// The cached world (`Renderer::world_cache`) back into the frame's colour, aux and depth, pixel
-// for pixel, before the props, water, sky and weather are drawn over it.
+// The cached world (`Renderer::world_cache`) back into the frame's colour and aux, pixel for pixel
+// (its depth is copied), before the props, water, sky and weather are drawn over it.
 @fragment fn fs_restore(in: Screen) -> Restored {
   let p = vec2i(in.clip.xy);
   var o: Restored;
   o.color = textureLoad(src_tex, p, 0);
   o.aux = textureLoad(aux_tex, p, 0);
-  o.depth = textureLoad(depth_tex, p, 0);
   return o;
 }
 

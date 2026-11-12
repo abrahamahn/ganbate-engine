@@ -19,6 +19,7 @@
 //! * `COPY_BUFFER` src, src offset(u64), dst, dst offset(u64), size(u64)
 //! * `COPY_TEXTURE` texture, mip, layer, width, height, buffer, offset(u64), bytes per row
 //! * `BLIT` src texture, mip, layer, dst texture, mip, layer, filter (0 nearest, 1 linear)
+//! * `COPY_DEPTH` src texture, mip, layer, dst texture, mip, layer, width, height (a depth blit)
 use super::ffi::{EMPTY_GROUP, PUSH_COMPUTE, PUSH_RENDER, SURFACE};
 use super::*;
 use crate::gpu::{Command, Encoder, Load, PassView, Span, TransferCmd};
@@ -37,6 +38,7 @@ const DISPATCH: u32 = 11;
 const COPY_BUFFER: u32 = 12;
 const COPY_TEXTURE: u32 = 13;
 const BLIT: u32 = 14;
+const COPY_DEPTH: u32 = 15;
 
 fn u64_words(v: u64) -> [u32; 2] {
     [v as u32, (v >> 32) as u32]
@@ -724,7 +726,21 @@ impl Gpu<'_> {
             return Err("blit: source and destination are the same subresource".into());
         }
         if s.desc.format.is_depth() || d.desc.format.is_depth() {
-            return Err("blit: WebGPU blits colour textures only".into());
+            // WebGPU neither scales nor filters depth: a depth blit is a whole-subresource copy.
+            let size = s.desc.mip_size(src_mip);
+            if s.desc.format != d.desc.format
+                || size != d.desc.mip_size(dst_mip)
+                || filter != Filter::Nearest
+            {
+                return Err(
+                    "blit: depth blits need identical formats and sizes and Nearest filtering"
+                        .into(),
+                );
+            }
+            out.extend([
+                COPY_DEPTH, s.js, src_mip, src_layer, d.js, dst_mip, dst_layer, size.0, size.1,
+            ]);
+            return Ok(());
         }
         if filter == Filter::Linear && is_float32(s.desc.format) && !self.info.float32_filterable {
             return Err(format!(

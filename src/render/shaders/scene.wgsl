@@ -815,10 +815,14 @@ fn shade_scene(in: VsOut, front: bool, frag: vec4f, cut: bool) -> FsOut {
     let wn = water_normal(in.world, t);
     let cosv = clamp(dot(wn, v), 0.0, 1.0);
     let fres = 0.03 + 0.97 * pow(1.0 - cosv, 5.0);
-    var refl = sky_color(reflect(-v, wn));
+    // The reflection pass's picture where there is one; the sky (stars, moon, clouds) only where
+    // there is not, as it would be thrown away.
+    var refl: vec3f;
     if (!reflection_pass && frame.water2.w > 0.5) {
       let uv = frag.xy * frame.viewport.zw + wn.xz * vec2f(0.06, 0.035);
       refl = textureSampleLevel(reflection, clamp_sampler, uv, 0.0).rgb;
+    } else {
+      refl = sky_color(reflect(-v, wn));
     }
     // Depth below the surface from the ground map: shallows turn clear and green, and foam
     // lines the shore and anything standing in the water.

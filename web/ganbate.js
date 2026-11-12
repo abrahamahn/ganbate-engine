@@ -554,6 +554,14 @@ export function createHost(gpu, { onLog = () => {}, onStatus = () => {}, onError
           blit(enc, c[i], c[i + 1], c[i + 2], c[i + 3], c[i + 4], c[i + 5], c[i + 6]);
           i += 7;
           break;
+        case 15: // COPY_DEPTH
+          enc.copyTextureToTexture(
+            { texture: objects[c[i]].texture, mipLevel: c[i + 1], origin: [0, 0, c[i + 2]] },
+            { texture: objects[c[i + 3]].texture, mipLevel: c[i + 4], origin: [0, 0, c[i + 5]] },
+            [c[i + 6], c[i + 7], 1],
+          );
+          i += 8;
+          break;
         default:
           throw new Error(`unknown command ${op} at word ${i - 1}`);
       }
@@ -1440,6 +1448,16 @@ export function createGlHost(gpu, { onLog = () => {}, onStatus = () => {}, onErr
           i += 7;
           if (timing.on()) glMark('blit');
           break;
+        case 17: { // COPY_DEPTH
+          const from = framebuffer([], { t: texture(c[i]), mip: c[i + 1], layer: c[i + 2] });
+          framebuffer([], { t: texture(c[i + 3]), mip: c[i + 4], layer: c[i + 5] });
+          gl.bindFramebuffer(gl.READ_FRAMEBUFFER, from);
+          setFlag(gl.SCISSOR_TEST, false);
+          gl.blitFramebuffer(0, 0, c[i + 6], c[i + 7], 0, 0, c[i + 6], c[i + 7], gl.DEPTH_BUFFER_BIT, gl.NEAREST);
+          i += 8;
+          if (timing.on()) glMark('copy depth');
+          break;
+        }
         default:
           throw new Error(`unknown command ${op} at word ${i - 1}`);
       }

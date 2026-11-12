@@ -1064,6 +1064,8 @@ impl Pipelines {
             flower,
             sky,
             particle,
+            // Colour and aux only: the depth is copied, so the GPU keeps rejecting what lies
+            // behind the picture early (a shader-written depth would leave it none).
             restore: device.create_render_pipeline(&RenderPipelineDesc {
                 vertex: &fsvs,
                 fragment: Some(&compile(POST, Stage::Fragment, "fs_restore")?),
@@ -1074,7 +1076,7 @@ impl Pipelines {
                 depth: Some(DepthState {
                     format: Format::Depth32Float,
                     compare: Compare::Always,
-                    write: true,
+                    write: false,
                     bias_constant: 0.0,
                     bias_slope: 0.0,
                     clamp: false,
@@ -1669,10 +1671,23 @@ impl Renderer {
             height,
             hdr: tex(device, width, height, HDR, rt)?,
             aux: tex(device, width, height, HDR, rt)?,
-            depth: tex(device, width, height, Format::Depth32Float, depth_usage)?,
+            // The frame's depth starts as a copy of the cached picture's (`encode`).
+            depth: tex(
+                device,
+                width,
+                height,
+                Format::Depth32Float,
+                depth_usage | TextureUsage::COPY_DST,
+            )?,
             cache_hdr: tex(device, width, height, HDR, rt)?,
             cache_aux: tex(device, width, height, HDR, rt)?,
-            cache_depth: tex(device, width, height, Format::Depth32Float, depth_usage)?,
+            cache_depth: tex(
+                device,
+                width,
+                height,
+                Format::Depth32Float,
+                depth_usage | TextureUsage::COPY_SRC,
+            )?,
             reshade_depth: tex(device, width, height, Format::Depth32Float, depth_usage)?,
             cache_shadow: tex(device, width, height, HDR, rt)?,
             refl,
@@ -3406,13 +3421,26 @@ impl Renderer {
             stats.reshaded = true;
         }
 
-        // Main pass: world, sky, weather.
+        // Main pass: world, sky, weather. A cached frame starts from the picture's depth, copied:
+        // drawn from a shader instead, it would cost the GPU its early depth test for the rest of
+        // the pass, and the water under the deck (4.4 of 10.4 ms on a 780M) would be shaded
+        // whole behind it.
+        if cached {
+            enc.blit((t.cache_depth, 0, 0), (t.depth, 0, 0), Filter::Nearest);
+        }
         enc.begin_pass(PassDesc {
             colors: vec![
                 Attachment::clear(t.hdr, clear),
                 Attachment::clear(t.aux, clear),
             ],
-            depth: Some(Attachment::clear(t.depth, clear)),
+            depth: Some(Attachment {
+                load: if cached {
+                    Load::Load
+                } else {
+                    Load::Clear(clear)
+                },
+                ..Attachment::clear(t.depth, clear)
+            }),
         });
         // Timing each part (`split_passes`): the pass ends and goes on as another.
         let splits = self.split_passes && cached;
