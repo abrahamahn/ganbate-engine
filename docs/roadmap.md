@@ -82,7 +82,7 @@ The Studio can create, edit, undo and save Look assets while previewing them in 
   from `https://` pages, so a phone opens the studio's own preview page over the network (WebGL 2 there) and a
   game served over HTTPS follows edits through a relay on the game's own server (see the editor design).
 - Engine pieces the game slice needs: visibility groups (layers) of the cooked world; per-view grading; procedural
-  mesh builders; import settings for the usual fix-ups, with Draco and meshopt decoded at import; a shader standard
+  mesh builders; import settings for the usual fix-ups; a shader standard
   library and `ganbate-build check-shader`; cook provenance (engine revision and source hashes in every package);
   compressed cooked geometry for worlds and models (the first game's download budget needs it); Look rules for
   characters (cel ramps, rim and sheen in the model's rest space); clearcoat and glass approximated as Look rules

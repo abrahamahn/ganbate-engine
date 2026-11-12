@@ -87,7 +87,7 @@ Always distinguish **what runs today** from **planned milestones** (full breakdo
 | **Scene Identity, Cook & Studio Editor** | **Shipped (M1)** | `ganbate.project.json`, permanent `.meta.json` asset IDs, object-preserving GLB→scene import, GBEW v4 entity tables, Ganbate Studio (`localhost:7480`) with Asset Library, Outliner, schema-driven Inspector, gizmos, undo/redo, EN/KO UI, and `project-tools.json` workspace integration. |
 | **Deterministic 60 Hz Physics** | **Shipped (ahead of M9)** | Spheres, capsules, boxes, convex hulls, triangle meshes, heightfields; static/kinematic/dynamic bodies; 5 joints; CCD; ray/shape/overlap queries; kinematic character controller; identical 64-bit `state_hash` across native and WASM. Press **`P`** in Studio to simulate live. |
 | **AI Agent Scene CLI (`ganbate`)** | **Shipped** | Structured single-line JSON `inspect`, `validate`, `apply` (with `--dry-run`), `diff`, `undo`, and offscreen `render`. |
-| **Live Link, Device Loss & Packages** | **Next (M2)** | Live WebSocket sync into a running external game tab, Draco/meshopt decode at import, content-addressed platform packages, GPU context-loss recovery, adaptive resolution/idle pacing. |
+| **Live Link, Device Loss & Packages** | **Next (M2)** | Live WebSocket sync into a running external game tab, content-addressed platform packages, GPU context-loss recovery, adaptive resolution/idle pacing. |
 | **Sequencer, Sub-views & Variants** | **Planned (M3–M4)** | Multi-track timeline editor, vertex-stage card/prop deformers, secondary camera sub-views, cosmetic prefab variants, full device frame-gate qualification. |
 | **Terrain, Anim Graphs & Engine Audio** | **Planned (M5–M8)** | Heightfield sculpting & foliage brushes (M5), animation state machines + look-at/IK + spring bones + character assembly (M6), native audio buses & particles (M7), native iOS/Android app shells (M8). |
 
@@ -212,7 +212,7 @@ cargo run --release --bin ganbate-build -- simulate dist/room.gbew 120
 - **Why `--compact --keep-images` for web builds?**
   - `--compact` quantizes positions to a 0.5 mm grid, encodes normals as 12-bit octahedral vectors, delta-codes indices, and deflates streams (~7 bytes/triangle — roughly **5× smaller**).
   - `--keep-images` preserves compressed PNG/JPEG/WebP payloads instead of expanding uncompressed mipmaps on disk; browsers decode JPEG/WebP natively, the engine decodes PNG directly (avoiding HTML canvas premultiplied-alpha corruption), and mipmaps generate on the GPU.
-  - Note: Decode any Draco or meshopt geometry compression before passing a GLB to `ganbate-build` (native Draco/meshopt import lands in M2).
+  - Note: Export uncompressed GLBs (without external Draco or `meshopt` extensions) before passing them to `ganbate-build`; `ganbate-build --compact` applies Ganbate's own zero-dependency mesh optimization and `.gbew` compression.
 
 ### Headless Stills & Time-Lapses (`ganbate-render`)
 
