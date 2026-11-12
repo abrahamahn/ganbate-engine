@@ -1343,13 +1343,18 @@ impl Props {
         if ids.is_empty() {
             return Ok(());
         }
+        // The set is theirs alone when its users are `ids`: as many as they, each following it,
+        // none named twice (else another user could hide behind the count).
+        let distinct = ids.iter().enumerate().all(|(k, id)| !ids[..k].contains(id));
         let theirs = ids
             .first()
             .and_then(|&id| self.instances.get(id)?.joints)
             .filter(|&set| {
-                self.joint_sets
-                    .get(set)
-                    .is_some_and(|s| s.users as usize == ids.len())
+                distinct
+                    && self
+                        .joint_sets
+                        .get(set)
+                        .is_some_and(|s| s.users as usize == ids.len())
                     && ids.iter().all(|&id| {
                         self.instances
                             .get(id)
@@ -3814,6 +3819,19 @@ mod tests {
         let shared = set_of(&props, ids[1]).unwrap();
         assert_eq!(users(&props, shared), Some(2));
         assert_eq!(users(&props, set), None);
+
+        // One of two users named twice is not the set's every user: the other keeps its joints.
+        let matrices = |props: &Props, id: u32| {
+            joints_of(&props.joint_sets, props.instances.get(id).unwrap()).to_vec()
+        };
+        props.share_joints(&[ids[1], ids[1]], &pose(6.0)).unwrap();
+        assert_eq!(matrices(&props, ids[1]), pose(6.0));
+        assert_eq!(matrices(&props, ids[2]), pose(4.0));
+        assert_eq!(set_of(&props, ids[2]), Some(shared));
+        assert_eq!(users(&props, shared), Some(1));
+        props.share_joints(&ids[1..], &pose(4.0)).unwrap();
+        let shared = set_of(&props, ids[1]).unwrap();
+        assert_eq!(users(&props, shared), Some(2));
         props.share_joints(&ids[..1], &[]).unwrap();
         assert_eq!((set_of(&props, ids[0]), users(&props, own)), (None, None));
         props.share_joints(&[], &pose(5.0)).unwrap();
