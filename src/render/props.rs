@@ -391,6 +391,93 @@ pub(super) struct MeshEntry {
     /// How far, at most, a vertex moved in model space since the props' shadow maps were last
     /// drawn (each update's largest move, summed).
     drift: f32,
+    /// What the next morph of the range the last one rewrote needs ([`Morph`]).
+    morph: Option<Morph>,
+}
+
+/// What a mesh keeps of the range its morphs rewrite (`first..end`), frame after frame, so that
+/// a morph visits only the range's vertices: the bounds and [`zeros`] of the vertices outside
+/// it, and for a skinned mesh the range's vertices each joint moves, as `(joint, vertex)` by
+/// joint, each joint's in the order [`joint_boxes`] meets them.
+struct Morph {
+    first: usize,
+    end: usize,
+    outside: (V3, V3),
+    outside_zeros: [u8; 3],
+    moves: Vec<(u32, u32)>,
+}
+
+impl Morph {
+    /// What morphs of `first..end` need of a mesh with these `positions` (the range's as
+    /// morphed) and, when skinned, the range's skin `records`.
+    fn new(positions: &[V3], first: usize, end: usize, records: Option<&[[f32; 4]]>) -> Self {
+        let (before, after) = (&positions[..first], &positions[end..]);
+        let ((blo, bhi), (alo, ahi)) = (bounds(before), bounds(after));
+        let mut moves = vec![];
+        for (v, pair) in records.unwrap_or(&[]).chunks_exact(2).enumerate() {
+            for (j, w) in pair[0].iter().zip(pair[1]) {
+                if w <= 0.0 {
+                    continue;
+                }
+                moves.push((*j as u32, v as u32));
+            }
+        }
+        moves.sort_by_key(|&(j, _)| j);
+        let (bz, az) = (zeros(before), zeros(after));
+        Self {
+            first,
+            end,
+            outside: (
+                std::array::from_fn(|k| blo[k].min(alo[k])),
+                std::array::from_fn(|k| bhi[k].max(ahi[k])),
+            ),
+            outside_zeros: std::array::from_fn(|k| bz[k] | az[k]),
+            moves,
+        }
+    }
+
+    /// The bounds of the mesh with the range at `moved`: those of the range and of the rest
+    /// joined, the bits [`bounds`] of all `positions` gives (which it makes when a bound of 0
+    /// could hold either zero).
+    fn bounds(&self, positions: &[V3], moved: &[V3]) -> (V3, V3) {
+        let ((olo, ohi), (mlo, mhi)) = (self.outside, bounds(moved));
+        let lo: V3 = std::array::from_fn(|k| olo[k].min(mlo[k]));
+        let hi: V3 = std::array::from_fn(|k| ohi[k].max(mhi[k]));
+        let unsure = (0..3).any(|k| lo[k] == 0.0 || hi[k] == 0.0) && {
+            let z = zeros(moved);
+            (0..3).any(|k| (self.outside_zeros[k] | z[k]) == 3 && (lo[k] == 0.0 || hi[k] == 0.0))
+        };
+        if unsure { bounds(positions) } else { (lo, hi) }
+    }
+
+    /// Widens `held` (a skinned mesh's joint boxes) to hold the range at `moved`, as joining
+    /// the [`joint_boxes`] of `moved` would; returns how many boxes changed.
+    fn widen(&self, held: &mut [Option<(V3, V3)>], moved: &[V3]) -> u32 {
+        let mut changed = 0;
+        for run in self.moves.chunk_by(|a, b| a.0 == b.0) {
+            let Some(h) = held.get_mut(run[0].0 as usize) else {
+                continue;
+            };
+            let first = moved[run[0].1 as usize];
+            let b = run.iter().fold((first, first), |b, &(_, v)| {
+                let p = moved[v as usize];
+                (
+                    std::array::from_fn(|k| b.0[k].min(p[k])),
+                    std::array::from_fn(|k| b.1[k].max(p[k])),
+                )
+            });
+            let was = *h;
+            let x = h.get_or_insert(b);
+            *x = (
+                std::array::from_fn(|k| x.0[k].min(b.0[k])),
+                std::array::from_fn(|k| x.1[k].max(b.1[k])),
+            );
+            if *h != was {
+                changed += 1;
+            }
+        }
+        changed
+    }
 }
 
 /// Where a skinned mesh's vertices' joints and weights lie in the shared skin records.
@@ -1306,12 +1393,17 @@ fn normal_matrix(m: &M4) -> M4 {
     t
 }
 
-/// The farthest any point moved from `from` to `to`.
+/// The farthest any point moved from `from` to `to` (the square root of the largest squared
+/// move: the largest of the moves' lengths, with one root).
 fn farthest_move(from: &[V3], to: &[V3]) -> f32 {
     from.iter()
         .zip(to)
-        .map(|(a, b)| math::length(math::sub(*a, *b)))
+        .map(|(a, b)| {
+            let d = math::sub(*a, *b);
+            math::dot(d, d)
+        })
         .fold(0.0, f32::max)
+        .sqrt()
 }
 
 pub(super) fn bounds(points: &[V3]) -> (V3, V3) {
@@ -1324,6 +1416,21 @@ pub(super) fn bounds(points: &[V3]) -> (V3, V3) {
         }
     }
     (min, max)
+}
+
+/// Per axis, the zeros among `points` (1: +0, 2: -0). Bounds joined from parts are the bits
+/// [`bounds`] of all of them gives, in any order, but where a bound is 0 and both zeros are
+/// there: which one it holds then depends on the order they are met in.
+fn zeros(points: &[V3]) -> [u8; 3] {
+    let mut zeros = [0u8; 3];
+    for p in points {
+        for k in 0..3 {
+            if p[k] == 0.0 {
+                zeros[k] |= 1 << (p[k].to_bits() >> 31);
+            }
+        }
+    }
+    zeros
 }
 
 /// Interleaved position, normal, uv (the world vertex layout).
@@ -1722,6 +1829,7 @@ impl Renderer {
             joint_boxes: vec![],
             shape: 0,
             drift: 0.0,
+            morph: None,
         };
         Ok(PropMesh(self.props.meshes.insert(entry)?))
     }
@@ -1773,6 +1881,7 @@ impl Renderer {
             m.revision = m.revision.wrapping_add(1);
             m.shape = m.shape.wrapping_add(1);
             m.joint_boxes = boxes;
+            m.morph = None;
             m.skin = Some(SkinRange {
                 first,
                 count: (n * 2) as u32,
@@ -1829,6 +1938,7 @@ impl Renderer {
         m.drift += farthest_move(&m.positions, positions);
         m.positions.copy_from_slice(positions);
         (m.min, m.max) = bounds(positions);
+        m.morph = None;
         m.revision = m.revision.wrapping_add(1);
         if let Some(skin) = m.skin {
             let records = &self.props.skin_records;
@@ -1866,37 +1976,36 @@ impl Renderer {
         if positions.is_empty() {
             return Ok(());
         }
-        let mut data = Vec::with_capacity(positions.len() * 8);
-        for ((p, n), uv) in positions.iter().zip(normals).zip(&m.uvs[first..end]) {
-            data.extend_from_slice(p);
-            data.extend_from_slice(n);
-            data.extend_from_slice(uv);
+        let mut data = vec![0.0f32; positions.len() * 8];
+        let vertices = positions.iter().zip(normals).zip(&m.uvs[first..end]);
+        for (d, ((p, n), uv)) in data.chunks_exact_mut(8).zip(vertices) {
+            d[..3].copy_from_slice(p);
+            d[3..6].copy_from_slice(n);
+            d[6..].copy_from_slice(uv);
         }
         device.write_buffer(m.vertices, first as u64 * 32, &f32_bytes(&data))?;
         m.drift += farthest_move(&m.positions[first..end], positions);
         m.positions[first..end].copy_from_slice(positions);
-        (m.min, m.max) = bounds(&m.positions);
         m.revision = m.revision.wrapping_add(1);
-        // A morph each frame: its joints' bounds only widen to hold the moved vertices (they
-        // stay bounds; a full update makes them afresh).
-        if let Some(skin) = m.skin {
-            let records = &self.props.skin_records;
-            let at = skin.first as usize + first * 2;
-            let moved = joint_boxes(positions, &records[at..at + positions.len() * 2]);
-            for (held, b) in m.joint_boxes.iter_mut().zip(moved) {
-                if let Some(b) = b {
-                    let was = *held;
-                    let h = held.get_or_insert(b);
-                    *h = (
-                        std::array::from_fn(|k| h.0[k].min(b.0[k])),
-                        std::array::from_fn(|k| h.1[k].max(b.1[k])),
-                    );
-                    if *held != was {
-                        m.shape = m.shape.wrapping_add(1);
-                    }
-                }
+        // What morphs of this range need, found once while it is morphed frame after frame.
+        let morph = match m.morph.take() {
+            Some(morph) if (morph.first, morph.end) == (first, end) => morph,
+            _ => {
+                let records = m.skin.map(|skin| {
+                    let at = skin.first as usize + first * 2;
+                    &self.props.skin_records[at..at + positions.len() * 2]
+                });
+                Morph::new(&m.positions, first, end, records)
             }
+        };
+        (m.min, m.max) = morph.bounds(&m.positions, positions);
+        // Its joints' bounds only widen to hold the moved vertices (they stay bounds; a full
+        // update makes them afresh).
+        if m.skin.is_some() {
+            let changed = morph.widen(&mut m.joint_boxes, positions);
+            m.shape = m.shape.wrapping_add(changed);
         }
+        m.morph = Some(morph);
         Ok(())
     }
 
@@ -3171,6 +3280,7 @@ mod tests {
             joint_boxes: vec![],
             shape: 0,
             drift: 0.0,
+            morph: None,
         }
     }
 
@@ -3654,6 +3764,160 @@ mod tests {
         );
         assert!(canvas_clear([0.5, f32::NAN, 0.5, 1.0], true).is_err());
         assert!(canvas_clear([0.5, 0.5, 0.5, f32::INFINITY], false).is_err());
+    }
+
+    fn bound_bits((lo, hi): (V3, V3)) -> [u32; 6] {
+        std::array::from_fn(|k| if k < 3 { lo[k] } else { hi[k - 3] }.to_bits())
+    }
+
+    #[test]
+    fn a_morph_finds_the_bounds_and_joint_boxes_a_whole_scan_gives() {
+        let wave = |i: usize| {
+            let t = i as f32;
+            [(t * 0.37).sin(), (t * 1.3).cos() - 0.5, t * 0.01 - 0.2]
+        };
+        let points: Vec<V3> = (0..50).map(wave).collect();
+        for (first, end) in [(0, 5), (0, 50), (17, 30), (45, 50)] {
+            let morph = Morph::new(&points, first, end, None);
+            let found = morph.bounds(&points, &points[first..end]);
+            assert_eq!(
+                bound_bits(found),
+                bound_bits(bounds(&points)),
+                "{first}..{end}"
+            );
+        }
+        // A bound of 0 holds the zero the points hold; with both zeros there the whole scan
+        // decides. A -0 inside the bounds is no matter.
+        let left: Vec<V3> = points
+            .iter()
+            .map(|p| [-p[0].abs() - 0.1, p[1], p[2]])
+            .collect();
+        for signs in [[0.0, 0.0, -0.0], [0.0, -0.0, -0.0], [-0.0, -0.0, -0.0]] {
+            let mut zeros = left.clone();
+            zeros[3][0] = signs[0];
+            zeros[40][0] = signs[1];
+            zeros[12][1] = signs[2];
+            for (first, end) in [(0, 5), (40, 41), (10, 20), (0, 50)] {
+                let morph = Morph::new(&zeros, first, end, None);
+                let found = morph.bounds(&zeros, &zeros[first..end]);
+                assert_eq!(
+                    bound_bits(found),
+                    bound_bits(bounds(&zeros)),
+                    "{signs:?} {first}..{end}"
+                );
+            }
+        }
+
+        // Each vertex on two to four joints, one twice, some weighing nothing, one past the
+        // boxes held; the boxes held missing one joint.
+        let records: Vec<[f32; 4]> = (0..50)
+            .flat_map(|v| {
+                let j = (v % 6) as f32;
+                [
+                    [j, j + 1.0, j, 7.0],
+                    [0.5, if v % 3 == 0 { 0.0 } else { 0.25 }, 0.25, 0.1],
+                ]
+            })
+            .collect();
+        let mut held = joint_boxes(&points, &records);
+        held.truncate(7);
+        held[2] = None;
+        let moved: Vec<V3> = (0..50).map(|i| math::scale(wave(i + 3), 1.2)).collect();
+        let mut expected = held.clone();
+        let mut changes = 0;
+        for (h, b) in expected.iter_mut().zip(joint_boxes(&moved, &records)) {
+            if let Some(b) = b {
+                let was = *h;
+                let x = h.get_or_insert(b);
+                *x = (
+                    std::array::from_fn(|k| x.0[k].min(b.0[k])),
+                    std::array::from_fn(|k| x.1[k].max(b.1[k])),
+                );
+                changes += u32::from(*h != was);
+            }
+        }
+        let morph = Morph::new(&moved, 0, 50, Some(&records));
+        assert_eq!(morph.widen(&mut held, &moved), changes);
+        assert!(changes > 0);
+        let bits = |b: &[Option<(V3, V3)>]| -> Vec<Option<[u32; 6]>> {
+            b.iter().map(|b| b.map(bound_bits)).collect()
+        };
+        assert_eq!(bits(&held), bits(&expected));
+    }
+
+    /// A mesh morphed over a range frame after frame, over another range and whole keeps the
+    /// bounds a scan of all its vertices gives, to the bit.
+    #[test]
+    fn morphed_meshes_keep_the_bounds_of_all_their_vertices() {
+        use crate::render::{Look, Output, Quality};
+        use crate::world::World;
+
+        let Ok(mut device) = Device::headless() else {
+            return;
+        };
+        let mut r = Renderer::new(
+            &mut device,
+            &World::default(),
+            Look::default(),
+            Quality::low_cost(),
+            (16, 16),
+            Output::Still,
+        )
+        .expect("headless renderer");
+        let positions: Vec<V3> = (0..40)
+            .map(|i| [i as f32 * 0.1 - 2.0, (i % 7) as f32, -(i as f32)])
+            .collect();
+        let normals = vec![[0.0, 1.0, 0.0]; 40];
+        let indices: Vec<u32> = (0..39).flat_map(|i| [i, i + 1, 0]).collect();
+        let mesh = r
+            .create_prop_mesh(
+                &mut device,
+                &MeshData {
+                    positions: &positions,
+                    normals: &normals,
+                    uvs: &[],
+                    indices: &indices,
+                },
+            )
+            .expect("mesh");
+        let check = |r: &Renderer, what: &str| {
+            let m = r.props.meshes.get(mesh.0).unwrap();
+            assert_eq!(
+                bound_bits((m.min, m.max)),
+                bound_bits(bounds(&m.positions)),
+                "{what}"
+            );
+        };
+        // The morphed range holds the lowest x at first, then pulls in, then reaches past
+        // every other vertex, then rests on 0 beside a vertex at -0.
+        for (k, shift) in [0.0, 0.5, 1.0, -3.0, 2.0].into_iter().enumerate() {
+            let moved: Vec<V3> = positions[0..5]
+                .iter()
+                .map(|p| [p[0] + shift, p[1] * 2.0, p[2]])
+                .collect();
+            r.update_prop_mesh_range(&mut device, mesh, 0, &moved, &normals[0..5])
+                .expect("morph");
+            check(&r, &format!("morph {k}"));
+        }
+        let other: Vec<V3> = positions[10..14]
+            .iter()
+            .map(|p| [p[0], p[1] + 9.0, p[2]])
+            .collect();
+        r.update_prop_mesh_range(&mut device, mesh, 10, &other, &normals[10..14])
+            .expect("another range");
+        check(&r, "another range");
+        let zeros: Vec<V3> = positions[0..5].iter().map(|p| [p[0], 0.0, p[2]]).collect();
+        let mut whole = positions.clone();
+        whole[20][1] = -0.0;
+        r.update_prop_mesh(&mut device, mesh, &whole, &normals)
+            .expect("whole");
+        check(&r, "whole");
+        for k in 0..2 {
+            r.update_prop_mesh_range(&mut device, mesh, 0, &zeros, &normals[0..5])
+                .expect("zeros");
+            check(&r, &format!("zeros {k}"));
+        }
+        r.destroy_props(&mut device);
     }
 
     #[test]
