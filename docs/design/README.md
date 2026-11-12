@@ -50,8 +50,8 @@ Milestone 1 (scene and editor foundation), deterministic rigid-body physics, and
 implemented in this repository: `ganbate-core` (JSON writer, digests, ids), `ganbate-scene` (documents, schemas,
 prefabs, undo), `ganbate-pipeline` (project, asset database, import that keeps objects, scene cook to GBEW v4 with an
 entity table), renderer support for moving, hiding and picking world objects, `ganbate-physics` (60 Hz soft-step
-solver, joints, queries, character controller), `ganbate-studio` (host) plus `editor/` (interface + Asset Library),
-and `ganbate-agent` (`ganbate` JSON CLI), checked end to end by `editor/test/run.cjs` and `cargo test --workspace`.
+solver, joints, queries, character controller), `../ganbate-studio/server/ganbate-studio` (host) plus `../ganbate-studio/client/` (interface + Asset Library),
+and `../ganbate-studio/server/ganbate-agent` (`ganbate` JSON CLI), checked end to end by `../ganbate-studio/client/e2e/run.ts` and `cargo test --workspace`.
 See the [roadmap](../roadmap.md) for what each later milestone adds.
 
 ## Words used here

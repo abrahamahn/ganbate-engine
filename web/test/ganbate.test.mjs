@@ -11,7 +11,7 @@ import {
   createHost,
   gradeOnceFor,
   resolveGradeOnce,
-} from '../sdk/ganbate.js';
+} from '../dist/ganbate.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
@@ -322,7 +322,7 @@ test('cacheStats reads the eight words of the last frame\'s cached picture, the 
     waterFootprints: 4,
     reshadePixels: 450892,
   });
-  const dts = fs.readFileSync(path.join(__dirname, '..', 'sdk', 'ganbate.d.ts'), 'utf8');
+  const dts = fs.readFileSync(path.join(__dirname, '..', 'dist', 'ganbate.d.ts'), 'utf8');
   assert.ok(dts.includes('readonly reshadePixels: number;'));
   const without = makeMockWasm({ ganbate_rt_cache_stats: undefined });
   const bare = await createEngine({ canvas, wasm: without.instance, api: 'webgl2' });
@@ -346,7 +346,7 @@ test('gradeOnce \'auto\' grades once on Arm Mali: the WebGPU adapter\'s vendor, 
   const mali = webgl('Mali-G57');
   assert.deepEqual([undefined, false, true, 'auto', 'yes'].map((o) => resolveGradeOnce(o, mali)), [false, false, true, true, false]);
   assert.deepEqual([true, 'auto'].map((o) => resolveGradeOnce(o, webgpu({ vendor: 'apple' }))), [true, false]);
-  const dts = fs.readFileSync(path.join(__dirname, '..', 'sdk', 'ganbate.d.ts'), 'utf8');
+  const dts = fs.readFileSync(path.join(__dirname, '..', 'dist', 'ganbate.d.ts'), 'utf8');
   for (const token of ["readonly gradeOnce?: boolean | 'auto';", 'readonly gradeOnce: boolean;', 'export function gradeOnceFor(']) {
     assert.ok(dts.includes(token), `missing TypeScript declaration: ${token}`);
   }
@@ -927,7 +927,7 @@ test('createGraphSolver solves a graph without a canvas', async () => {
 });
 
 test('web/ganbate.d.ts and compiled ganbate_web.wasm expose Wave 8 ray-picking and WebXR contracts', () => {
-  const dts = fs.readFileSync(path.join(__dirname, '..', 'sdk', 'ganbate.d.ts'), 'utf8');
+  const dts = fs.readFileSync(path.join(__dirname, '..', 'dist', 'ganbate.d.ts'), 'utf8');
   for (const token of [
     'export interface GanbatePickHit',
     'export interface GanbateWorldPickHit',

@@ -13,7 +13,7 @@ needs its own tool, even when one person or an agent does several.
 | Kind of work | In a large studio | In Ganbate |
 | --- | --- | --- |
 | Engine programming | engine, graphics, platform, audio, physics, network programmers | agents writing Rust in this repository, against synthetic tests |
-| Tools programming | a tools team building editors and pipelines | the same, in `ganbate-studio`, `editor/` and `ganbate-pipeline` |
+| Tools programming | a tools team building editors and pipelines | the same, in `../ganbate-studio` (`server/ganbate-studio` + `client/`) and `ganbate-pipeline` |
 | Gameplay programming | gameplay engineers in the game's code | agents in the game's repository, through the engine's extension points |
 | Art direction, environment and level art | art director, environment artists, level designers | the founder in the editor: placement, landscape, vegetation, lighting, Look |
 | Character art and animation | character artists, riggers, animators | modelling in a content tool; assembly, animation graphs, expressions and customization in the editor |

@@ -1,5 +1,5 @@
 import { useState, type PointerEvent } from 'react';
-import type { GanbatePlayerController } from '../../sdk/ganbate.js';
+import type { GanbatePlayerController } from '../../sdk/src/index.ts';
 
 interface TouchControlsProps {
   readonly player: GanbatePlayerController | null;

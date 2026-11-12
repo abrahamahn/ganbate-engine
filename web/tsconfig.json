@@ -19,8 +19,7 @@
   "include": [
     "./player/**/*.ts",
     "./player/**/*.tsx",
-    "./sdk/**/*.d.ts",
-    "./sdk/**/*.d.mts",
+    "./sdk/src/**/*.ts",
     "./vite.config.ts"
   ],
   "exclude": ["./node_modules", "./dist"]

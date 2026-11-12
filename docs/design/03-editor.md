@@ -65,7 +65,7 @@ documents and plugins (§6). **D** stays the place to model meshes; the editor a
   ops all-or-nothing, refuses an edit that adds a validation problem (problems the document already had do not block
   edits), records the inverse for undo and broadcasts the ops with the new revision to every client watching that
   document. A client whose revision is stale gets the current document instead. The protocol's messages are listed
-  at the top of `crates/ganbate-studio/src/session.rs`: `hello`/`welcome`, `open`/`doc`, `close`, `edit` (answered with
+  at the top of `../ganbate-studio/server/ganbate-studio/src/session.rs`: `hello`/`welcome`, `open`/`doc`, `close`, `edit` (answered with
   `ops` or `error`), `delete` (an edit whose ops the host works out, through what prefab instances show), `undo`,
   `redo`, `save`/`saved` (with `force` to overwrite a file changed on disk), `ids`, `create`/`created`, `import`,
   `cook`/`cooked`, and `preview` and `select`, which are relayed to the other clients.
@@ -209,7 +209,7 @@ M1 has the Viewport (orbit, frame, click to select, the gizmo), the Outliner (tr
 (schema fields, add and remove components), Assets (list, open, import as scene, new scene) and the Console; the
 rest of each panel comes with later milestones.
 
-Acceptance (met by `editor/test/run.cjs` in headless Chromium on WebGPU and WebGL 2): on the synthetic sample, click
+Acceptance (met by `../ganbate-studio/client/e2e/run.ts` in headless Chromium on WebGPU and WebGL 2): on the synthetic sample, click
 an object to select it, drag it with the gizmo, undo and redo, move a parent and see its child follow, rename
 through the inspector, add a component (re-cooking the scene), save, reload and find the move, then cook the saved
 scene with `ganbate-build` and render it with `ganbate-render`.

@@ -1,7 +1,8 @@
-// TypeScript declarations for web/sdk/ganbate.js: library mode (`createEngine`) and player/self-test
-// entry points (`startPlayer`, `startSelfTest`), with which a host page drives the renderer. Positions are metres; matrices are 16 numbers, column-major, model to
-// world. Handles (textures, meshes, materials, instances, models) are nonzero numbers. Every
-// engine method throws an Error carrying the engine's message when a call fails.
+// TypeScript declarations for web/sdk: library mode (`createEngine`) and player/self-test
+// entry points (`startPlayer`, `startSelfTest`), with which a host page drives the renderer.
+// Positions are metres; matrices are 16 numbers, column-major, model to world. Handles
+// (textures, meshes, materials, instances, models) are nonzero numbers. Every engine method
+// throws an Error carrying the engine's message when a call fails.
 
 export type GanbateApi = 'auto' | 'webgpu' | 'webgl2';
 export type GanbateQualityMode = 'realtime' | 'still' | 'hybrid' | 'low-cost';
@@ -374,11 +375,6 @@ export interface GanbateGraphSolver {
   ): GanbateGraphCommit;
 }
 
-/** The graph solver without a canvas, for pages and tools that edit a graph without drawing it. */
-export function createGraphSolver(options: {
-  readonly wasm: string | ArrayBuffer | Uint8Array | WebAssembly.Module;
-}): Promise<GanbateGraphSolver>;
-
 export interface GanbateGraphCommit {
   readonly graph: GanbateGraph;
   /** sha256 of the graph's canonical text: equal graphs have equal digests. */
@@ -390,7 +386,11 @@ export interface GanbateGraphCommit {
 export interface GanbateEntityTable {
   readonly entities: readonly GanbateEntityRecord[];
   /** The components the renderer does not draw, by entity id, and the scene's id and name. */
-  readonly data: { readonly entities: Record<string, { readonly components: Record<string, unknown> }>; readonly scene?: string; readonly name?: string } | null;
+  readonly data: {
+    readonly entities: Record<string, { readonly components: Record<string, unknown> }>;
+    readonly scene?: string;
+    readonly name?: string;
+  } | null;
 }
 
 export interface GanbateEngine {
@@ -609,8 +609,6 @@ export interface GanbateEngine {
   destroy(): void;
 }
 
-export function createEngine(options: CreateEngineOptions): Promise<GanbateEngine>;
-
 export interface GanbateCapturedFrame {
   readonly width: number;
   readonly height: number;
@@ -662,26 +660,18 @@ export interface GanbatePlayerController {
   capture(): Promise<GanbateCapturedFrame>;
 }
 
-export function startSelfTest(options: StartSelfTestOptions): Promise<GanbateSelfTestResult>;
-export function startPlayer(options: StartPlayerOptions): Promise<GanbatePlayerController>;
-
-/**
- * Whether the tone-map output should grade each pixel once on this GPU, as `gradeOnce: 'auto'`
- * decides: a WebGPU adapter whose vendor is 'arm', or a WebGL 2 context whose renderer string
- * names Mali and that renders 32-bit floats (`EXT_color_buffer_float`).
- */
-export function gradeOnceFor(gpu: {
+export interface GanbateGpuInfo {
   readonly api: 'webgpu' | 'webgl2';
   readonly adapter?: { readonly info?: { readonly vendor?: string } };
   readonly renderer?: string;
   readonly ext?: { readonly colorFloat?: unknown };
-}): boolean;
-export function resolveGradeOnce(
-  option: boolean | 'auto' | undefined,
-  gpu: {
-    readonly api: 'webgpu' | 'webgl2';
-    readonly adapter?: { readonly info?: { readonly vendor?: string } };
-    readonly renderer?: string;
-    readonly ext?: { readonly colorFloat?: unknown };
-  },
-): boolean;
+}
+
+export interface GanbateHostOptions {
+  readonly onLog?: (level: number, text: string) => void;
+  readonly onStatus?: (text: string) => void;
+  readonly onError?: (text: string) => void;
+  readonly settled?: boolean;
+  readonly bundles?: boolean;
+  readonly checkErrors?: boolean;
+}

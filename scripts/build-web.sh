@@ -78,17 +78,10 @@ if [ ! -d "$root/web/node_modules" ]; then
 fi
 
 npm --prefix "$root/web" run typecheck >/dev/null
-npm --prefix "$root/web" run build -- --outDir "$out" >/dev/null
+node "$root/web/scripts/build-sdk.mjs" --outDir "$out" >/dev/null
+npx --prefix "$root/web" vite build --config "$root/web/vite.config.ts" --outDir "$out" >/dev/null
 
 cp "$target_dir/$target/release/ganbate_web.wasm" "$out/ganbate_web.wasm"
-cp \
-  "$root/web/sdk/ganbate.js" \
-  "$root/web/sdk/ganbate.d.ts" \
-  "$root/web/sdk/character-customization.mjs" \
-  "$root/web/sdk/character-customization.d.mts" \
-  "$root/web/sdk/graph-session.mjs" \
-  "$root/web/sdk/graph-session.d.mts" \
-  "$out/"
 
 size=$(wc -c < "$out/ganbate_web.wasm")
 echo "build-web: $out (ganbate_web.wasm $((size / 1024)) KiB, $mode)"

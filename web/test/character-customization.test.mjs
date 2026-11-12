@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { bindCharacterShapes } from '../sdk/character-customization.mjs';
+import { bindCharacterShapes } from '../dist/character-customization.mjs';
 test('named, signed controls commit all matching nodes once and preserve unrelated pose channels', () => {
   const edits = [], updates = [];
   const engine = { modelMorph: (...args) => edits.push(args), updateModel: id => updates.push(id) };

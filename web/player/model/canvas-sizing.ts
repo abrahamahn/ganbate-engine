@@ -1,4 +1,4 @@
-import type { GanbateApi } from '../../sdk/ganbate.js';
+import type { GanbateApi } from '../../sdk/src/index.ts';
 import type { FixedCanvasSize, ParsedPlayerUrlConfig } from './player-types.ts';
 
 function parseApi(raw: string | null): GanbateApi {

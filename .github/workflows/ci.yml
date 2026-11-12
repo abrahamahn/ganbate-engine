@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: Rust & Web Verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: web/package-lock.json
+
+      - name: Audit repository topology & zero external Cargo dependencies
+        run: node scripts/audit-topology.mjs
+
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy (native workspace + wasm32)
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo clippy -p ganbate-web --target wasm32-unknown-unknown --locked -- -D warnings
+
+      - name: Run Rust unit & integration tests
+        run: cargo test --workspace --locked
+
+      - name: Build & verify Web SDK + React Player
+        run: |
+          npm --prefix web ci
+          ./scripts/build-web.sh web/dist
+          npm --prefix web run check

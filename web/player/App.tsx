@@ -3,7 +3,7 @@ import {
   startPlayer,
   startSelfTest,
   type GanbatePlayerController,
-} from '../sdk/ganbate.js';
+} from '../sdk/src/index.ts';
 import { ErrorDrawer } from './components/ErrorDrawer.tsx';
 import { HudOverlay } from './components/HudOverlay.tsx';
 import { LoadingOverlay } from './components/LoadingOverlay.tsx';

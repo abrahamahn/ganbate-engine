@@ -45,7 +45,7 @@ rasterizers (lavapipe/llvmpipe, SwiftShader, ANGLE on llvmpipe) unless a row say
 | Streaming and partial loading | absent | whole-file decode (`cooked.rs`: `decode_scene`) | Next hand and next room stream in the background; open worlds stream cells by distance | P1, P2 for cells |
 | Large-world coordinates (origin shifting per region) | absent | | `f32` keeps millimetre precision only within about 10 km of the origin; open worlds rebase rendering and physics per region | P1 (M9) |
 | Video playback | absent | | Intro and story movies, video textures on screens | P2 |
-| Hot reload | partial (M1: the host broadcasts confirmed ops to every client watching a document and the editor's viewport applies moves live; no runtime live-link client yet, M2) | `crates/ganbate-studio`, `editor/` | Change a Look, material or placement and see it in the running game; shaders and textures reload without restart | P0 |
+| Hot reload | partial (M1: the host broadcasts confirmed ops to every client watching a document and the editor's viewport applies moves live; no runtime live-link client yet, M2) | `../ganbate-studio/server/ganbate-studio`, `../ganbate-studio/client/` | Change a Look, material or placement and see it in the running game; shaders and textures reload without restart | P0 |
 | Hostile-input hardening of cooked files on wasm32 | partial | overflow in `padded()` and a 1 GiB reservation (`cooked.rs`: `padded` and the reservation in `decode_mesh`), unchecked accessor ranges (`model.rs:350-395`) | A corrupt download must fail with a message, never abort the page | P0 (M2) |
 
 ## 3. Scene
@@ -144,7 +144,7 @@ Look files, with props, overlays, prop shaders and game lights for game-drawn co
 
 | Subsystem | Status | Evidence | Why | Priority |
 | --- | --- | --- | --- | --- |
-| Editor host and interface | present (M1) | `crates/ganbate-studio`, `editor/` | All content work in the editor | P0 |
+| Editor host and interface | present (M1) | `../ganbate-studio/server/ganbate-studio`, `../ganbate-studio/client/` | All content work in the editor | P0 |
 | Profiler: CPU and GPU scopes, counters, frame traces | absent | legacy benchmark only (`src/vulkan/bench.rs`) | Frame budgets on devices; find the slow pass | P0 (M2: engine stats) |
 | Debug draw (lines, boxes, labels in the viewport) | partial | the editor's 2D overlay | Visualize bounds, anchors, camera paths, colliders | P0 (M2) |
 | Frame pacing gate | present | `ganbate-framecheck`, `timing::Pacing` | The device frame-rate gate for switching renderers | P0 |

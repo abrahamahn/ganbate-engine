@@ -1,5 +1,5 @@
 import { useRef, useState, type DragEvent, type FormEvent } from 'react';
-import type { GanbateApi } from '../../sdk/ganbate.js';
+import type { GanbateApi } from '../../sdk/src/index.ts';
 import type { LaunchRequest } from '../model/player-types.ts';
 
 interface SceneLauncherProps {

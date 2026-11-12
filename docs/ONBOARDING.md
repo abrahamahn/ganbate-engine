@@ -30,8 +30,8 @@ Four rules govern everything in this repository:
 │  Game rules, authoritative server, HTML/DOM UI, art assets, project tools   │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  LAYER 6 · TOOLS, WEB HOST & AGENT CLI                                      │
-│  crates/ganbate-studio + editor/  │  crates/ganbate-agent (`ganbate` CLI)   │
-│  crates/web + web/        │  src/bin/ganbate-{build,render,player}  │
+│  ../ganbate-studio (host + UI)    │  ../ganbate-studio (`ganbate` CLI)      │
+│  crates/web + web/                │  src/bin/ganbate-{build,render,player}  │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  LAYER 5 · RUNTIME PRESENTATION & SIMULATION                                │
 │  src/render/* (Stylized Look renderer, props, shadows, water, sky/weather)  │
@@ -67,8 +67,8 @@ Four rules govern everything in this repository:
 | `crates/physics` | lib | Deterministic 60 Hz soft-step rigid-body solver (`+`, `-`, `*`, `/`, `sqrt` only), GJK/EPA, shapes, 5 joint types, CCD, ray/shape/overlap queries, character controller | Modifying collision shapes, physics stepping, joints, or character movement |
 | `src/` (`ganbate-engine` root) | lib | Unified RHI (`src/gpu/`), Vulkan/Metal/WebGPU/WebGL 2 backends, stylized `Look` renderer (`src/render/`), GPU skinning & morphs (`src/anim.rs`), native windowing (`src/window/`) | Changing rendering passes, Look parameters, dynamic props, lights, or GPU backends |
 | `crates/web` + `web/` | `ganbate_web.wasm`, `ganbate.js`, `ganbate.d.ts` | Browser WASM runtime (`ganbate_rt_*` exports) and JS/TS wrapper supporting standalone viewer mode and `createEngine()` library mode | Adding or updating methods exposed to TypeScript web games or the Studio viewport |
-| `crates/ganbate-studio` + `editor/` | `ganbate-studio` (`:7480`) | Local Rust HTTP + WebSocket project server (`crates/ganbate-studio`) and browser UI (`editor/studio.js`, Asset Library, Outliner, Inspector, Viewport gizmos) | Adding editor panels, gizmos, asset previews, rescan rules, or `project-tools.json` hooks |
-| `crates/ganbate-agent` | `ganbate` | Single-line JSON CLI (`scene inspect`, `validate`, `apply`, `undo`, `diff`, `render`) + `.ganbate/history/` undo journals | Extending AI-agent scene editing, validation, or headless verification |
+| `../ganbate-studio/server/ganbate-studio` + `../ganbate-studio/client/` | `ganbate-studio` (`:7480`) | Local Rust HTTP + WebSocket project server (`server/ganbate-studio`) and React/Vite browser UI (`client/`, Asset Library, Outliner, Inspector, Viewport gizmos) | Adding editor panels, gizmos, asset previews, rescan rules, or `project-tools.json` hooks |
+| `../ganbate-studio/server/ganbate-agent` | `ganbate` | Single-line JSON CLI (`scene inspect`, `validate`, `apply`, `undo`, `diff`, `render`) + `.ganbate/history/` undo journals | Extending AI-agent scene editing, validation, or headless verification |
 | `src/bin/ganbate-build.rs` | `ganbate-build` | Asset CLI (`import`, `cook`, `cook-scene`, `inspect`, `model`, `simulate`) | Adding offline asset build/cook subcommands |
 | `src/bin/ganbate-render.rs` | `ganbate-render` | Headless Vulkan offscreen PNG/PPM still & 24 fps time-lapse renderer | Rendering reference stills, thumbnails, or CI regression diffs |
 | `src/bin/ganbate-player.rs` | `ganbate-player` | Native desktop fly-through viewer (X11 / Win32 / macOS Metal) | Testing native swapchain presentation and interactive scene fly-throughs |
@@ -95,7 +95,7 @@ Always distinguish **what runs today** from **planned milestones** (full breakdo
 
 ## 4. Ganbate Studio Manual (Visual Editor)
 
-Ganbate Studio consists of a **local Rust host** (`ganbate-studio`) that owns disk I/O, asset indexing, cooking, and undo history, paired with a **browser interface** (`editor/`) whose central viewport runs `ganbate-web`.
+Ganbate Studio (`../ganbate-studio`) consists of a **local Rust host** (`server/ganbate-studio`) that owns disk I/O, asset indexing, cooking, and undo history, paired with a **React + Vite browser interface** (`client/`) whose central viewport runs `ganbate-web`.
 
 ### 4.1 Build & Launch on a Sample Project
 
@@ -110,13 +110,13 @@ scripts/build-web.sh web/dist
 cargo run --release --example studio_sample -- ~/ganbate-sample
 
 # 3. Launch Ganbate Studio and open http://localhost:7480/
-cargo run --release -p ganbate-studio -- ~/ganbate-sample
+cargo run --release --manifest-path ../ganbate-studio/Cargo.toml -p ganbate-studio -- ~/ganbate-sample
 ```
 
 To open **any real game project**, pass the directory containing its `ganbate.project.json` instead of `~/ganbate-sample`:
 
 ```sh
-cargo run --release -p ganbate-studio -- /path/to/game/project
+cargo run --release --manifest-path ../ganbate-studio/Cargo.toml -p ganbate-studio -- /path/to/game/project
 ```
 
 ### 4.2 Anatomy of a Ganbate Project Folder
@@ -322,13 +322,13 @@ const stateHash = engine.physicsHash(); // identical 64-bit hash on Chrome, Safa
 
 ## 7. Working With AI Agents (`ganbate` CLI)
 
-When an AI coding agent edits a `.scene.json` file by hand with regex or raw text tools, it risks inventing invalid schema fields, breaking base-62 sibling order, or clobbering permanent hex IDs. **Always instruct AI agents to use the `ganbate` CLI (`crates/ganbate-agent`) instead.**
+When an AI coding agent edits a `.scene.json` file by hand with regex or raw text tools, it risks inventing invalid schema fields, breaking base-62 sibling order, or clobbering permanent hex IDs. **Always instruct AI agents to use the `ganbate` CLI (`../ganbate-studio/server/ganbate-agent`) instead.**
 
 ### Build the CLI
 
 ```sh
-cargo build --release -p ganbate-agent --bin ganbate
-export PATH="$PWD/target/release:$PATH"
+cargo build --release --manifest-path ../ganbate-studio/Cargo.toml -p ganbate-agent --bin ganbate
+export PATH="../ganbate-studio/target/release:$PATH"
 ```
 
 ### The Standard Agent Loop (`Inspect → Dry-Run → Apply → Render → Verify`)

@@ -2,7 +2,7 @@ import type {
   GanbateApi,
   GanbatePlayerController,
   GanbateSelfTestResult,
-} from '../../sdk/ganbate.js';
+} from '../../sdk/src/index.ts';
 
 export type BootMode = 'player' | 'selftest' | 'launcher';
 

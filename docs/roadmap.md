@@ -33,9 +33,9 @@ is M1 to M3, *Platform qualification* is M4 and M8, *Prove reuse* is M9.
   prefabs with overrides, order keys. `ganbate-pipeline`: projects, sidecars, asset index, object-keeping import, scene
   cook to GBEW v4 with an entity table. Renderer: draws grouped by material; world instances move, hide and pick;
   lamps move. Web runtime: `worldEntities`, `setWorldInstance`, `pickWorld`, `setWorldLight`. `ganbate-studio` host and
-  the `editor/` interface. `ganbate-build cook-scene` and `import`.
+  the `../ganbate-studio/client/` interface. `ganbate-build cook-scene` and `import`.
 - **Acceptance (met):** on the synthetic sample (`examples/studio_sample.rs`), in headless Chromium on WebGPU and
-  WebGL 2, `editor/test/run.cjs` clicks an object in the viewport to select it, drags it with the gizmo, undoes and
+  WebGL 2, `../ganbate-studio/client/e2e/run.ts` clicks an object in the viewport to select it, drags it with the gizmo, undoes and
   redoes with the keyboard, moves a parent and sees its child follow, renames through the inspector, adds a
   component (re-cooking the scene), saves canonical JSON, reloads and finds the move, then cooks the saved scene
   with `ganbate-build` and renders it with `ganbate-render`. The driver test

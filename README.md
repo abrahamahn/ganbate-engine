@@ -26,20 +26,20 @@ The core workspace uses **zero third-party Cargo crates**, calling OS/GPU ABIs d
 | `crates/physics` | lib | Deterministic 60 Hz rigid-body solver (`+`, `-`, `*`, `/`, `sqrt` only), 5 joints, CCD, spatial queries, character controller |
 | `crates/graph`, `audio`, `jobs`, `seq`, `vfx` | libs | Semantic spatial graph solver, QOA/DSP spatial audio, work-stealing SIMD culling, multi-track sequencer, and deterministic VFX |
 | `crates/web` + `web/` | `ganbate_web.wasm`, `ganbate.js`, `ganbate.d.ts`, React+TS player | Browser WASM runtime (`web/sdk/`), React 19 + TypeScript + Vite scene player (`web/player/`), and browser test suites (`web/test/`) |
-| `../ganbate-editor/server/ganbate-studio` + `../ganbate-editor/client/` | `ganbate-studio` | Local HTTP/WebSocket editor host (`localhost:7480`) + React/Vite Studio UI (Asset Library, Outliner, Inspector, `ganbate-web` viewport) |
-| `../ganbate-editor/server/ganbate-agent` | `ganbate` | Single-line JSON CLI for AI agents & scripts (`scene inspect`, `validate`, `apply`, `undo`, `diff`, `render`) |
+| `../ganbate-studio/server/ganbate-studio` + `../ganbate-studio/client/` | `ganbate-studio` | Local HTTP/WebSocket editor host (`localhost:7480`) + React/Vite Studio UI (Asset Library, Outliner, Inspector, `ganbate-web` viewport) |
+| `../ganbate-studio/server/ganbate-agent` | `ganbate` | Single-line JSON CLI for AI agents & scripts (`scene inspect`, `validate`, `apply`, `undo`, `diff`, `render`) |
 | `src/bin/ganbate-*` | `ganbate-player`, `ganbate-render`, `ganbate-build`, `ganbate-bench`, `ganbate-framecheck`, `ganbate-ios` | Native desktop player, headless renderer, asset importer/cooker, throughput benchmark, and 120/240 Hz display-pacing verifier |
 
 ---
 
-## 1. Edit a Scene in Ganbate Studio (Visual Editor — `../ganbate-editor`)
+## 1. Edit a Scene in Ganbate Studio (Visual Editor — `../ganbate-studio`)
 
-Ganbate Studio (`../ganbate-editor`) pairs a local Rust host (`ganbate-studio`) that owns a project folder (`ganbate.project.json`) and undo history with a browser UI (`editor/`) whose 3D viewport runs the live `ganbate-web` runtime ([data design](docs/design/04-data.md)).
+Ganbate Studio (`../ganbate-studio`) pairs a local Rust host (`ganbate-studio`) that owns a project folder (`ganbate.project.json`) and undo history with a browser UI (`client/`) whose 3D viewport runs the live `ganbate-web` runtime ([data design](docs/design/04-data.md)).
 
 ```sh
 scripts/build-web.sh web/dist                                                         # 1. Build the browser viewport runtime
 cargo run --release --example studio_sample -- ~/ganbate-sample                       # 2. Generate a synthetic sample project
-cargo run --release --manifest-path ../ganbate-editor/Cargo.toml -p ganbate-studio -- ~/ganbate-sample  # 3. Start host, then open http://localhost:7480/
+cargo run --release --manifest-path ../ganbate-studio/Cargo.toml -p ganbate-studio -- ~/ganbate-sample  # 3. Start host, then open http://localhost:7480/
 ```
 
 ### Studio Controls & Workflows
@@ -170,11 +170,11 @@ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
 
 ## 6. AI Agent CLI (`ganbate`)
 
-`../ganbate-editor/server/ganbate-agent` (`ganbate`) lets AI agents and automation inspect, validate, edit, diff, undo, and render scenes without touching engine source or corrupting canonical JSON. Every command outputs a single JSON line (`{"ok":true,...}` or `{"ok":false,"error":{"code":"...","message":"..."}}`).
+`../ganbate-studio/server/ganbate-agent` (`ganbate`) lets AI agents and automation inspect, validate, edit, diff, undo, and render scenes without touching engine source or corrupting canonical JSON. Every command outputs a single JSON line (`{"ok":true,...}` or `{"ok":false,"error":{"code":"...","message":"..."}}`).
 
 ```sh
 cargo run --release --example studio_sample -- ~/ganbate-sample
-cargo build --release -p ganbate-agent --bin ganbate && export PATH="$PWD/target/release:$PATH"
+cargo build --release --manifest-path ../ganbate-studio/Cargo.toml -p ganbate-agent --bin ganbate && export PATH="../ganbate-studio/target/release:$PATH"
 P=~/ganbate-sample S=content/scenes/blocks.scene.json
 
 ganbate scene inspect "$P" "$S" --entity "Tower/Tower top" --defaults
@@ -222,9 +222,10 @@ cargo test --workspace --locked --offline
 cargo test --locked --offline --test vulkan -- --ignored
 cargo test --locked --offline --test present -- --ignored
 cargo test --locked --offline --test gpu --test render -- --ignored
-cargo test --locked --offline -p ganbate-agent --test binary -- --ignored
-node editor/test/run.cjs --out editor-test
-node editor/test/run.cjs --api webgl2 --out editor-test-gl
+cargo test --locked --offline --manifest-path ../ganbate-studio/Cargo.toml --workspace
+npm --prefix ../ganbate-studio run check
+npm --prefix ../ganbate-studio run e2e -- --out studio-test
+npm --prefix ../ganbate-studio run e2e -- --api webgl2 --out studio-test-gl
 
 # Cross-backend PSNR oracle (WebGPU/SwiftShader & WebGL 2/ANGLE vs. native Vulkan/llvmpipe)
 cargo run --release --example synthetic_world -- scenes

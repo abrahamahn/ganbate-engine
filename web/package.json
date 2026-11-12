@@ -6,24 +6,25 @@
   "type": "module",
   "exports": {
     ".": {
-      "types": "./sdk/ganbate.d.ts",
-      "import": "./sdk/ganbate.js"
+      "types": "./dist/ganbate.d.ts",
+      "import": "./dist/ganbate.js"
     },
     "./character-customization": {
-      "types": "./sdk/character-customization.d.mts",
-      "import": "./sdk/character-customization.mjs"
+      "types": "./dist/character-customization.d.mts",
+      "import": "./dist/character-customization.mjs"
     },
     "./graph-session": {
-      "types": "./sdk/graph-session.d.mts",
-      "import": "./sdk/graph-session.mjs"
+      "types": "./dist/graph-session.d.mts",
+      "import": "./dist/graph-session.mjs"
     }
   },
   "scripts": {
     "dev": "vite --config vite.config.ts",
-    "build": "vite build --config vite.config.ts",
+    "build:sdk": "node scripts/build-sdk.mjs",
+    "build": "npm run build:sdk && vite build --config vite.config.ts",
     "preview": "vite preview --config vite.config.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node --test test/*.test.mjs",
+    "test": "npm run build:sdk && node --test test/*.test.mjs",
     "check": "npm run typecheck && npm test"
   },
   "dependencies": {

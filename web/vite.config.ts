@@ -6,7 +6,7 @@ import { defineConfig, type Plugin } from 'vite';
 
 const webRoot = dirname(fileURLToPath(import.meta.url));
 const repoRoot = resolve(webRoot, '..');
-const sdkEntry = resolve(webRoot, 'sdk/ganbate.js');
+const sdkEntry = resolve(webRoot, 'sdk/src/index.ts');
 
 function ganbateSdkExternalPlugin(): Plugin {
   let isBuild = false;

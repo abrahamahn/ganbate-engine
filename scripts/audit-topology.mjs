@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const ALLOWED_TOP_DIRS = new Set(['crates', 'docs', 'examples', 'scripts', 'src', 'tests', 'web']);
-const IGNORED_TOP_DIRS = new Set(['.git', 'target', 'artifacts']);
+const IGNORED_TOP_DIRS = new Set(['.git', '.github', 'target', 'artifacts']);
 const RETIRED_TOP_PATHS = ['samples', 'content', 'editor'];
 
 const ALLOWED_TOP_FILES = new Set([
@@ -35,7 +35,7 @@ const EXPECTED_CRATES = [
   'web',
 ];
 
-const EXPECTED_WEB_DIRS = new Set(['player', 'sdk', 'test']);
+const EXPECTED_WEB_DIRS = new Set(['player', 'scripts', 'sdk', 'test']);
 const IGNORED_WEB_DIRS = new Set(['dist', 'node_modules']);
 const ALLOWED_WEB_FILES = new Set([
   '.gitignore',
@@ -136,6 +136,18 @@ function checkWebTopology() {
     const abs = path.join(webDir, req);
     if (!existsSync(abs) || !statSync(abs).isDirectory()) {
       errors.push(`Missing web/${req}/ directory`);
+    }
+  }
+  const sdkEntry = path.join(webDir, 'sdk', 'src', 'index.ts');
+  if (!existsSync(sdkEntry)) {
+    errors.push('Missing modular TypeScript SDK entry: web/sdk/src/index.ts');
+  }
+  const sdkDir = path.join(webDir, 'sdk');
+  if (existsSync(sdkDir)) {
+    for (const entry of readdirSync(sdkDir, { withFileTypes: true })) {
+      if (entry.isFile() && /\.(m?js|d\.m?ts)$/.test(entry.name)) {
+        errors.push(`Legacy unmodularized SDK file must not live in web/sdk/: web/sdk/${entry.name}`);
+      }
     }
   }
 }
