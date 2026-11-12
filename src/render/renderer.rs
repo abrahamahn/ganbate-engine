@@ -644,6 +644,9 @@ pub struct FrameStats {
     pub prop_shadows_kept: bool,
     /// The painterly filter ran (it is skipped where it would change nothing).
     pub painted: bool,
+    /// The fused tone-map output graded each pixel once, in a pass of its own
+    /// ([`Renderer::set_grade_once`]).
+    pub graded_once: bool,
 }
 
 /// Where the final pass writes.
@@ -731,6 +734,10 @@ pub(super) struct Pipelines {
     /// `fs_tonemap` and `fs_final` in one pass, where no painterly filter runs between them; then
     /// the same for a Look whose grade changes nothing ([`Look::grade_is_identity`]).
     tonemap_output: [PipelineId; 2],
+    /// The same in two passes ([`Renderer::set_grade_once`]), made when first chosen: `fs_grade`
+    /// and `fs_grade_plain` into [`GRADED_FORMAT`], then `fs_tonemap_output` compiled with
+    /// `GRADED`, which reads what they wrote.
+    grade_once: Option<([PipelineId; 2], PipelineId)>,
     paint: PipelineId,
     output: PipelineId,
 }
@@ -767,6 +774,8 @@ pub(super) struct Targets {
     bloom_levels: u32,
     ldr: TextureId,
     paint: TextureId,
+    /// Each pixel's grade, where frames grade once ([`Renderer::set_grade_once`]).
+    graded: Option<TextureId>,
     still: Option<TextureId>,
     readback: Option<BufferId>,
     tiles: [(u32, u32); 2],
@@ -800,6 +809,8 @@ pub(super) struct Slot {
     tonemap: BindGroupId,
     tonemap_final: BindGroupId,
     tonemap_output: [BindGroupId; 2],
+    /// `Pipelines::grade_once`'s groups, where frames grade once.
+    grade_once: Option<([BindGroupId; 2], BindGroupId)>,
     paint: BindGroupId,
     output: BindGroupId,
 }
@@ -907,6 +918,14 @@ const WATER_STATICS: [(&str, SpecValue); 1] = [("WATER_STATICS", SpecValue::Bool
 /// steps). Devices that cannot read them (WebGPU without `float32-filterable`) compute them.
 const WATER_STATICS_FORMAT: Format = Format::Rgba32Float;
 
+/// `fs_grade`'s target: 32-bit floats hold each pixel's grade as computing it gives, so the output
+/// read from them is the fused pass's byte for byte. WebGL 2 renders them with
+/// `EXT_color_buffer_float`, as it does the 16-bit float targets the renderer always has.
+const GRADED_FORMAT: Format = Format::Rgba32Float;
+
+/// `fs_tonemap_output` reading the grades `fs_grade` wrote.
+const GRADED: [(&str, SpecValue); 1] = [("GRADED", SpecValue::Bool(true))];
+
 /// The scene shader with a game's prop shader (`shade`) and the overlay entry point that calls it.
 pub(super) fn prop_shader_source(user: &str) -> Result<String> {
     let raw = format!(
@@ -993,7 +1012,19 @@ fn fullscreen(
     format: Format,
     blend: Blend,
 ) -> Result<PipelineId> {
-    let fs = compile(POST, Stage::Fragment, entry)?;
+    fullscreen_specialized(device, vs, entry, &[], format, blend)
+}
+
+/// [`fullscreen`] with the post shader's module `const`s set.
+fn fullscreen_specialized(
+    device: &mut Device<'_>,
+    vs: &Compiled,
+    entry: &str,
+    specialize: &[(&str, SpecValue)],
+    format: Format,
+    blend: Blend,
+) -> Result<PipelineId> {
+    let fs = compile_specialized(POST, Stage::Fragment, entry, specialize)?;
     device.create_render_pipeline(&RenderPipelineDesc {
         vertex: vs,
         fragment: Some(&fs),
@@ -1467,9 +1498,29 @@ impl Pipelines {
                     Blend::Replace,
                 )?,
             ],
+            grade_once: None,
             paint: fullscreen(device, &fsvs, "fs_paint", HDR, Blend::Replace)?,
             output: fullscreen(device, &fsvs, "fs_final", output, Blend::Replace)?,
         })
+    }
+
+    /// The `grade_once` pipelines, for an `output` target.
+    fn grade_once(
+        device: &mut Device<'_>,
+        output: Format,
+    ) -> Result<([PipelineId; 2], PipelineId)> {
+        let fsvs = compile(POST, Stage::Vertex, "vs_fullscreen")?;
+        let mut pass = |entry| fullscreen(device, &fsvs, entry, GRADED_FORMAT, Blend::Replace);
+        let grade = [pass("fs_grade")?, pass("fs_grade_plain")?];
+        let read = fullscreen_specialized(
+            device,
+            &fsvs,
+            "fs_tonemap_output",
+            &GRADED,
+            output,
+            Blend::Replace,
+        )?;
+        Ok((grade, read))
     }
 }
 
@@ -1856,7 +1907,7 @@ impl Renderer {
             sampled,
         ))?;
         device.write_texture(lut, 0, 0, &bake_lut(&look))?;
-        let targets = Self::create_targets(device, &quality, output, size)?;
+        let targets = Self::create_targets(device, &quality, output, size, false)?;
         let mut r = Self {
             scene,
             pipelines,
@@ -1997,11 +2048,13 @@ impl Renderer {
         (self.scene.min, self.scene.max)
     }
 
+    /// The size-dependent targets, with `fs_grade`'s where frames grade once (`grade_once`).
     fn create_targets(
         device: &mut Device<'_>,
         q: &Quality,
         output: Output,
         (width, height): (u32, u32),
+        grade_once: bool,
     ) -> Result<Targets> {
         let rt = TextureUsage::COLOR_TARGET | TextureUsage::SAMPLED;
         let tex = |d: &mut Device<'_>, w: u32, h: u32, f: Format, u| {
@@ -2067,6 +2120,9 @@ impl Renderer {
             bloom_levels,
             ldr: tex(device, width, height, HDR, rt)?,
             paint: tex(device, width, height, HDR, rt)?,
+            graded: grade_once
+                .then(|| tex(device, width, height, GRADED_FORMAT, rt))
+                .transpose()?,
             still: None,
             readback: None,
             tiles: [
@@ -2239,11 +2295,22 @@ impl Renderer {
             Resource::Texture(t.lit),
             Resource::TextureMip(t.bloom, 0),
         )?;
-        let [graded, plain] = p.tonemap_output.map(|pipe| {
-            let (lit, bloom) = (Resource::Texture(t.lit), Resource::TextureMip(t.bloom, 0));
-            post(device, pipe, lit, bloom)
-        });
-        let tonemap_output = [graded?, plain?];
+        // The fused output's groups, or `fs_grade`'s: the lit picture and its bloom.
+        let lit = |d: &mut Device<'_>, pipes: [PipelineId; 2]| -> Result<[BindGroupId; 2]> {
+            let [graded, plain] = pipes.map(|pipe| {
+                let (lit, bloom) = (Resource::Texture(t.lit), Resource::TextureMip(t.bloom, 0));
+                post(d, pipe, lit, bloom)
+            });
+            Ok([graded?, plain?])
+        };
+        let tonemap_output = lit(device, p.tonemap_output)?;
+        let grade_once = match (t.graded, p.grade_once) {
+            (Some(graded), Some((grade, read))) => Some((
+                lit(device, grade)?,
+                post(device, read, Resource::Texture(graded), none)?,
+            )),
+            _ => None,
+        };
         let tonemap_final = device.create_bind_group(
             p.tonemap_final,
             0,
@@ -2285,6 +2352,7 @@ impl Renderer {
             tonemap,
             tonemap_final,
             tonemap_output,
+            grade_once,
             paint,
             output,
         })
@@ -2301,6 +2369,11 @@ impl Renderer {
                     s.grass, s.flower, s.particle, s.restore, s.mask, s.ssao, s.air,
                 ])
                 .chain(s.tonemap_output)
+                .chain(
+                    s.grade_once
+                        .into_iter()
+                        .flat_map(|(grade, read)| grade.into_iter().chain([read])),
+                )
                 .chain([s.tonemap, s.tonemap_final, s.paint, s.output])
             {
                 device.destroy_bind_group(g);
@@ -2341,6 +2414,7 @@ impl Renderer {
             old.paint,
         ]
         .into_iter()
+        .chain(old.graded)
         .chain(old.still)
         .chain(old.cache_water)
         {
@@ -2356,7 +2430,44 @@ impl Renderer {
         if size == (self.targets.width, self.targets.height) {
             return Ok(());
         }
-        let new_targets = Self::create_targets(device, &self.quality, self.output, size)?;
+        self.rebuild_targets(device, size, self.grade_once())
+    }
+
+    /// Draws the fused tone-map output (no painterly filter between the tone-map and the output)
+    /// as two passes: `fs_grade` grades each pixel once into a 32-bit float target, which holds
+    /// the grade exactly, then `fs_tonemap_output` sharpens, smooths edges and encodes from
+    /// there, where the fused pass grades the pixel and its four neighbours itself. The picture
+    /// is the same (byte for byte on lavapipe); the GPU grades one pixel a pixel instead of five
+    /// and moves 32 bytes a pixel more (the target written and read back): for a GPU whose
+    /// arithmetic the five grades bind (Arm Mali). A device that cannot read 32-bit float
+    /// textures (WebGPU without `float32-filterable`) keeps the fused pass. Returns whether
+    /// frames now grade once.
+    pub fn set_grade_once(&mut self, device: &mut Device<'_>, on: bool) -> Result<bool> {
+        let on = on && device.limits().float32_readable;
+        if on != self.grade_once() {
+            if on && self.pipelines.grade_once.is_none() {
+                let output = self.pipelines.output_format;
+                self.pipelines.grade_once = Some(Pipelines::grade_once(device, output)?);
+            }
+            self.rebuild_targets(device, self.size(), on)?;
+        }
+        Ok(on)
+    }
+
+    /// Frames grade each pixel once ([`Renderer::set_grade_once`]).
+    pub fn grade_once(&self) -> bool {
+        self.targets.graded.is_some()
+    }
+
+    /// Makes the size-dependent targets and the frame slots binding them again.
+    fn rebuild_targets(
+        &mut self,
+        device: &mut Device<'_>,
+        size: (u32, u32),
+        grade_once: bool,
+    ) -> Result<()> {
+        let new_targets =
+            Self::create_targets(device, &self.quality, self.output, size, grade_once)?;
         self.world_cache = None;
         self.reset_prop_slots(device);
         Self::destroy_slots(device, std::mem::take(&mut self.slots));
@@ -2380,7 +2491,8 @@ impl Renderer {
             return Ok(());
         }
         let size = (self.targets.width, self.targets.height);
-        let new_targets = Self::create_targets(device, &quality, self.output, size)?;
+        let new_targets =
+            Self::create_targets(device, &quality, self.output, size, self.grade_once())?;
         self.world_cache = None;
 
         let old_shadow_size = self.quality.shadow_size.max(16);
@@ -4241,15 +4353,16 @@ impl Renderer {
                 grade[13] = if self.quality.fxaa { 1.0 } else { 0.0 };
                 grade[14] = if encode_srgb { 1.0 } else { 0.0 };
                 let plain = usize::from(l.grade_is_identity());
-                Self::post_pass(
-                    enc,
-                    dest,
-                    0,
-                    Load::DontCare,
-                    p.tonemap_output[plain],
-                    slot.tonemap_output[plain],
-                    grade,
-                );
+                let (pipe, group) = match (t.graded, p.grade_once, slot.grade_once) {
+                    (Some(graded), Some((pipes, read)), Some((groups, read_group))) => {
+                        stats.graded_once = true;
+                        let (pipe, group) = (pipes[plain], groups[plain]);
+                        Self::post_pass(enc, graded, 0, Load::DontCare, pipe, group, grade);
+                        (read, read_group)
+                    }
+                    _ => (p.tonemap_output[plain], slot.tonemap_output[plain]),
+                };
+                Self::post_pass(enc, dest, 0, Load::DontCare, pipe, group, grade);
             }
         }
         if self.has_overlays() {
@@ -4532,6 +4645,35 @@ mod tests {
             compile_msl_with_options(&composed, Stage::Fragment, entry, &opts).expect(entry);
             compile_wgsl_with_options(&composed, Stage::Fragment, entry, &opts).expect(entry);
         }
+    }
+
+    /// The grade-once passes compile for every backend the player draws with, and the output
+    /// reading the grades (`GRADED`) binds the frame, the depth and the grades alone: nothing the
+    /// grading reads (the bloom, its sampler) is left in it.
+    #[test]
+    fn the_grade_once_shaders_compile_everywhere() {
+        let composed = ganbate_shader::compose(POST, &shader_modules()).expect("compose");
+        for (entry, specialize) in [
+            ("fs_grade", &[][..]),
+            ("fs_grade_plain", &[]),
+            ("fs_tonemap_output", &GRADED),
+        ] {
+            let opts = CompileOptions {
+                imports: &[],
+                specialize,
+            };
+            compile_specialized(POST, Stage::Fragment, entry, specialize).expect(entry);
+            compile_glsl_with_options(&composed, Stage::Fragment, entry, &opts).expect(entry);
+            compile_msl_with_options(&composed, Stage::Fragment, entry, &opts).expect(entry);
+            compile_wgsl_with_options(&composed, Stage::Fragment, entry, &opts).expect(entry);
+        }
+        let read = compile_specialized(POST, Stage::Fragment, "fs_tonemap_output", &GRADED)
+            .expect("fs_tonemap_output");
+        let bound: Vec<_> = sorted_bindings(&read.bindings)
+            .iter()
+            .map(|b| b.binding)
+            .collect();
+        assert_eq!(bound, [0, 1, 3]);
     }
 
     #[test]
@@ -5316,14 +5458,23 @@ mod tests {
     }
 
     /// An offscreen RGBA8 target standing in for a `size` canvas, and a buffer to read it into.
-    fn canvas(device: &mut Device<'_>, (w, h): (u32, u32)) -> (TextureId, BufferId) {
+    fn canvas(device: &mut Device<'_>, size: (u32, u32)) -> (TextureId, BufferId) {
+        canvas_as(device, size, Format::Rgba8Unorm)
+    }
+
+    /// [`canvas`] in `format`.
+    fn canvas_as(
+        device: &mut Device<'_>,
+        (w, h): (u32, u32),
+        format: Format,
+    ) -> (TextureId, BufferId) {
         let usage = TextureUsage::COLOR_TARGET | TextureUsage::COPY_SRC;
         let target = device
-            .create_texture(&TextureDesc::new(w, h, Format::Rgba8Unorm, usage))
+            .create_texture(&TextureDesc::new(w, h, format, usage))
             .expect("target");
         let readback = device
             .create_buffer(&BufferDesc {
-                size: u64::from(w * h * 4),
+                size: u64::from(w * h * format.texel_size()),
                 usage: BufferUsage::COPY_DST,
                 memory: Memory::Readback,
             })
@@ -5367,14 +5518,14 @@ mod tests {
         (off as f64 / (a.len() / 4) as f64, largest)
     }
 
-    /// A Look whose grade changes nothing is tone-mapped without grading, and the picture is the
-    /// one its grade gives: within one 8-bit step on 99.9 % of pixels of the same frame graded a
-    /// hair from the identity, which takes the full grade.
-    #[test]
-    fn an_identity_grade_is_skipped_without_changing_the_picture() {
-        let Ok(mut device) = Device::headless() else {
-            return;
-        };
+    /// A glowing ball by a matte one on a floor at half past five in the evening, drawn in `look`
+    /// by a `size` renderer presenting to `format`, with the view and the light to draw it in.
+    fn two_balls(
+        device: &mut Device<'_>,
+        look: &Look,
+        size: (u32, u32),
+        format: Format,
+    ) -> (Renderer, View, Environment) {
         let mut world = World::default();
         world.materials.push(Material {
             name: "floor".into(),
@@ -5386,30 +5537,20 @@ mod tests {
             mesh: 0,
             transform: Transform(math::IDENTITY),
         });
-        let identity = Look {
-            painterly: 0.0,
-            saturation: 1.0,
-            contrast: 1.0,
-            lift: [0.0; 3],
-            gain: [1.0; 3],
-            ..Look::default()
-        };
-        assert!(identity.grade_is_identity() && !Look::default().grade_is_identity());
-        let size = (128, 96);
         let mut r = Renderer::new(
-            &mut device,
+            device,
             &world,
-            identity.clone(),
+            look.clone(),
             Quality::realtime(),
             size,
-            Output::Surface(Format::Rgba8Unorm),
+            Output::Surface(format),
         )
         .expect("renderer");
-        r.finish_ao(&mut device).expect("ao");
+        r.finish_ao(device).expect("ao");
         let (sp, sn, suv, sidx) = sphere_prop_data();
         let sphere = r
             .create_prop_mesh(
-                &mut device,
+                device,
                 &MeshData {
                     positions: &sp,
                     normals: &sn,
@@ -5418,14 +5559,13 @@ mod tests {
                 },
             )
             .expect("mesh");
-        // A glowing ball by a matte one.
         for (color, emissive, x) in [
             ([0.2, 0.5, 0.9, 1.0], [6.0, 3.0, 1.0], 0.5),
             ([0.8; 4], [0.0; 3], -0.6),
         ] {
             let material = r
                 .create_prop_material(
-                    &mut device,
+                    device,
                     &MaterialDesc {
                         name: "ball".into(),
                         base_color: color,
@@ -5454,9 +5594,31 @@ mod tests {
                 ..TimeOfDay::default()
             },
             &Weather::default(),
-            &identity.palette,
+            &look.palette,
             1.0,
         );
+        (r, view, env)
+    }
+
+    /// A Look whose grade changes nothing is tone-mapped without grading, and the picture is the
+    /// one its grade gives: within one 8-bit step on 99.9 % of pixels of the same frame graded a
+    /// hair from the identity, which takes the full grade.
+    #[test]
+    fn an_identity_grade_is_skipped_without_changing_the_picture() {
+        let Ok(mut device) = Device::headless() else {
+            return;
+        };
+        let identity = Look {
+            painterly: 0.0,
+            saturation: 1.0,
+            contrast: 1.0,
+            lift: [0.0; 3],
+            gain: [1.0; 3],
+            ..Look::default()
+        };
+        assert!(identity.grade_is_identity() && !Look::default().grade_is_identity());
+        let size = (128, 96);
+        let (mut r, view, env) = two_balls(&mut device, &identity, size, Format::Rgba8Unorm);
         let out = canvas(&mut device, size);
         let hair = 1.0 + f32::EPSILON;
         for tonemap in ToneMap::ALL {
@@ -5490,6 +5652,82 @@ mod tests {
         let errs = device.validation_errors();
         assert!(errs.is_empty(), "validation errors: {errs:?}");
         r.destroy_props(&mut device);
+    }
+
+    /// The fused tone-map output drawn grading each pixel once (`set_grade_once`: `fs_grade`
+    /// into a 32-bit float target, then `fs_tonemap_output` reading it) is the fused pass's
+    /// picture, compared in 32-bit floats: bit for bit on lavapipe, for an identity grade and a
+    /// full one, with sharpening and edge smoothing each on and off. On another driver, whose
+    /// compilers may round the two shaders apart, within one 8-bit step on 99.9 % of pixels.
+    #[test]
+    fn grading_once_draws_the_fused_picture() {
+        let Ok(mut device) = Device::headless() else {
+            return;
+        };
+        let size = (128, 96);
+        let look = Look {
+            painterly: 0.0,
+            ..Look::default()
+        };
+        let (mut fused, view, env) = two_balls(&mut device, &look, size, GRADED_FORMAT);
+        let (mut once, ..) = two_balls(&mut device, &look, size, GRADED_FORMAT);
+        assert!(once.set_grade_once(&mut device, true).expect("grade once"));
+        let out = [(); 2].map(|_| canvas_as(&mut device, size, GRADED_FORMAT));
+        let unorm8 = |frame: &[u8]| -> Vec<u8> {
+            let channels = frame.chunks_exact(4).map(|c| [c[0], c[1], c[2], c[3]]);
+            let to_8 = |c| (f32::from_le_bytes(c) * 255.0).round().clamp(0.0, 255.0) as u8;
+            channels.map(to_8).collect()
+        };
+        let mut seen = vec![];
+        for smoothing in [false, true] {
+            let quality = Quality {
+                fxaa: smoothing,
+                ..Quality::realtime()
+            };
+            for identity in [false, true] {
+                for sharpen in [0.0, 0.6] {
+                    let mut look = Look {
+                        sharpen,
+                        ..look.clone()
+                    };
+                    if identity {
+                        (look.saturation, look.contrast) = (1.0, 1.0);
+                        (look.lift, look.gain) = ([0.0; 3], [1.0; 3]);
+                    }
+                    let [a, b] = [(&mut fused, out[0]), (&mut once, out[1])].map(|(r, out)| {
+                        r.set_quality(&mut device, quality).expect("quality");
+                        r.set_look(look.clone());
+                        present(&mut device, r, &view, &env, out)
+                    });
+                    let what =
+                        format!("smoothing {smoothing}, identity {identity}, sharpen {sharpen}");
+                    let stats = [&fused, &once].map(|r| r.last_frame_stats().graded_once);
+                    assert_eq!(stats, [false, true], "{what}");
+                    if device.name().starts_with("llvmpipe") {
+                        let floats = a.chunks_exact(4).zip(b.chunks_exact(4));
+                        let differ = floats.filter(|(x, y)| x != y).count();
+                        assert_eq!(differ, 0, "{what}: {differ} floats differ");
+                    } else {
+                        assert_same_frame(&device, &unorm8(&a), &unorm8(&b), &what);
+                    }
+                    // Each setting draws a picture of its own, so each is compared.
+                    let mut h = Fnv::new();
+                    h.write(&a);
+                    assert!(!seen.contains(&h.finish()), "{what}: as another setting");
+                    seen.push(h.finish());
+                }
+            }
+        }
+        once.resize(&mut device, (size.0 + 2, size.1))
+            .expect("resize");
+        assert!(once.grade_once(), "a resized renderer still grades once");
+        assert!(!once.set_grade_once(&mut device, false).expect("fused"));
+        assert!(!once.grade_once());
+        let errs = device.validation_errors();
+        assert!(errs.is_empty(), "validation errors: {errs:?}");
+        for r in [&mut fused, &mut once] {
+            r.destroy_props(&mut device);
+        }
     }
 
     /// The presented picture drawn through the caches frame after frame (the cached picture, the

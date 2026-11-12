@@ -526,22 +526,47 @@ fn graded_at(p: vec2i, identity: bool) -> vec3f {
   return clamp(col, vec3f(0.0), vec3f(1.0));
 }
 
+// `graded_at` for every pixel, into a 32-bit float target that holds it exactly, for
+// `fs_tonemap_output` compiled with `GRADED` to read (`Renderer::set_grade_once`).
+@fragment fn fs_grade(in: Screen) -> @location(0) vec4f {
+  return vec4f(graded_at(vec2i(in.clip.xy), false), 1.0);
+}
+
+@fragment fn fs_grade_plain(in: Screen) -> @location(0) vec4f {
+  return vec4f(graded_at(vec2i(in.clip.xy), true), 1.0);
+}
+
+// Set, `tonemap_output` reads each pixel's grade from `src_tex`, where `fs_grade` wrote it,
+// rather than grading the pixel and its four neighbours itself: the same values, so the same
+// picture, for one grade a pixel instead of five.
+const GRADED: bool = false;
+
+fn graded(p: vec2i, identity: bool) -> vec3f {
+  if (GRADED) {
+    let size = vec2i(frame.viewport.xy);
+    return textureLoad(src_tex, clamp(p, vec2i(0), size - vec2i(1)), 0).rgb;
+  } else {
+    return graded_at(p, identity);
+  }
+}
+
 // `fs_tonemap` and `fs_final` in one pass, for when no painterly filter runs between them: the
 // same sharpening and edge smoothing on the same tone-mapped pixels, computed here for the pixel
-// and its four neighbours rather than written out and read back. pc.a..c as `graded_at`, pc.d =
-// (sharpen, edge smoothing on, encode sRGB, unused).
+// and its four neighbours rather than written out and read back (compiled with `GRADED`, read
+// from where `fs_grade` wrote them exactly). pc.a..c as `graded_at`, pc.d = (sharpen, edge
+// smoothing on, encode sRGB, unused).
 fn tonemap_output(in: Screen, identity: bool) -> vec4f {
   let px = vec2i(in.clip.xy);
-  let centre = graded_at(px, identity);
+  let centre = graded(px, identity);
   var col = centre;
   let d = depth_px(px);
   let sharpen = pc.d.x * select(1.0 - smoothstep(6.0, 18.0, linear_depth(d)), 0.0, d <= 0.0);
   let smoothing = pc.d.y > 0.5;
   if (sharpen > 0.0 || smoothing) {
-    let n = graded_at(px + vec2i(0, -1), identity);
-    let s = graded_at(px + vec2i(0, 1), identity);
-    let e = graded_at(px + vec2i(1, 0), identity);
-    let w = graded_at(px + vec2i(-1, 0), identity);
+    let n = graded(px + vec2i(0, -1), identity);
+    let s = graded(px + vec2i(0, 1), identity);
+    let e = graded(px + vec2i(1, 0), identity);
+    let w = graded(px + vec2i(-1, 0), identity);
     if (sharpen > 0.0) {
       let detail = col - (n + s + e + w) * 0.25;
       col = max(col + clamp(detail * sharpen, vec3f(-0.08), vec3f(0.08)), vec3f(0.0));
