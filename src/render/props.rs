@@ -481,6 +481,10 @@ pub(super) struct Batch {
     settled: bool,
 }
 
+/// Runs of a batch's instances drawn apart at most ([`Renderer::instance_runs`]); a batch whose
+/// instances in view lie in more is drawn whole.
+const MAX_INSTANCE_RUNS: usize = 4;
+
 /// Which opaque prop batches a draw takes: all of them, those in the cached picture, or those
 /// drawn over it each frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2555,24 +2559,36 @@ impl Renderer {
         push
     }
 
-    /// The runs (first, count) of a batch's instances whose bounds `within` sees; the whole
-    /// batch without it.
-    fn instance_runs(&self, b: &Batch, within: Option<&Frustum>) -> Vec<(u32, u32)> {
+    /// The runs (first, count) of the `count` instances from `first` (their world bounds in
+    /// `placed`) whose bounds `within` sees, and how many there are: all of them as one without
+    /// it, and as one too where those it sees lie in more than [`MAX_INSTANCE_RUNS`] runs (those
+    /// it does not see draw no pixel inside it).
+    fn instance_runs(
+        placed: &[(V3, V3)],
+        first: u32,
+        count: u32,
+        within: Option<&Frustum>,
+    ) -> ([(u32, u32); MAX_INSTANCE_RUNS], usize) {
+        let mut runs = [(first, count); MAX_INSTANCE_RUNS];
         let Some(f) = within else {
-            return vec![(b.first, b.count)];
+            return (runs, 1);
         };
-        let mut runs: Vec<(u32, u32)> = vec![];
-        for i in b.first..b.first + b.count {
-            let (lo, hi) = self.props.placed[i as usize];
+        let mut n = 0;
+        for i in first..first + count {
+            let (lo, hi) = placed[i as usize];
             if !f.intersects_aabb(lo, hi) {
                 continue;
             }
-            match runs.last_mut() {
-                Some((first, count)) if *first + *count == i => *count += 1,
-                _ => runs.push((i, 1)),
+            if n > 0 && runs[n - 1].0 + runs[n - 1].1 == i {
+                runs[n - 1].1 += 1;
+            } else if n == MAX_INSTANCE_RUNS {
+                return ([(first, count); MAX_INSTANCE_RUNS], 1);
+            } else {
+                runs[n] = (i, 1);
+                n += 1;
             }
         }
-        runs
+        (runs, n)
     }
 
     /// Draws this frame's opaque prop batches in `set` with the scene shading (`view` 0 main,
@@ -2623,8 +2639,8 @@ impl Renderer {
                 if view == 1 && mat.data.params[3] == 2.0 {
                     continue;
                 }
-                let runs = self.instance_runs(b, within);
-                if runs.is_empty() {
+                let (runs, n) = Self::instance_runs(&self.props.placed, b.first, b.count, within);
+                if n == 0 {
                     continue;
                 }
                 if bound != Some(b.material) {
@@ -2633,7 +2649,7 @@ impl Renderer {
                 }
                 enc.set_vertex_buffer(mesh.vertices, 0);
                 enc.set_index_buffer(mesh.indices, 0);
-                for (first, count) in runs {
+                for &(first, count) in &runs[..n] {
                     enc.push_constants(&f32_bytes(&Self::prop_push(mat, first, false)));
                     enc.draw_indexed(mesh.index_count, count, 0, 0, 0);
                 }
@@ -2760,6 +2776,39 @@ impl Renderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A batch's instances in view are drawn in runs, at most `MAX_INSTANCE_RUNS`; more runs, or
+    /// no frustum, draw the batch whole, and none in view draws nothing.
+    #[test]
+    fn instance_runs_draw_what_is_in_view_in_few_runs() {
+        // Looking down -z from the origin: an instance 5 m ahead ('x') is in view, one 50 m
+        // aside ('.') is not. The batch starts at instance 1.
+        let view = math::mul(
+            &math::perspective(1.0, 1.0, 0.1),
+            &math::look_at([0.0; 3], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]),
+        );
+        let seen = Frustum::from_view_proj(&view);
+        let at = |x: f32| ([x - 0.1, -0.1, -5.1], [x + 0.1, 0.1, -4.9]);
+        let placed = |pattern: &str| -> Vec<(V3, V3)> {
+            let x = |c| if c == 'x' { 0.0 } else { 50.0 };
+            std::iter::once(at(50.0))
+                .chain(pattern.chars().map(|c| at(x(c))))
+                .collect()
+        };
+        let runs = |pattern: &str, within| {
+            let (runs, n) =
+                Renderer::instance_runs(&placed(pattern), 1, pattern.len() as u32, within);
+            runs[..n].to_vec()
+        };
+        assert_eq!(runs("x.xx..x", None), [(1, 7)]);
+        assert_eq!(runs("x.xx..x", Some(&seen)), [(1, 1), (3, 2), (7, 1)]);
+        assert_eq!(
+            runs("xx.x.x.x", Some(&seen)),
+            [(1, 2), (4, 1), (6, 1), (8, 1)]
+        );
+        assert_eq!(runs("xx.x.x.x.x", Some(&seen)), [(1, 10)]);
+        assert_eq!(runs("....", Some(&seen)), []);
+    }
 
     #[test]
     fn material_from_json() {
