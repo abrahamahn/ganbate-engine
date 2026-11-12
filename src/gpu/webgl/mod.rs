@@ -39,7 +39,7 @@ use crate::gpu::{
     Limits, Memory, PipelineId, RenderPipelineDesc, Resource, SamplerDesc, SamplerId, TextureDesc,
     TextureId, TextureUsage, Topology, VertexFormat,
 };
-use ganbate_shader::glsl::HiddenValue;
+use ganbate_shader::glsl::{HiddenValue, STORAGE_ROW_TEXELS};
 use ganbate_shader::{BindingKind, Compiled, IoType, SampleType, Stage, TextureView};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -455,6 +455,17 @@ impl<'w> Gpu<'w> {
             ffi::write_buffer(b.js, offset, data);
         }
         Ok(())
+    }
+
+    /// A storage buffer's bytes live in the host's RGBA32UI texture, whose rows of
+    /// [`STORAGE_ROW_TEXELS`] texels a write uploads whole (`uploadRows` in web/ganbate.js).
+    pub fn write_granularity(&self, id: BufferId) -> u64 {
+        match self.buffer(id) {
+            Ok(b) if b.desc.usage.contains(BufferUsage::STORAGE) => {
+                u64::from(STORAGE_ROW_TEXELS) * 16
+            }
+            _ => 4,
+        }
     }
 
     pub fn read_buffer(&self, id: BufferId) -> Result<Vec<u8>> {

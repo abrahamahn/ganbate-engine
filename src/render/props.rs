@@ -1062,8 +1062,9 @@ fn max_stretch(m: &M4) -> f32 {
 }
 
 /// Writes to `buffer` the rows of `data` (`row` numbers each) that differ from `held`, what it
-/// holds: runs of changed rows, joined across a few unchanged ones between them (fewer, larger
-/// writes). `held` then holds `data`, and `data` what `held` held.
+/// holds, in the runs [`changed_runs`] makes for its write granularity (the unchanged rows a run
+/// spans are written with the bits it holds). `held` then holds `data`, and `data` what `held`
+/// held.
 fn write_changed(
     device: &mut Device<'_>,
     buffer: BufferId,
@@ -1071,32 +1072,71 @@ fn write_changed(
     data: &mut Vec<f32>,
     row: usize,
 ) -> Result<()> {
-    const GAP: usize = 4;
-    let rows = data.len() / row;
     let at = |r: usize| r * row..(r + 1) * row;
     let changed = |r: usize| {
         held.get(at(r))
             .is_none_or(|old| !same_bits(old, &data[at(r)]))
     };
+    let unit = device.write_granularity(buffer);
+    for run in changed_runs(data.len() / row, row * 4, unit, changed) {
+        let bytes = f32_bytes(&data[run.start * row..run.end * row]);
+        device.write_buffer(buffer, (run.start * row * 4) as u64, &bytes)?;
+    }
+    std::mem::swap(held, data);
+    Ok(())
+}
+
+/// The runs of rows to write of `rows` rows of `row_bytes` bytes, where `changed` says which
+/// differ: each changed row in one, joined across a few unchanged rows between them (fewer,
+/// larger writes), and across any number while they start in the `unit` (the buffer's write
+/// granularity) the run ends in, so that no unit is sent twice.
+fn changed_runs(
+    rows: usize,
+    row_bytes: usize,
+    unit: u64,
+    changed: impl Fn(usize) -> bool,
+) -> impl Iterator<Item = std::ops::Range<usize>> {
+    const GAP: usize = 4;
+    let unit = usize::try_from(unit).unwrap_or(usize::MAX).max(1);
     let mut r = 0;
-    while r < rows {
-        if !changed(r) {
+    std::iter::from_fn(move || {
+        while r < rows && !changed(r) {
             r += 1;
-            continue;
+        }
+        if r == rows {
+            return None;
         }
         let (start, mut end) = (r, r + 1);
         r = end;
-        while r < rows && r - end <= GAP {
+        while r < rows && (r - end <= GAP || r * row_bytes / unit <= (end * row_bytes - 1) / unit) {
             if changed(r) {
                 end = r + 1;
             }
             r += 1;
         }
-        let bytes = f32_bytes(&data[start * row..end * row]);
-        device.write_buffer(buffer, (start * row * 4) as u64, &bytes)?;
-    }
-    std::mem::swap(held, data);
-    Ok(())
+        Some(start..end)
+    })
+}
+
+/// How many units of `unit` bytes writing `data` over `held` (rows of `row` numbers) sends when
+/// its runs are made for write granularity `granularity`: for a benchmark of WebGL 2's storage
+/// uploads, which send their texture's rows whole.
+#[cfg(test)]
+pub(super) fn units_sent(
+    held: &[f32],
+    data: &[f32],
+    row: usize,
+    granularity: u64,
+    unit: usize,
+) -> usize {
+    let at = |r: usize| r * row..(r + 1) * row;
+    let changed = |r: usize| {
+        held.get(at(r))
+            .is_none_or(|old| !same_bits(old, &data[at(r)]))
+    };
+    changed_runs(data.len() / row, row * 4, granularity, changed)
+        .map(|run| (run.end * row * 4 - 1) / unit - run.start * row * 4 / unit + 1)
+        .sum()
 }
 
 /// A game's prop shader: its compiled stages and the overlay pipelines made from them so far.
@@ -1281,6 +1321,13 @@ impl Props {
         let mut h = Fnv::new();
         h.write(format!("{:?} {:?}", self.batches, self.bounds).as_bytes());
         h.finish()
+    }
+
+    /// What frame slot `slot`'s instance and joint buffers hold.
+    #[cfg(test)]
+    pub(super) fn slot_rows(&self, slot: usize) -> Option<(&[f32], &[f32])> {
+        let s = self.slots.get(slot)?.as_ref()?;
+        Some((&s.rows, &s.joint_rows))
     }
 
     /// Removes an instance; what it held in the cached picture is drawn again.
@@ -3838,6 +3885,88 @@ mod tests {
         props.remove_instance(ids[1]);
         props.remove_instance(ids[2]);
         assert_eq!(props.joint_sets.iter().count(), 0);
+    }
+
+    /// Runs made for WebGL 2's storage texture rows send none of them twice and leave the buffer
+    /// holding what a whole write would; made for 4 bytes they are the runs joined across four
+    /// unchanged rows alone, as before granularity.
+    #[test]
+    fn changed_runs_send_each_unit_of_the_write_granularity_once() {
+        const TEXTURE_ROW: u64 = 16384;
+        let by_gap = |changed: &[bool]| {
+            let mut runs = vec![];
+            let mut r = 0;
+            while r < changed.len() {
+                if !changed[r] {
+                    r += 1;
+                    continue;
+                }
+                let (start, mut end) = (r, r + 1);
+                r = end;
+                while r < changed.len() && r - end <= 4 {
+                    if changed[r] {
+                        end = r + 1;
+                    }
+                    r += 1;
+                }
+                runs.push(start..end);
+            }
+            runs
+        };
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for trial in 0..400 {
+            let rows = (next() % 400) as usize + 1;
+            let row = [16, 40][trial % 2];
+            let density = next() % 40 + 1;
+            let changed: Vec<bool> = (0..rows).map(|_| next() % 100 < density).collect();
+            let runs =
+                |unit| -> Vec<_> { changed_runs(rows, row * 4, unit, |r| changed[r]).collect() };
+            assert_eq!(runs(4), by_gap(&changed));
+            let joined = runs(TEXTURE_ROW);
+            let unit = |byte: usize| byte / TEXTURE_ROW as usize;
+            for pair in joined.windows(2) {
+                let (a, b) = (&pair[0], &pair[1]);
+                assert!(
+                    unit(a.end * row * 4 - 1) < unit(b.start * row * 4),
+                    "{joined:?}"
+                );
+            }
+            assert!(
+                joined
+                    .iter()
+                    .all(|r| changed[r.start] && changed[r.end - 1])
+            );
+            let held: Vec<f32> = (0..rows * row).map(|k| k as f32).collect();
+            let data: Vec<f32> = (0..rows * row)
+                .map(|k| {
+                    if changed[k / row] {
+                        -1.0 - k as f32
+                    } else {
+                        k as f32
+                    }
+                })
+                .collect();
+            let mut buffer = held.clone();
+            for r in &joined {
+                let at = r.start * row..r.end * row;
+                buffer[at.clone()].copy_from_slice(&data[at]);
+            }
+            assert_eq!(buffer, data);
+        }
+        // Instance rows (160 bytes) far apart in one texture row are one write; in two, two.
+        let two = |a: usize, b: usize| -> Vec<_> {
+            changed_runs(200, 160, TEXTURE_ROW, |r| r == a || r == b).collect()
+        };
+        assert_eq!(two(0, 50), [0..51]);
+        assert_eq!(two(0, 102), [0..103]);
+        assert_eq!(two(0, 103), [0..1, 103..104]);
+        assert_eq!(two(101, 103), [101..104]);
     }
 
     fn bound_bits((lo, hi): (V3, V3)) -> [u32; 6] {

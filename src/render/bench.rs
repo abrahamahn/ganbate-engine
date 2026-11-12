@@ -16,7 +16,7 @@ use super::lights::{LightDesc, SpotCone};
 use super::math::{self, M4, V3};
 use super::props::{
     CacheView, MaterialDesc, MeshData, PropInstance, PropMaterial, PropMesh, ShadowMap,
-    commit_prop_shadows, track_cached_props,
+    commit_prop_shadows, track_cached_props, units_sent,
 };
 use super::{
     Environment, Look, ModelId, ModelInstance, Output, Quality, Renderer, TimeOfDay, View, Weather,
@@ -698,12 +698,30 @@ fn prop_steps(device: &mut Device<'_>, lines: &mut Vec<String>) -> u64 {
     };
     let (mut prepare, mut track, mut commit) = (vec![], vec![], vec![]);
     let mut digest = super::renderer::Fnv::new();
+    // The texture rows WebGL 2 would upload for the slots' writes (it keeps storage buffers in
+    // textures and sends a write's rows whole): with runs made for that granularity, and as
+    // they were made before it, joined across four unchanged rows alone.
+    let texture_row = u64::from(crate::gpu::shader::glsl::STORAGE_ROW_TEXELS) * 16;
+    let (mut texture_rows, mut texture_rows_by_gap) = (0, 0);
     for f in 0..WARMUP + FRAMES {
         table.pose(device, f);
         let r = &mut table.renderer;
+        let held = r
+            .props
+            .slot_rows(f % 2)
+            .map(|(rows, joints)| (rows.to_vec(), joints.to_vec()));
         let t = Instant::now();
         r.prepare_props(device, f % 2, eye).expect("prepare");
         let prepare_us = micros(t);
+        if let (Some((rows, joints)), Some((now, joints_now))) = (held, r.props.slot_rows(f % 2))
+            && f >= WARMUP
+        {
+            for (held, data, row) in [(&rows[..], now, 40), (&joints[..], joints_now, 16)] {
+                let unit = texture_row as usize;
+                texture_rows += units_sent(held, data, row, texture_row, unit);
+                texture_rows_by_gap += units_sent(held, data, row, 4, unit);
+            }
+        }
         let maps: Vec<ShadowMap> = r
             .game_lights
             .shadow_views()
@@ -739,6 +757,12 @@ fn prop_steps(device: &mut Device<'_>, lines: &mut Vec<String>) -> u64 {
     lines.push(summary("prepare_props", &mut prepare));
     lines.push(summary("track_cached_props", &mut track));
     lines.push(summary("commit_prop_shadows", &mut commit));
+    lines.push(format!(
+        "WebGL 2 storage texture rows uploaded a frame: {:.2} (joined across four unchanged rows \
+         alone: {:.2})",
+        texture_rows as f64 / FRAMES as f64,
+        texture_rows_by_gap as f64 / FRAMES as f64
+    ));
     table.renderer.destroy_props(device);
     digest.finish()
 }

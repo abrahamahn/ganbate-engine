@@ -248,6 +248,13 @@ impl<'w> Device<'w> {
     pub fn write_buffer(&mut self, b: BufferId, offset: u64, data: &[u8]) -> Result<()> {
         self.gpu.write_buffer(b, offset, data)
     }
+    /// The bytes a write to `b` sends at least: a write sends every unit of this many bytes it
+    /// touches whole, so writes to one unit cost no more joined. Here only the 4 bytes writes
+    /// align to (on WebGL 2 a storage buffer's are a row of its texture).
+    pub fn write_granularity(&self, b: BufferId) -> u64 {
+        let _ = b;
+        4
+    }
     /// The whole contents of a `Readback` buffer, after the submissions that wrote it.
     pub fn read_buffer(&self, b: BufferId) -> Result<Vec<u8>> {
         self.gpu.read_buffer(b)
@@ -457,6 +464,15 @@ impl Device<'_> {
     /// Ordered after earlier submissions. On WebGPU, offset and length must be multiples of 4.
     pub fn write_buffer(&mut self, b: BufferId, offset: u64, data: &[u8]) -> Result<()> {
         web!(mut self, g => g.write_buffer(b, offset, data))
+    }
+    /// The bytes a write to `b` sends at least: a write sends every unit of this many bytes it
+    /// touches whole, so writes to one unit cost no more joined. On WebGL 2 a storage buffer's
+    /// are a row of the texture the host keeps it in; elsewhere the 4 bytes writes align to.
+    pub fn write_granularity(&self, b: BufferId) -> u64 {
+        match &self.gpu {
+            Web::Gpu(_) => 4,
+            Web::Gl(g) => g.write_granularity(b),
+        }
     }
     /// Not available on WebGPU; synchronous on WebGL 2.
     pub fn read_buffer(&self, b: BufferId) -> Result<Vec<u8>> {
