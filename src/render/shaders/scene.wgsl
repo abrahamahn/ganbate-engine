@@ -763,10 +763,14 @@ var<private> lamps_and_shadow: vec4f;
 // water; without them (`fs_main_opaque`) the shader never discards, so the GPU can reject hidden
 // fragments before shading them (early depth, or a tiler's hidden-surface removal).
 fn shade_scene(in: VsOut, front: bool, frag: vec4f, cut: bool) -> FsOut {
-  // Texture fetches and derivatives first, in uniform control flow.
+  // Texture fetches and derivatives first, in uniform control flow. The water (`fs_water`)
+  // fetches its normal map only when it has one.
   let bias = frame.style2.x;
   let base_s = textureSampleBias(base_tex, material_sampler, in.uv, bias);
-  let nrm_s = textureSampleBias(normal_tex, material_sampler, in.uv, bias * 0.5);
+  var nrm_s = vec4f(0.0);
+  if (!WATER_STATICS || draw.flags.y > 0.5) {
+    nrm_s = textureSampleBias(normal_tex, material_sampler, in.uv, bias * 0.5);
+  }
   let emi_s = textureSampleBias(emissive_tex, material_sampler, in.uv, bias);
   let dpx = dpdx(in.world);
   let dpy = dpdy(in.world);
@@ -796,7 +800,12 @@ fn shade_scene(in: VsOut, front: bool, frag: vec4f, cut: bool) -> FsOut {
   if (cut && albedo.a < draw.params.x) {
     discard;
   }
-  let shading = i32(draw.params.w + 0.5);
+  // `fs_water` (`WATER_STATICS`) draws only the water: there its shading is a constant, and all
+  // its branch never reads is dead code the GPU's compilers drop, the colour and glow fetches
+  // (left in the source so the material's bind group keeps the scene's layout), surface detail,
+  // brushwork and the derivatives they take, and the other surfaces' lighting. The normal map
+  // stays: `hemi` and the lamps take the normal it tilts.
+  let shading = select(i32(draw.params.w + 0.5), 2, WATER_STATICS);
   let to_cam = frame.camera.xyz - in.world;
   let dist = length(to_cam);
   let v = to_cam / max(dist, 1e-4);
