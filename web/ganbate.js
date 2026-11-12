@@ -2641,9 +2641,9 @@ export async function createEngine(options) {
     /** What the last frame did with the room's cached picture, or `null` if unavailable. */
     cacheStats() {
       if (typeof x.ganbate_rt_cache_stats !== 'function') return null;
-      const p = reserve(28);
+      const p = reserve(32);
       if (!x.ganbate_rt_cache_stats(p)) return null;
-      const w = new Uint32Array(x.memory.buffer, p, 7);
+      const w = new Uint32Array(x.memory.buffer, p, 8);
       return {
         worldCached: w[0] !== 0,
         regions: w[1],
@@ -2652,6 +2652,7 @@ export async function createEngine(options) {
         waterStaticsWhole: w[4] !== 0,
         waterStaticsRegions: w[5],
         waterFootprints: w[6],
+        reshadePixels: w[7],
       };
     },
     /** Selects stereo XR eye (`'mono' | 'left' | 'right'` or `-1 | 0 | 1`) with IPD in metres (`0.050..=0.078`, default `0.063`). */
