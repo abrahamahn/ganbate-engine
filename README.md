@@ -67,7 +67,7 @@ cargo run --locked --offline --release --bin ganbate-build -- inspect scene.gbew
 cargo run --locked --offline --release --bin ganbate-build -- model character.glb
 ```
 
-- **Supported inputs:** Embedded glTF 2.0 triangle meshes, PBR material factors, PNG base-colour/normal/emissive textures, `KHR_materials_emissive_strength`, `KHR_lights_punctual` point lights, alpha modes, double-sidedness, `extras.ganbate.shading` (`standard`, `foliage`, `water`, `unlit`), and `extras.ganbate.emission` (`lamp`, scaled by time of day). Unsupported codecs (such as Draco, decoded prior to cooking until M2) are reported explicitly.
+- **Supported inputs:** Embedded uncompressed glTF 2.0 triangle meshes, PBR material factors, PNG/JPEG/WebP base-colour/normal/emissive textures, `KHR_materials_emissive_strength`, `KHR_lights_punctual` point lights, alpha modes, double-sidedness, `extras.ganbate.shading` (`standard`, `foliage`, `water`, `unlit`), and `extras.ganbate.emission` (`lamp`, scaled by time of day). External geometry compression codecs (`KHR_draco_mesh_compression`, `EXT_meshopt_compression`) are intentionally excluded and rejected explicitly in favour of native `--compact` `.gbew` cooking and `ganbate-assets::mesh_opt`.
 - **Browser compression (`--compact --keep-images`):** Shrinks worlds to ~1/5th size (~7 bytes/triangle via 0.5 mm grid quantization, 12-bit octahedral normals, 1/8192 UVs, delta coding, and deflate) while keeping PNG/JPEG/WebP files intact (`EXT_texture_webp` supported). Browsers decode JPEG/WebP natively while the engine decodes PNG directly (avoiding 2D canvas premultiplied-alpha loss) and builds mip chains on the GPU.
 
 ---
