@@ -785,7 +785,13 @@ var<private> lamps_and_shadow: vec4f;
 // The scene's surface shading. `cut` keeps the alpha test and the reflection's clip under the
 // water; without them (`fs_main_opaque`) the shader never discards, so the GPU can reject hidden
 // fragments before shading them (early depth, or a tiler's hidden-surface removal).
-fn shade_scene(in: VsOut, front: bool, frag: vec4f, cut: bool) -> FsOut {
+// `reflects` is false in an entry point the mirrored reflection pass never draws with (it binds
+// the main view's frame alone), and `water` false in one that never draws the water (the cached
+// picture holds none: `draw_world`'s opaque and masked parts leave it out, and a water prop never
+// settles). Each entry point passes constants, so the GPU's compiler drops the code they rule out
+// and the registers and uniform slots that code took, while the bindings it reads stay in the
+// layout every scene pipeline shares.
+fn shade_scene(in: VsOut, front: bool, frag: vec4f, cut: bool, reflects: bool, water: bool) -> FsOut {
   // Texture fetches and derivatives first, in uniform control flow. The water (`fs_water`)
   // fetches its normal map only when it has one.
   let bias = frame.style2.x;
@@ -798,7 +804,7 @@ fn shade_scene(in: VsOut, front: bool, frag: vec4f, cut: bool) -> FsOut {
   let dpx = dpdx(in.world);
   let dpy = dpdy(in.world);
   // The mirrored reflection pass reverses winding: there the faces seen are back faces.
-  let reflection_pass = frame.water_color.w > 0.5;
+  let reflection_pass = reflects && frame.water_color.w > 0.5;
   var n = normalize(in.normal);
   if (front == reflection_pass) {
     n = -n;
@@ -894,7 +900,7 @@ fn shade_scene(in: VsOut, front: bool, frag: vec4f, cut: bool) -> FsOut {
   cast_shadows.w = 1.0;
   lamps_and_shadow = vec4f(lamps, sh);
 
-  if (shading == 2) {
+  if (water && shading == 2) {
     let t = frame.camera.w;
     let wn = water_normal(in.world, t);
     let cosv = clamp(dot(wn, v), 0.0, 1.0);
@@ -1036,16 +1042,16 @@ fn shade_scene(in: VsOut, front: bool, frag: vec4f, cut: bool) -> FsOut {
 }
 
 @fragment fn fs_main(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> FsOut {
-  return shade_scene(in, front, frag, true);
+  return shade_scene(in, front, frag, true, true, true);
 }
 
-// Opaque world surfaces in the main view, drawn nearest first.
+// Opaque world surfaces and props in the main view, drawn nearest first.
 @fragment fn fs_main_opaque(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> FsOut {
-  return shade_scene(in, front, frag, false);
+  return shade_scene(in, front, frag, false, false, true);
 }
 
-// The cached picture's shading: as `fs_main` and `fs_main_opaque`, with the shadows moved props
-// can change.
+// The cached picture's shading: as `fs_main` and `fs_main_opaque` in the main view, with the
+// shadows moved props can change; the picture holds no water.
 struct CacheOut {
   @location(0) color: vec4f,
   @location(1) aux: vec4f,
@@ -1061,17 +1067,17 @@ fn cache_out(o: FsOut) -> CacheOut {
 }
 
 @fragment fn fs_main_cache(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> CacheOut {
-  return cache_out(shade_scene(in, front, frag, true));
+  return cache_out(shade_scene(in, front, frag, true, false, false));
 }
 
 @fragment fn fs_main_opaque_cache(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> CacheOut {
-  return cache_out(shade_scene(in, front, frag, false));
+  return cache_out(shade_scene(in, front, frag, false, false, false));
 }
 
 // The water's lamp light and shadow, shaded as `fs_main_opaque` shades the water, into
 // `cache_water`.
 @fragment fn fs_water_static(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> @location(0) vec4f {
-  _ = shade_scene(in, front, frag, false);
+  _ = shade_scene(in, front, frag, false, false, true);
   return lamps_and_shadow;
 }
 
@@ -1079,7 +1085,7 @@ fn cache_out(o: FsOut) -> CacheOut {
 // `cache_water` where no prop moved since they were kept (compiled with `WATER_STATICS`; its
 // group binds `reshade` to the water's own block).
 @fragment fn fs_water(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> FsOut {
-  return shade_scene(in, front, frag, false);
+  return shade_scene(in, front, frag, false, false, true);
 }
 
 // ---------------------------------------------------------------- grass and flowers
