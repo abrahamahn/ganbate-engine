@@ -20,8 +20,8 @@ use super::math::{
     perspective, reflect_y, scale, sub, transform,
 };
 use super::props::{
-    CacheChanges, CacheView, PropSet, Rect, corners, merge_boxes, screen_rect, track_cached_props,
-    union,
+    CacheChanges, CacheView, PropSet, Rect, SHADOW_DRIFT_TEXELS, ShadowMap, commit_prop_shadows,
+    corners, merge_boxes, screen_rect, track_cached_props, union,
 };
 use super::scene::{DrawItem, GpuScene};
 use super::sky::Environment;
@@ -436,6 +436,9 @@ pub struct FrameStats {
     /// Footprints of the shadows of props moved since they were drawn whole (one shadow map
     /// apiece), within which the water computes them.
     pub water_footprints: u32,
+    /// The props' shadow maps (the key light's prop cascades, a game's lights') were kept from
+    /// the last frame: no caster moved, and the lights' views held.
+    pub prop_shadows_kept: bool,
     /// The painterly filter ran (it is skipped where it would change nothing).
     pub painted: bool,
 }
@@ -628,6 +631,9 @@ pub struct Renderer {
     pub(super) shadow_map: TextureId,
     shadow_layers_ready: bool,
     static_shadows_vp: Option<[M4; 2]>,
+    /// What the props' shadow maps were last drawn for; while it holds and no caster moved, they
+    /// are kept.
+    prop_shadows_for: Option<PropShadowViews>,
     /// The game lights' shadow maps, a layer for each light casting shadows.
     pub(super) light_shadow_map: TextureId,
     /// Every layer of the light shadow map has been written (cleared) once.
@@ -1309,6 +1315,14 @@ impl Eye {
     }
 }
 
+/// The views the props' shadow maps are drawn from: the key light's cascades while it shines on
+/// casters (layers 2, 3 of its map), and each shadowed game light's.
+#[derive(PartialEq)]
+struct PropShadowViews {
+    cascades: Option<[M4; 2]>,
+    lights: Vec<M4>,
+}
+
 struct Cascades {
     mats: [M4; 2],
     split: f32,
@@ -1643,6 +1657,7 @@ impl Renderer {
             shadow_map,
             shadow_layers_ready: false,
             static_shadows_vp: None,
+            prop_shadows_for: None,
             light_shadow_map,
             light_shadows_ready: false,
             ground_depth,
@@ -3252,49 +3267,78 @@ impl Renderer {
             // A still draws everything itself; the picture no longer follows the props.
             self.world_cache = None;
         }
+        // The views the props' shadow maps are drawn from this frame, and those maps as casters'
+        // moves are measured in.
+        let prop_views = PropShadowViews {
+            cascades: (env.key_intensity > 0.0 && has_prop_shadows).then_some(cas.mats),
+            lights: self.game_lights.shadow_views().to_vec(),
+        };
+        let cascade_maps = prop_views.cascades.iter().flatten();
+        let light_maps = prop_views.lights.iter();
+        let shadow_maps: Vec<ShadowMap> = cascade_maps
+            .map(|m| (*m, self.quality.shadow_size.max(16)))
+            .chain(light_maps.map(|m| (*m, self.quality.light_shadow_size.max(16))))
+            .collect();
         // The props the cached picture holds, and the regions of it to draw again: where props
-        // settled or left, and where the shadows of live ones moved over it.
+        // settled or left, and where the shadows of casters moved over it.
         let CacheChanges {
             regions,
             moved,
             settled,
+            casters_moved,
         } = if cached {
             let view = CacheView {
                 view_proj: &eye.view_proj,
                 size,
             };
-            track_cached_props(&mut self.props, rebuild, &view)
+            track_cached_props(
+                &mut self.props,
+                rebuild,
+                &view,
+                &shadow_maps,
+                SHADOW_DRIFT_TEXELS,
+            )
         } else {
             CacheChanges::default()
         };
         let regions = merge_regions(regions);
         let key = env.key_intensity > 0.0 && has_prop_shadows;
-        // The pixels of the picture moved props' shadows can reach, shaded again below, and the
-        // moved props whose shadows can reach the water.
-        let (reshade, water_moved) = if cached && !rebuild && !moved.is_empty() {
-            if self.receivers.as_ref().is_none_or(|r| r.key != world_key) {
-                let maps = self.prop_shadow_maps(&cas);
-                self.receivers = Some(ReceiverBounds::new(
-                    world_key,
-                    &self.scene.draws,
-                    &maps,
-                    &eye.view_proj,
-                    size,
-                ));
-            }
-            let footprints = self.shadow_footprints(&moved, &cas, key);
-            let water = self.receivers.as_ref().map_or(vec![], |r| {
-                let reaches = |b: &(V3, V3)| {
-                    let f = self.shadow_footprints(&[*b], &cas, key);
-                    r.water.iter().any(|m| reached(&f, m))
-                };
-                moved.iter().copied().filter(reaches).collect()
-            });
-            let plan = self.reshade_plan(&footprints, &settled, &eye, size, &cas);
-            (plan, water)
-        } else {
-            (None, vec![])
-        };
+        // The props' shadow maps are kept while their views hold and no caster moved across
+        // them (props that cast none move freely): a frame draws its live props' shadows from
+        // them as they are, and the cached picture was shaded from them. A still draws them
+        // every frame.
+        let redraw_prop_shadows = !cached
+            || casters_moved
+            || first_shadow_layers
+            || first_light_shadows
+            || self.prop_shadows_for.as_ref() != Some(&prop_views);
+        // The pixels of the picture moved casters' shadows can reach, shaded again below, and
+        // the moved casters whose shadows can reach the water.
+        let (reshade, water_moved) =
+            if cached && !rebuild && redraw_prop_shadows && !moved.is_empty() {
+                if self.receivers.as_ref().is_none_or(|r| r.key != world_key) {
+                    let maps = self.prop_shadow_maps(&cas);
+                    self.receivers = Some(ReceiverBounds::new(
+                        world_key,
+                        &self.scene.draws,
+                        &maps,
+                        &eye.view_proj,
+                        size,
+                    ));
+                }
+                let footprints = self.shadow_footprints(&moved, &cas, key);
+                let water = self.receivers.as_ref().map_or(vec![], |r| {
+                    let reaches = |b: &(V3, V3)| {
+                        let f = self.shadow_footprints(&[*b], &cas, key);
+                        r.water.iter().any(|m| reached(&f, m))
+                    };
+                    moved.iter().copied().filter(reaches).collect()
+                });
+                let plan = self.reshade_plan(&footprints, &settled, &eye, size, &cas);
+                (plan, water)
+            } else {
+                (None, vec![])
+            };
         // The water's lamp light and shadow, kept (`cache_water`) while the picture holds. A
         // frame drawing the picture whole (as while the camera moves) computes them, as a still
         // does; the first frame keeping it draws them whole. Later frames draw them again in the
@@ -3380,7 +3424,7 @@ impl Renderer {
                 }
                 self.static_shadows_vp = Some(cas.mats);
             }
-            if has_prop_shadows || first_shadow_layers {
+            if redraw_prop_shadows && (has_prop_shadows || first_shadow_layers) {
                 for (layer, m) in cas.mats.iter().enumerate() {
                     enc.begin_pass(PassDesc {
                         colors: vec![],
@@ -3417,9 +3461,8 @@ impl Renderer {
         }
 
         // A game's shadowed lights: the props seen from each, on a layer apiece.
-        let views = self.game_lights.shadow_views();
-        for layer in 0..super::lights::MAX_SHADOWED_LIGHTS {
-            let light_vp = views.get(layer);
+        for layer in (0..super::lights::MAX_SHADOWED_LIGHTS).filter(|_| redraw_prop_shadows) {
+            let light_vp = prop_views.lights.get(layer);
             if light_vp.is_none() && !first_light_shadows {
                 continue;
             }
@@ -3437,6 +3480,12 @@ impl Renderer {
                 self.draw_prop_shadows(enc, slot_index, m);
             }
             enc.end_pass();
+        }
+        if redraw_prop_shadows {
+            self.prop_shadows_for = Some(prop_views);
+            commit_prop_shadows(&mut self.props);
+        } else {
+            stats.prop_shadows_kept = true;
         }
 
         // Rain and petals wrap around a box just ahead of the camera.

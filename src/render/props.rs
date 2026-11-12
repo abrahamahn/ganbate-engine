@@ -380,6 +380,12 @@ pub(super) struct MeshEntry {
     /// A skinned mesh's per-joint bind-space bounds ([`joint_boxes`]): where its instances'
     /// posed vertices can lie.
     joint_boxes: Vec<Option<(V3, V3)>>,
+    /// Counts changes its instances' shadows follow as a whole rather than by how far they
+    /// moved ([`shadow_key`]): a new skin, or vertices moved out of their joints' boxes.
+    shape: u32,
+    /// How far, at most, a vertex moved in model space since the props' shadow maps were last
+    /// drawn (each update's largest move, summed).
+    drift: f32,
 }
 
 /// Where a skinned mesh's vertices' joints and weights lie in the shared skin records.
@@ -437,11 +443,30 @@ struct InstanceEntry {
     /// frames since then it has stayed the same.
     sig: u64,
     still: u32,
-    /// Its world bounds as drawn this frame and the last (none while hidden or incomplete).
+    /// Its world bounds as drawn this frame (none while hidden or incomplete).
     world_bounds: Option<(V3, V3)>,
-    prev_bounds: Option<(V3, V3)>,
     /// Where its image and shadows lie in the cached picture, while it is drawn there.
     cached: Option<Rect>,
+    shadow: ShadowTrack,
+}
+
+/// What follows an instance's shadow in the props' shadow maps, which are drawn again only when
+/// a caster moved across them ([`track_cached_props`]).
+#[derive(Default)]
+struct ShadowTrack {
+    /// The corners of the boxes holding its vertices as drawn this frame ([`posed_corners`]),
+    /// and the most any matrix placing them stretches a length.
+    corners: Vec<V3>,
+    stretch: f32,
+    /// Its shadow as the maps hold it, while they hold one.
+    drawn: Option<DrawnShadow>,
+}
+
+/// What a caster's shadow in the props' shadow maps was drawn from ([`commit_prop_shadows`]).
+struct DrawnShadow {
+    key: u64,
+    corners: Vec<V3>,
+    bounds: (V3, V3),
 }
 
 /// One instanced draw of this frame: instances `first..first + count` of the buffer.
@@ -482,6 +507,13 @@ pub(super) type Rect = [u32; 4];
 /// and then (a card dealt, a chip pushed) stays live while it moves and a little after.
 const SETTLE_FRAMES: u32 = 8;
 
+/// How far a caster may drift from where the props' shadow maps hold it, in texels of the finest
+/// map it lands in, before they are drawn again ([`track_cached_props`]). Any drift shows: a
+/// sphere half a texel off left 0.3 to 1 % of a frame more than one 8-bit step off the frame
+/// drawn whole (up to 30 steps, along its own shadow's terminator and its shadow's edge), and a
+/// fiftieth of a texel up to 0.1 %. So the maps are kept only while every caster stands still.
+pub(super) const SHADOW_DRIFT_TEXELS: f32 = 0.0;
+
 /// What an instance's picture depends on besides the frame: where and how it is drawn, its
 /// joints, and its mesh, material and textures as they stand.
 fn signature(
@@ -518,6 +550,98 @@ fn settles(inst: &InstanceEntry, mat: &MaterialEntry) -> bool {
         && inst.world_bounds.is_some()
         && mat.layer() == Layer::Opaque
         && mat.desc.shading != Shading::Water
+}
+
+/// Whether an instance is drawn into the props' shadow maps this frame
+/// ([`Renderer::draw_prop_shadows`]).
+fn casts(inst: &InstanceEntry, mat: &MaterialEntry) -> bool {
+    inst.world_bounds.is_some() && mat.layer() == Layer::Opaque && mat.desc.casts_shadow
+}
+
+/// Whether an instance's mesh is drawn moved by its joints (as `prepare_props` writes it).
+fn skinned(inst: &InstanceEntry, mesh: &MeshEntry) -> bool {
+    mesh.skin
+        .is_some_and(|s| inst.joints.len() > usize::from(s.max_joint))
+}
+
+/// What decides a caster's shadow as a whole rather than by how far it moved: its mesh and the
+/// boxes [`posed_corners`] places (its joints' boxes, or for a mesh drawn unskinned its box),
+/// and an alpha-tested material's cutoff, alpha and texture.
+fn shadow_key(
+    inst: &InstanceEntry,
+    mesh: &MeshEntry,
+    mat: &MaterialEntry,
+    edits: &HashMap<u32, u32>,
+) -> u64 {
+    let mut h = Fnv::new();
+    for n in [inst.mesh.0, mesh.shape, u32::from(skinned(inst, mesh))] {
+        h.write(&n.to_le_bytes());
+    }
+    if !skinned(inst, mesh) {
+        h.write(&f32_bytes(&[mesh.min, mesh.max].concat()));
+    }
+    if let Some(cutoff) = mat.desc.alpha_cutoff {
+        h.write(&f32_bytes(&[cutoff, mat.desc.base_color[3]]));
+        if let Some(t) = mat.desc.base_texture {
+            h.write(&t.0.to_le_bytes());
+            h.write(&edits.get(&t.0).copied().unwrap_or(0).to_le_bytes());
+        }
+    }
+    h.finish()
+}
+
+/// How far (metres) any vertex of an instance can lie from where the props' shadow maps hold it:
+/// `None` when it casts into them neither now nor as they were drawn; infinite when it came,
+/// went or changed as a whole. Each vertex lies in the hull of one of its boxes' corners (all of
+/// its joints' boxes when skinned, weights summing to one), and the matrices placing a box are
+/// affine, so none moved farther than those corners did, plus its mesh's morphing stretched by
+/// the matrices placing it now.
+fn shadow_drift(
+    inst: &InstanceEntry,
+    mesh: &MeshEntry,
+    mat: &MaterialEntry,
+    edits: &HashMap<u32, u32>,
+) -> Option<f32> {
+    let track = &inst.shadow;
+    match (&track.drawn, casts(inst, mat)) {
+        (None, false) => None,
+        (Some(d), true)
+            if d.key == shadow_key(inst, mesh, mat, edits)
+                && d.corners.len() == track.corners.len() =>
+        {
+            Some(farthest_move(&d.corners, &track.corners) + track.stretch * mesh.drift)
+        }
+        _ => Some(f32::INFINITY),
+    }
+}
+
+/// A shadow map props cast into: world to its clip space, and its texels a side.
+pub(super) type ShadowMap = (M4, u32);
+
+/// The most texels a point in `b` moves across a shadow map per metre it moves, or `None` when
+/// the box lies outside the map. Its clip x/w moves by `|row_x - x/w row_w| / w` per metre (the
+/// rows' xyz), largest where `w` is least and `|x/w|` most, both at a corner.
+fn texels_per_metre((m, size): &ShadowMap, b: (V3, V3)) -> Option<f32> {
+    let clip = corners(b).map(|p| math::transform(m, [p[0], p[1], p[2], 1.0]));
+    let outside = (0..2)
+        .any(|k| clip.iter().all(|c| c[k] > c[3]) || clip.iter().all(|c| c[k] < -c[3]))
+        || clip.iter().all(|c| c[3] <= 0.0);
+    if outside {
+        return None;
+    }
+    let w = clip.iter().map(|c| c[3]).fold(f32::INFINITY, f32::min);
+    if w <= 1e-3 {
+        return Some(f32::INFINITY);
+    }
+    let row = |r: usize| [m[r], m[4 + r], m[8 + r]];
+    let per_metre = (0..2)
+        .map(|k| {
+            let n = clip.iter().map(|c| (c[k] / c[3]).abs()).fold(0.0, f32::max);
+            let tilt = math::scale(row(3), n);
+            math::length(math::add(row(k), tilt)).max(math::length(math::sub(row(k), tilt)))
+        })
+        .fold(0.0, f32::max);
+    Some(per_metre / w * *size as f32 * 0.5)
 }
 
 /// The pixels the points cover in a `size` picture seen through `view_proj`, widened by
@@ -580,12 +704,17 @@ pub(super) struct CacheView<'a> {
 pub(super) struct CacheChanges {
     /// Regions to empty and draw again: where an instance entered or left the picture.
     pub(super) regions: Vec<Rect>,
-    /// Where props that cast shadows moved (or changed, came or went): their bounds last frame
-    /// and now, overlapping ones joined. The picture's pixels their shadows can reach are
-    /// shaded again ([`Renderer::reshade`]).
+    /// Where casters moved (or changed, came or went) since the props' shadow maps were last
+    /// drawn: their bounds then and now, overlapping ones joined. When the maps are drawn
+    /// again, the picture's pixels their shadows can reach are shaded again
+    /// ([`Renderer::reshade`]).
     pub(super) moved: Vec<(V3, V3)>,
     /// The bounds of the props the picture holds.
     pub(super) settled: Vec<(V3, V3)>,
+    /// A caster came, went, changed as a whole or moved across a shadow map it lands in (by
+    /// `drift_texels` of the finest or more) since the maps were drawn: they are drawn again.
+    /// Otherwise the maps and the picture keep it as they were.
+    pub(super) casters_moved: bool,
 }
 
 /// Boxes that overlap joined into one, so casters moving together are followed as one.
@@ -613,19 +742,30 @@ pub(super) fn merge_boxes(mut boxes: Vec<(V3, V3)>) -> Vec<(V3, V3)> {
 }
 
 /// Follows the props into and out of the cached picture for this frame: the regions of it to
-/// draw again where an instance entered or left it, and where opaque props moved (their
-/// shadows on what it holds change). `full` when the whole picture is drawn again: the records
-/// are then made afresh and nothing is returned.
+/// draw again where an instance entered or left it, and where casters moved since the props'
+/// shadow maps were drawn (their shadows on what it holds change), measured in `maps` against
+/// `drift_texels` ([`SHADOW_DRIFT_TEXELS`]). `full` when the whole picture is drawn again: the
+/// records are then made afresh and no region or move is returned.
 pub(super) fn track_cached_props(
     props: &mut Props,
     full: bool,
     view: &CacheView<'_>,
+    maps: &[ShadowMap],
+    drift_texels: f32,
 ) -> CacheChanges {
     let mut regions = std::mem::take(&mut props.vacated);
     let mut moved = std::mem::take(&mut props.vacated_boxes);
+    let mut casters_moved = !moved.is_empty();
     let mut settled = vec![];
-    for (_, inst) in props.instances.iter_mut() {
-        let Some(mat) = props.materials.get(inst.material.0) else {
+    let Props {
+        instances,
+        meshes,
+        materials,
+        texture_edits,
+        ..
+    } = props;
+    for (_, inst) in instances.iter_mut() {
+        let Some(mat) = materials.get(inst.material.0) else {
             regions.extend(inst.cached.take());
             continue;
         };
@@ -640,14 +780,33 @@ pub(super) fn track_cached_props(
             settled.extend(inst.world_bounds);
         } else {
             regions.extend(inst.cached.take());
-            if inst.still == 0 && mat.layer() == Layer::Opaque {
-                moved.extend(inst.prev_bounds.into_iter().chain(inst.world_bounds));
-            }
+        }
+        let drift = meshes
+            .get(inst.mesh.0)
+            .and_then(|mesh| shadow_drift(inst, mesh, mat, texture_edits));
+        if let Some(drift) = drift.filter(|d| *d != 0.0) {
+            let then = inst.shadow.drawn.as_ref().map(|d| d.bounds);
+            let reach = then.into_iter().chain(inst.world_bounds).reduce(|a, b| {
+                (
+                    std::array::from_fn(|k| a.0[k].min(b.0[k])),
+                    std::array::from_fn(|k| a.1[k].max(b.1[k])),
+                )
+            });
+            let finest = reach.map_or(0.0, |r| {
+                maps.iter()
+                    .filter_map(|m| texels_per_metre(m, r))
+                    .fold(0.0, f32::max)
+            });
+            // A caster that came or went counts in or out of every map (infinite times 0).
+            let texels = drift * finest;
+            casters_moved |= texels.is_nan() || (texels > 0.0 && texels >= drift_texels);
+            moved.extend(then.into_iter().chain(inst.world_bounds));
         }
     }
     if full {
         return CacheChanges {
             settled,
+            casters_moved,
             ..CacheChanges::default()
         };
     }
@@ -656,6 +815,52 @@ pub(super) fn track_cached_props(
         regions,
         moved: merge_boxes(moved),
         settled,
+        casters_moved,
+    }
+}
+
+/// Records that the props' shadow maps now hold every caster as this frame draws it: later
+/// frames measure from here how far casters moved ([`shadow_drift`]).
+pub(super) fn commit_prop_shadows(props: &mut Props) {
+    let Props {
+        instances,
+        meshes,
+        materials,
+        texture_edits,
+        vacated_boxes,
+        ..
+    } = props;
+    vacated_boxes.clear();
+    for (_, inst) in instances.iter_mut() {
+        let caster = match (
+            meshes.get(inst.mesh.0),
+            materials.get(inst.material.0),
+            inst.world_bounds,
+        ) {
+            (Some(mesh), Some(mat), Some(bounds)) if casts(inst, mat) => {
+                Some((shadow_key(inst, mesh, mat, texture_edits), bounds))
+            }
+            _ => None,
+        };
+        let ShadowTrack { corners, drawn, .. } = &mut inst.shadow;
+        match (caster, drawn.as_mut()) {
+            (None, _) => *drawn = None,
+            (Some((key, bounds)), Some(d)) => {
+                d.key = key;
+                d.corners.clone_from(corners);
+                d.bounds = bounds;
+            }
+            (Some((key, bounds)), None) => {
+                *drawn = Some(DrawnShadow {
+                    key,
+                    corners: corners.clone(),
+                    bounds,
+                })
+            }
+        }
+    }
+    for (_, m) in meshes.iter_mut() {
+        m.drift = 0.0;
     }
 }
 
@@ -682,30 +887,39 @@ fn joint_boxes(positions: &[V3], records: &[[f32; 4]]) -> Vec<Option<(V3, V3)>> 
     boxes
 }
 
-/// World bounds of an instance as drawn: its mesh's bounds placed by its model, or for a skinned
-/// one posed by its joints, each joint's share of the mesh moved by that joint.
-fn posed_bounds(inst: &InstanceEntry, mesh: &MeshEntry) -> (V3, V3) {
-    fn add(out: &mut (V3, V3), m: &M4, b: (V3, V3)) {
-        for p in corners(b) {
-            let w = math::transform_point(m, p);
-            *out = (
-                std::array::from_fn(|k| out.0[k].min(w[k])),
-                std::array::from_fn(|k| out.1[k].max(w[k])),
-            );
-        }
-    }
-    let mut out = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
-    if mesh.skin.is_some() && !inst.joints.is_empty() {
+/// The corners of the boxes holding an instance's vertices as drawn, into `out` (their bounds
+/// are its world bounds): its mesh's box placed by its model, or for one drawn skinned each
+/// joint's share of the mesh moved by that joint. Returns the most any of those placements
+/// stretches a length.
+fn posed_corners(inst: &InstanceEntry, mesh: &MeshEntry, out: &mut Vec<V3>) -> f32 {
+    let mut stretch = 0.0f32;
+    let mut place = |out: &mut Vec<V3>, m: &M4, b: (V3, V3)| {
+        out.extend(corners(b).map(|p| math::transform_point(m, p)));
+        stretch = stretch.max(max_stretch(m));
+    };
+    out.clear();
+    if skinned(inst, mesh) {
         for (joint, b) in inst.joints.iter().zip(&mesh.joint_boxes) {
             if let Some(b) = b {
-                add(&mut out, &math::mul(&inst.model, joint), *b);
+                place(out, &math::mul(&inst.model, joint), *b);
             }
         }
     }
-    if out.0[0] > out.1[0] {
-        add(&mut out, &inst.model, (mesh.min, mesh.max));
+    if out.is_empty() {
+        place(out, &inst.model, (mesh.min, mesh.max));
     }
-    out
+    stretch
+}
+
+/// The most `m` stretches a length: Gershgorin's bound on the largest eigenvalue of `AᵀA` (`A`
+/// its linear part), square-rooted; exact for a rotation with a uniform scale.
+fn max_stretch(m: &M4) -> f32 {
+    let col = |c: usize| [m[c * 4], m[c * 4 + 1], m[c * 4 + 2]];
+    let cols = [col(0), col(1), col(2)];
+    cols.iter()
+        .map(|a| cols.iter().map(|b| math::dot(*a, *b).abs()).sum::<f32>())
+        .fold(0.0, f32::max)
+        .sqrt()
 }
 
 /// A game's prop shader: its compiled stages and the overlay pipelines made from them so far.
@@ -763,7 +977,8 @@ pub(super) struct Props {
     texture_edits: HashMap<u32, u32>,
     /// Regions of the cached picture held by instances destroyed since the last frame.
     vacated: Vec<Rect>,
-    /// Bounds of the instances destroyed since the last frame (their shadows are drawn away).
+    /// Where the shadow maps hold casters destroyed since they were drawn (their shadows are
+    /// drawn away).
     vacated_boxes: Vec<(V3, V3)>,
     /// Every skinned mesh's vertices' joints and weights, packed in mesh order of creation.
     skin_records: Vec<[f32; 4]>,
@@ -776,11 +991,45 @@ pub(super) struct Props {
 }
 
 impl Props {
+    /// What each instance's picture depends on now and how long that has held, where its
+    /// vertices lie as drawn ([`posed_corners`]) and its world bounds.
+    fn pose_instances(&mut self) {
+        let Self {
+            instances,
+            meshes,
+            materials,
+            texture_edits,
+            ..
+        } = self;
+        for (_, inst) in instances.iter_mut() {
+            let (Some(m), Some(mat)) = (meshes.get(inst.mesh.0), materials.get(inst.material.0))
+            else {
+                inst.world_bounds = None;
+                inst.still = 0;
+                continue;
+            };
+            let sig = signature(inst, m, mat, texture_edits);
+            inst.still = if sig == inst.sig {
+                inst.still.saturating_add(1)
+            } else {
+                0
+            };
+            inst.sig = sig;
+            inst.world_bounds = None;
+            if inst.visible {
+                let mut posed = std::mem::take(&mut inst.shadow.corners);
+                inst.shadow.stretch = posed_corners(inst, m, &mut posed);
+                inst.world_bounds = Some(bounds(&posed));
+                inst.shadow.corners = posed;
+            }
+        }
+    }
+
     /// Removes an instance; what it held in the cached picture is drawn again.
     fn remove_instance(&mut self, id: u32) {
         if let Some(i) = self.instances.remove(id) {
             self.vacated.extend(i.cached);
-            self.vacated_boxes.extend(i.world_bounds);
+            self.vacated_boxes.extend(i.shadow.drawn.map(|d| d.bounds));
         }
     }
 }
@@ -795,6 +1044,14 @@ fn normal_matrix(m: &M4) -> M4 {
         }
     }
     t
+}
+
+/// The farthest any point moved from `from` to `to`.
+fn farthest_move(from: &[V3], to: &[V3]) -> f32 {
+    from.iter()
+        .zip(to)
+        .map(|(a, b)| math::length(math::sub(*a, *b)))
+        .fold(0.0, f32::max)
 }
 
 pub(super) fn bounds(points: &[V3]) -> (V3, V3) {
@@ -1201,6 +1458,8 @@ impl Renderer {
             skin: None,
             revision: 0,
             joint_boxes: vec![],
+            shape: 0,
+            drift: 0.0,
         };
         Ok(PropMesh(self.props.meshes.insert(entry)?))
     }
@@ -1250,6 +1509,7 @@ impl Renderer {
         self.props.skin_records.extend(records);
         if let Some(m) = self.props.meshes.get_mut(mesh.0) {
             m.revision = m.revision.wrapping_add(1);
+            m.shape = m.shape.wrapping_add(1);
             m.joint_boxes = boxes;
             m.skin = Some(SkinRange {
                 first,
@@ -1304,13 +1564,18 @@ impl Renderer {
         }
         let data = interleave(positions, normals, &m.uvs, &m.triangles);
         device.write_buffer(m.vertices, 0, &f32_bytes(&data))?;
+        m.drift += farthest_move(&m.positions, positions);
         m.positions.copy_from_slice(positions);
         (m.min, m.max) = bounds(positions);
         m.revision = m.revision.wrapping_add(1);
         if let Some(skin) = m.skin {
             let records = &self.props.skin_records;
             let range = skin.first as usize..(skin.first + skin.count) as usize;
-            m.joint_boxes = joint_boxes(&m.positions, &records[range]);
+            let boxes = joint_boxes(&m.positions, &records[range]);
+            if boxes != m.joint_boxes {
+                m.shape = m.shape.wrapping_add(1);
+                m.joint_boxes = boxes;
+            }
         }
         Ok(())
     }
@@ -1346,6 +1611,7 @@ impl Renderer {
             data.extend_from_slice(uv);
         }
         device.write_buffer(m.vertices, first as u64 * 32, &f32_bytes(&data))?;
+        m.drift += farthest_move(&m.positions[first..end], positions);
         m.positions[first..end].copy_from_slice(positions);
         (m.min, m.max) = bounds(&m.positions);
         m.revision = m.revision.wrapping_add(1);
@@ -1357,11 +1623,15 @@ impl Renderer {
             let moved = joint_boxes(positions, &records[at..at + positions.len() * 2]);
             for (held, b) in m.joint_boxes.iter_mut().zip(moved) {
                 if let Some(b) = b {
+                    let was = *held;
                     let h = held.get_or_insert(b);
                     *h = (
                         std::array::from_fn(|k| h.0[k].min(b.0[k])),
                         std::array::from_fn(|k| h.1[k].max(b.1[k])),
                     );
+                    if *held != was {
+                        m.shape = m.shape.wrapping_add(1);
+                    }
                 }
             }
         }
@@ -1652,8 +1922,8 @@ impl Renderer {
             sig: 0,
             still: 0,
             world_bounds: None,
-            prev_bounds: None,
             cached: None,
+            shadow: ShadowTrack::default(),
         };
         Ok(PropInstance(self.props.instances.insert(entry)?))
     }
@@ -1928,34 +2198,7 @@ impl Renderer {
             mesh: u32,
             inst: &'a InstanceEntry,
         }
-        // What each instance's picture depends on now, how long that has held, and its bounds.
-        {
-            let Props {
-                instances,
-                meshes,
-                materials,
-                texture_edits,
-                ..
-            } = &mut self.props;
-            for (_, inst) in instances.iter_mut() {
-                let (Some(m), Some(mat)) =
-                    (meshes.get(inst.mesh.0), materials.get(inst.material.0))
-                else {
-                    inst.world_bounds = None;
-                    inst.still = 0;
-                    continue;
-                };
-                let sig = signature(inst, m, mat, texture_edits);
-                inst.still = if sig == inst.sig {
-                    inst.still.saturating_add(1)
-                } else {
-                    0
-                };
-                inst.sig = sig;
-                let posed = inst.visible.then(|| posed_bounds(inst, m));
-                inst.prev_bounds = std::mem::replace(&mut inst.world_bounds, posed);
-            }
-        }
+        self.props.pose_instances();
         let mut lo = [f32::INFINITY; 3];
         let mut hi = [f32::NEG_INFINITY; 3];
         let mut live: Vec<Live> = Vec::new();
@@ -2569,6 +2812,8 @@ mod tests {
             skin: None,
             revision: 0,
             joint_boxes: vec![],
+            shape: 0,
+            drift: 0.0,
         }
     }
 
@@ -2581,7 +2826,7 @@ mod tests {
     }
 
     #[test]
-    fn posed_bounds_follow_the_joints_of_a_skinned_prop() {
+    fn posed_corners_follow_the_joints_of_a_skinned_prop() {
         // Two vertices, one on each joint; joint 1 lifts its vertex 3 m.
         let mut mesh = z_quad_mesh_entry(0.5);
         mesh.positions = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
@@ -2610,13 +2855,171 @@ mod tests {
             sig: 0,
             still: 0,
             world_bounds: None,
-            prev_bounds: None,
             cached: None,
+            shadow: ShadowTrack::default(),
         };
-        assert_eq!(
-            posed_bounds(&inst, &mesh),
-            ([10.0, 0.0, 0.0], [11.0, 3.0, 0.0])
+        let mut posed = vec![];
+        assert_eq!(posed_corners(&inst, &mesh, &mut posed), 1.0);
+        assert_eq!(bounds(&posed), ([10.0, 0.0, 0.0], [11.0, 3.0, 0.0]));
+    }
+
+    fn instance_entry(mesh: PropMesh, material: PropMaterial, joints: Vec<M4>) -> InstanceEntry {
+        InstanceEntry {
+            mesh,
+            material,
+            model: math::IDENTITY,
+            normal: math::IDENTITY,
+            tint: [1.0; 4],
+            visible: true,
+            pick: 0,
+            joints,
+            sig: 0,
+            still: 0,
+            world_bounds: None,
+            cached: None,
+            shadow: ShadowTrack::default(),
+        }
+    }
+
+    #[test]
+    fn shadow_maps_are_drawn_again_once_a_caster_drifted_far_enough() {
+        // Straight down on the origin, 4 m across in 1024 texels: 256 texels a metre.
+        let down = math::look_at([0.0, 5.0, 0.0], [0.0; 3], [0.0, 0.0, -1.0]);
+        let map: ShadowMap = (
+            math::mul(&math::ortho(-2.0, 2.0, -2.0, 2.0, 0.1, 10.0), &down),
+            1024,
         );
+        let texel = 1.0 / 256.0;
+        let unit = ([-0.5; 3], [0.5; 3]);
+        assert!((texels_per_metre(&map, unit).unwrap() - 256.0).abs() < 1e-2);
+        assert_eq!(
+            texels_per_metre(&map, ([3.0, 0.0, 0.0], [4.0, 1.0, 1.0])),
+            None
+        );
+        // A spot: ahead of it, the nearer the finer; behind it, outside; reaching it, unbounded.
+        let spot = (
+            math::mul(
+                &math::perspective_depth(1.0, 1.0, 0.1, 20.0),
+                &math::look_at([0.0, 5.0, 0.0], [0.0; 3], [0.0, 0.0, -1.0]),
+            ),
+            1024,
+        );
+        let near = texels_per_metre(&spot, ([-0.1, 3.0, -0.1], [0.1, 3.1, 0.1])).unwrap();
+        let far = texels_per_metre(&spot, ([-0.1, 0.0, -0.1], [0.1, 0.1, 0.1])).unwrap();
+        assert!(near > far && far > 0.0);
+        assert_eq!(
+            texels_per_metre(&spot, ([-0.1, 6.0, -0.1], [0.1, 7.0, 0.1])),
+            None
+        );
+        assert_eq!(
+            texels_per_metre(&spot, ([-0.1, 4.0, -0.1], [0.1, 6.0, 0.1])),
+            Some(f32::INFINITY)
+        );
+
+        // A skinned quad (its lower edge on joint 0, its upper on joint 1) casting, and an opaque
+        // prop that casts none.
+        let mut props = Props::default();
+        let mut quad = z_quad_mesh_entry(0.5);
+        let on = |j: f32| [[j, 0.0, 0.0, 0.0], [1.0, 0.0, 0.0, 0.0]];
+        let records = [on(0.0), on(0.0), on(1.0), on(1.0)].concat();
+        quad.joint_boxes = joint_boxes(&quad.positions, &records);
+        quad.skin = Some(SkinRange {
+            first: 0,
+            count: 8,
+            max_joint: 1,
+        });
+        let quad = PropMesh(props.meshes.insert(quad).unwrap());
+        let plain = PropMesh(props.meshes.insert(z_quad_mesh_entry(0.5)).unwrap());
+        let caster = PropMaterial(
+            props
+                .materials
+                .insert(dummy_material_entry(MaterialDesc::default()))
+                .unwrap(),
+        );
+        let shadeless = PropMaterial(
+            props
+                .materials
+                .insert(dummy_material_entry(MaterialDesc {
+                    casts_shadow: false,
+                    ..MaterialDesc::default()
+                }))
+                .unwrap(),
+        );
+        let rest = vec![math::IDENTITY; 2];
+        let figure = props
+            .instances
+            .insert(instance_entry(quad, caster, rest.clone()))
+            .unwrap();
+        let pillar = props
+            .instances
+            .insert(instance_entry(plain, shadeless, vec![]))
+            .unwrap();
+        let eye = math::mul(
+            &math::perspective(1.0, 1.0, 0.1),
+            &math::look_at([0.0, 1.0, 5.0], [0.0; 3], [0.0, 1.0, 0.0]),
+        );
+        let view = CacheView {
+            view_proj: &eye,
+            size: (64, 64),
+        };
+        // Measured against half a texel, so a drift can be told from a move.
+        let frame = |props: &mut Props| {
+            props.pose_instances();
+            track_cached_props(props, false, &view, &[map], 0.5)
+        };
+        let lift = |props: &mut Props, texels: f32| {
+            let joints = &mut props.instances.get_mut(figure).unwrap().joints;
+            joints[1] = translation_matrix(0.0, texels * texel, 0.0);
+        };
+
+        // A caster appearing counts; the maps then hold it.
+        assert!(frame(&mut props).casters_moved);
+        commit_prop_shadows(&mut props);
+        let still = frame(&mut props);
+        assert!(!still.casters_moved && still.moved.is_empty());
+
+        // Its upper edge rises 0.3 texel a frame: measured from where the maps hold it, the
+        // second frame's rise counts.
+        lift(&mut props, 0.3);
+        let small = frame(&mut props);
+        assert!(!small.casters_moved && small.moved.len() == 1);
+        props.pose_instances();
+        let exact = track_cached_props(&mut props, false, &view, &[map], SHADOW_DRIFT_TEXELS);
+        assert!(
+            exact.casters_moved,
+            "any drift counts as the renderer measures it"
+        );
+        lift(&mut props, 0.6);
+        assert!(frame(&mut props).casters_moved);
+        commit_prop_shadows(&mut props);
+        lift(&mut props, 0.9);
+        assert!(!frame(&mut props).casters_moved);
+        commit_prop_shadows(&mut props);
+
+        // A prop that casts no shadow moves freely.
+        props.instances.get_mut(pillar).unwrap().model = translation_matrix(1.0, 0.0, 0.0);
+        let shadeless_move = frame(&mut props);
+        assert!(!shadeless_move.casters_moved && shadeless_move.moved.is_empty());
+
+        // Its mesh morphed 0.6 texel since the maps were drawn counts, and only until then.
+        props.meshes.get_mut(quad.0).unwrap().drift = 0.6 * texel;
+        assert!(frame(&mut props).casters_moved);
+        commit_prop_shadows(&mut props);
+        assert!(frame(&mut props).moved.is_empty());
+
+        // Hidden, shown and destroyed, it counts each time; while the whole picture is drawn
+        // again too.
+        props.instances.get_mut(figure).unwrap().visible = false;
+        assert!(frame(&mut props).casters_moved);
+        commit_prop_shadows(&mut props);
+        assert!(!frame(&mut props).casters_moved);
+        props.instances.get_mut(figure).unwrap().visible = true;
+        props.pose_instances();
+        assert!(track_cached_props(&mut props, true, &view, &[map], 0.5).casters_moved);
+        commit_prop_shadows(&mut props);
+        props.remove_instance(figure);
+        let gone = frame(&mut props);
+        assert!(gone.casters_moved && gone.moved.len() == 1);
     }
 
     #[test]
@@ -2661,8 +3064,8 @@ mod tests {
                     sig: 0,
                     still: 0,
                     world_bounds: None,
-                    prev_bounds: None,
                     cached: None,
+                    shadow: ShadowTrack::default(),
                 })
                 .unwrap(),
         );
@@ -2683,8 +3086,8 @@ mod tests {
                     sig: 0,
                     still: 0,
                     world_bounds: None,
-                    prev_bounds: None,
                     cached: None,
+                    shadow: ShadowTrack::default(),
                 })
                 .unwrap(),
         );
@@ -2734,8 +3137,8 @@ mod tests {
                     sig: 0,
                     still: 0,
                     world_bounds: None,
-                    prev_bounds: None,
                     cached: None,
+                    shadow: ShadowTrack::default(),
                 })
                 .unwrap(),
         );
