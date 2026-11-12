@@ -1763,6 +1763,10 @@ impl Renderer {
     }
     /// Converged fraction of the baked vertex AO in `[0, 1]` (it refines a slice per live
     /// frame after start and after world edits).
+    /// The props' shadow maps no longer hold the props there are: the next frame draws them again.
+    pub(super) fn forget_prop_shadows(&mut self) {
+        self.prop_shadows_for = None;
+    }
     pub fn ao_progress(&self) -> f32 {
         self.scene.ao.progress()
     }

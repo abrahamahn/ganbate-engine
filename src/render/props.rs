@@ -2713,6 +2713,7 @@ impl Renderer {
             device.destroy_texture(t);
         }
         self.props.instances.drain();
+        self.forget_prop_shadows();
         self.props.batches.clear();
         self.props.vacated.clear();
         self.props.vacated_boxes.clear();
