@@ -515,6 +515,9 @@ pub struct Limits {
     /// `Depth32Float` can be sampled through a non-comparison `Filter::Linear` sampler.
     /// (Comparison samplers may always filter linearly.) Use `Filter::Nearest` otherwise.
     pub depth_filterable: bool,
+    /// `R32Float` and `Rgba32Float` textures can be bound to a shader's `texture_2d<f32>`: on
+    /// WebGPU only with its `float32-filterable` feature, elsewhere always.
+    pub float32_readable: bool,
     /// Native hardware sampling of BC1 and BC7 compressed textures (transparently falls back to
     /// software RGBA8 upload when false).
     pub texture_compression_bc: bool,

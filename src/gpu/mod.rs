@@ -92,13 +92,27 @@ mod webgpu;
 /// plus WGSL (with push constants lowered to a dynamically offset uniform) when the backend is
 /// WebGPU, or GLSL ES 3.00 when it is WebGL 2. Browser pipelines need shaders compiled this way.
 pub fn compile_shader(source: &str, stage: shader::Stage, entry: &str) -> Result<shader::Compiled> {
+    compile_shader_specialized(source, stage, entry, &[])
+}
+
+/// [`compile_shader`] with module `const`s set (`specialize`): branches on them fold away, with
+/// the functions and resources only those branches use.
+pub fn compile_shader_specialized(
+    source: &str,
+    stage: shader::Stage,
+    entry: &str,
+    specialize: &[(&str, shader::SpecValue)],
+) -> Result<shader::Compiled> {
+    let options = shader::CompileOptions::new().with_specialize(specialize);
     #[cfg(target_arch = "wasm32")]
     let compiled = match web_api() {
-        Some(WebApi::WebGl2) => ganbate_shader::compile_glsl(source, stage, entry),
-        _ => ganbate_shader::compile_wgsl(source, stage, entry),
+        Some(WebApi::WebGl2) => {
+            ganbate_shader::compile_glsl_with_options(source, stage, entry, &options)
+        }
+        _ => ganbate_shader::compile_wgsl_with_options(source, stage, entry, &options),
     };
     #[cfg(not(target_arch = "wasm32"))]
-    let compiled = ganbate_shader::compile(source, stage, entry);
+    let compiled = ganbate_shader::compile_with_options(source, stage, entry, &options);
     compiled.map_err(|e| format!("shader {entry}: {e}"))
 }
 
