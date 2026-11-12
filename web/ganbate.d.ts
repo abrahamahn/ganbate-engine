@@ -15,6 +15,18 @@ export interface CreateEngineOptions {
   readonly wasm: string | ArrayBuffer | ArrayBufferView | WebAssembly.Instance;
   /** WebGPU where the browser has it, otherwise WebGL 2 (`auto`, the default). */
   readonly api?: GanbateApi;
+  /**
+   * How frames reach a WebGPU canvas. 'direct' (the default) draws into the canvas with up to two
+   * frames on the GPU. 'settled' draws offscreen and copies each frame to the canvas once the GPU
+   * has finished it, with one frame on the GPU, so a refused frame shows the last one again rather
+   * than an undrawn buffer's older picture (Safari); it costs throughput.
+   */
+  readonly present?: 'direct' | 'settled';
+  /**
+   * WebGPU replays repeated passes from render bundles (the default, but on Apple's WebKit, which
+   * refuses some of them); false encodes every pass.
+   */
+  readonly bundles?: boolean;
   /** A cooked `.gbew` world: URL or bytes. Omit for a scene of props only. */
   readonly world?: string | ArrayBuffer | Uint8Array;
   /**
@@ -60,6 +72,18 @@ export interface GanbateFocus {
 
 export type GanbateStereoEyeName = 'mono' | 'left' | 'right';
 export type GanbateStereoEye = -1 | 0 | 1;
+
+/** Per-pass GPU times (`setPassTiming`), in milliseconds. */
+export interface GanbatePassTiming {
+  /** Frames timed. */
+  readonly frames: number;
+  /** A frame's GPU time: its passes' sum. */
+  readonly gpuMs: number;
+  /** From a frame's first pass sent to its last finished. */
+  readonly wallMs: number;
+  /** Each pass by its first pipeline's entry point and size (`fs_restore 1206x1380`). */
+  readonly passes: readonly { readonly label: string; readonly ms: number }[];
+}
 
 export interface GanbateFrameStats {
   readonly worldDrawsTotal: number;
@@ -354,6 +378,8 @@ export interface GanbateEntityTable {
 
 export interface GanbateEngine {
   readonly api: 'webgpu' | 'webgl2';
+  /** How frames reach the canvas (`CreateEngineOptions.present`); WebGL 2 is always 'direct'. */
+  readonly present: 'direct' | 'settled';
   readonly adapter: string;
   errors(): string[];
   /** Sizes the canvas to its CSS box times `dpr` (default: the device pixel ratio). */
@@ -415,6 +441,13 @@ export interface GanbateEngine {
   capture(): Promise<{ width: number; height: number; rgba: Uint8ClampedArray }>;
   /** Waits for submitted GPU work (WebGPU; immediate on WebGL 2). */
   idle(): Promise<void>;
+  /**
+   * Times each pass of the frames drawn from now on (true) on the GPU, drawing one frame at a
+   * time, or stops (false); each call starts the means afresh.
+   */
+  setPassTiming(on: boolean): void;
+  /** The timed frames' mean GPU time a pass, in drawing order, and a frame's. */
+  passTiming(): GanbatePassTiming;
 
   createTexture(source: GanbateImageSource | GanbateClearTexture, options?: { readonly srgb?: boolean }): number;
   /** New pixels for a texture from a source of the texture's size. */

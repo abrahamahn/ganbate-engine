@@ -334,13 +334,24 @@ fn light_shadow(world: vec3f, n: vec3f, ld: vec3f, l: Light, layer: i32, frag: v
   return sum / 8.0;
 }
 
+// Slices of view depth per screen tile (`CLUSTER_SLICES` in renderer.rs).
+const CLUSTER_SLICES: u32 = 16u;
+
 fn lamp_light(world: vec3f, n: vec3f, frag: vec2f, foliage: bool) -> vec3f {
   // The lamps follow the time of day; a game's own lights shine at every hour.
   let level = frame.amb_sky.w;
   let size = f32(frame.tiles.z);
   let tx = min(u32(frag.x / size), frame.tiles.x - 1u);
   let ty = min(u32(frag.y / size), frame.tiles.y - 1u);
-  let t = tiles[ty * frame.tiles.x + tx];
+  // The pixel's cluster: its tile and the slice of view depth it lies in (clip w is the view
+  // depth), as `Renderer::tile_lights` filled them; lamps.z the nearest slice's far edge,
+  // lamps.w slices per doubling of depth.
+  let depth = (frame.view_proj * vec4f(world, 1.0)).w;
+  var slice = 0u;
+  if (depth > frame.lamps.z) {
+    slice = min(u32(log2(depth / frame.lamps.z) * frame.lamps.w), CLUSTER_SLICES - 1u);
+  }
+  let t = tiles[(slice * frame.tiles.y + ty) * frame.tiles.x + tx];
   var sum = vec3f(0.0);
   for (var k = 0u; k < t.y; k++) {
     // Most of a tile's lights do not reach this pixel: read just the position and range first,
@@ -804,10 +815,14 @@ fn shade_scene(in: VsOut, front: bool, frag: vec4f, cut: bool) -> FsOut {
     let wn = water_normal(in.world, t);
     let cosv = clamp(dot(wn, v), 0.0, 1.0);
     let fres = 0.03 + 0.97 * pow(1.0 - cosv, 5.0);
-    var refl = sky_color(reflect(-v, wn));
+    // The reflection pass's picture where there is one; the sky (stars, moon, clouds) only where
+    // there is not, as it would be thrown away.
+    var refl: vec3f;
     if (!reflection_pass && frame.water2.w > 0.5) {
       let uv = frag.xy * frame.viewport.zw + wn.xz * vec2f(0.06, 0.035);
       refl = textureSampleLevel(reflection, clamp_sampler, uv, 0.0).rgb;
+    } else {
+      refl = sky_color(reflect(-v, wn));
     }
     // Depth below the surface from the ground map: shallows turn clear and green, and foam
     // lines the shore and anything standing in the water.

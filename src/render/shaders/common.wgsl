@@ -48,7 +48,7 @@ struct Frame {
   wet_sand: vec4f,      // rgb sand at the water line
   rock: vec4f,          // rgb bare rock
   meadow: vec4f,        // rgb second grass tone of the broad patches
-  lamps: vec4f,         // lamp light on foliage (scale), baked AO strength, unused, unused
+  lamps: vec4f,         // lamp light on foliage (scale), baked AO strength, cluster near (m), cluster slices per doubling
   tide: vec4f,          // tide-mark height above the water (m, 0 = none), rgb stain multiplier
   tiles: vec4u,         // tiles across, tiles down, tile size in pixels, light count
   light_shadow0: mat4x4f, // world to the shadow maps of a game's shadowed lights (layers 0, 1):

@@ -570,6 +570,17 @@ pub extern "C" fn ganbate_rt_ao_progress() -> u32 {
     })
 }
 
+/// Draws the main pass as several while passes are timed (`on` 1), so a device's timing shows
+/// each part ([`ganbate_engine::render::Renderer::set_split_passes`]). Returns 1, or 0 before
+/// `ganbate_rt_start`.
+#[unsafe(no_mangle)]
+pub extern "C" fn ganbate_rt_set_split_passes(on: u32) -> u32 {
+    with(0, |rt| {
+        rt.renderer.set_split_passes(on != 0);
+        Ok(1)
+    })
+}
+
 /// Switches the renderer's quality preset at runtime (`0` = realtime, `1` = still,
 /// `2` = hybrid stage, `3` = low-cost fast-path; unknown codes fall back to realtime).
 /// Returns `1` on success, `0` on error.
