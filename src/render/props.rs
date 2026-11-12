@@ -1340,6 +1340,9 @@ impl Props {
         if let Some(&id) = ids.iter().find(|&&id| self.instances.get(id).is_none()) {
             return Err(format!("{:?} was destroyed", PropInstance(id)));
         }
+        if ids.is_empty() {
+            return Ok(());
+        }
         let theirs = ids
             .first()
             .and_then(|&id| self.instances.get(id)?.joints)
@@ -1365,17 +1368,21 @@ impl Props {
                 revision: 0,
                 digest: 0,
                 digested: None,
-                users: ids.len() as u32,
+                users: 0,
                 first: 0,
                 placed: 0,
             })?)
         };
         for &id in ids {
-            if let Some(i) = self.instances.get_mut(id) {
-                let old = std::mem::replace(&mut i.joints, set);
-                i.dirty = true;
-                self.release_joints(old);
+            let Some(i) = self.instances.get_mut(id).filter(|i| i.joints != set) else {
+                continue;
+            };
+            let old = std::mem::replace(&mut i.joints, set);
+            i.dirty = true;
+            if let Some(s) = set.and_then(|s| self.joint_sets.get_mut(s)) {
+                s.users += 1;
             }
+            self.release_joints(old);
         }
         Ok(())
     }
@@ -3764,6 +3771,55 @@ mod tests {
         );
         assert!(canvas_clear([0.5, f32::NAN, 0.5, 1.0], true).is_err());
         assert!(canvas_clear([0.5, 0.5, 0.5, f32::INFINITY], false).is_err());
+    }
+
+    #[test]
+    fn instances_share_joint_sets_until_the_last_of_them_goes() {
+        let mut props = Props::default();
+        let mesh = PropMesh(props.meshes.insert(z_quad_mesh_entry(0.5)).unwrap());
+        let mat = PropMaterial(
+            props
+                .materials
+                .insert(dummy_material_entry(MaterialDesc::default()))
+                .unwrap(),
+        );
+        let ids: Vec<u32> = (0..3)
+            .map(|_| props.instances.insert(instance_entry(mesh, mat)).unwrap())
+            .collect();
+        let pose = |y: f32| [math::IDENTITY, translation_matrix(0.0, y, 0.0)];
+        let set_of = |props: &Props, id: u32| props.instances.get(id).unwrap().joints;
+        let users = |props: &Props, set: u32| props.joint_sets.get(set).map(|s| s.users);
+
+        // One set for all three, written in place while it is theirs alone.
+        props.share_joints(&ids, &pose(1.0)).unwrap();
+        let set = set_of(&props, ids[0]).unwrap();
+        props.share_joints(&ids, &pose(2.0)).unwrap();
+        assert!(ids.iter().all(|&id| set_of(&props, id) == Some(set)));
+        assert_eq!(users(&props, set), Some(3));
+
+        // Given the same matrices of its own, an instance stays the same frame to frame.
+        props.pose_instances();
+        let still = props.instances.get(ids[0]).unwrap().still;
+        props.share_joints(&ids[..1], &pose(2.0)).unwrap();
+        props.pose_instances();
+        assert_eq!(props.instances.get(ids[0]).unwrap().still, still + 1);
+        let own = set_of(&props, ids[0]).unwrap();
+        assert_ne!(own, set);
+        assert_eq!(users(&props, set), Some(2));
+
+        // Named twice, an instance counts once; a set goes with the last instance following it.
+        props
+            .share_joints(&[ids[1], ids[1], ids[2]], &pose(4.0))
+            .unwrap();
+        let shared = set_of(&props, ids[1]).unwrap();
+        assert_eq!(users(&props, shared), Some(2));
+        assert_eq!(users(&props, set), None);
+        props.share_joints(&ids[..1], &[]).unwrap();
+        assert_eq!((set_of(&props, ids[0]), users(&props, own)), (None, None));
+        props.share_joints(&[], &pose(5.0)).unwrap();
+        props.remove_instance(ids[1]);
+        props.remove_instance(ids[2]);
+        assert_eq!(props.joint_sets.iter().count(), 0);
     }
 
     fn bound_bits((lo, hi): (V3, V3)) -> [u32; 6] {
