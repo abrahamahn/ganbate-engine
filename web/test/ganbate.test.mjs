@@ -9,6 +9,8 @@ import {
   createGlHost,
   createGraphSolver,
   createHost,
+  gradeOnceFor,
+  resolveGradeOnce,
 } from '../sdk/ganbate.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -325,6 +327,55 @@ test('cacheStats reads the eight words of the last frame\'s cached picture, the 
   const without = makeMockWasm({ ganbate_rt_cache_stats: undefined });
   const bare = await createEngine({ canvas, wasm: without.instance, api: 'webgl2' });
   assert.equal(bare.cacheStats(), null);
+});
+
+test('gradeOnce \'auto\' grades once on Arm Mali: the WebGPU adapter\'s vendor, or a WebGL 2 renderer that renders floats', () => {
+  const webgpu = (info) => ({ api: 'webgpu', adapter: { info } });
+  assert.equal(gradeOnceFor(webgpu({ vendor: 'arm', architecture: 'valhall' })), true);
+  assert.equal(gradeOnceFor(webgpu({ vendor: 'ARM' })), true);
+  assert.equal(gradeOnceFor(webgpu({ vendor: 'qualcomm' })), false);
+  assert.equal(gradeOnceFor(webgpu({})), false);
+  assert.equal(gradeOnceFor({ api: 'webgpu', adapter: {} }), false);
+  const webgl = (renderer, colorFloat = {}) => ({ api: 'webgl2', renderer, ext: { colorFloat } });
+  assert.equal(gradeOnceFor(webgl('ANGLE (ARM, Mali-G57 MC2, OpenGL ES 3.2)')), true);
+  assert.equal(gradeOnceFor(webgl('Mali-G615')), true);
+  // Without EXT_color_buffer_float no 32-bit float target: the fused pass.
+  assert.equal(gradeOnceFor(webgl('Mali-G615', null)), false);
+  assert.equal(gradeOnceFor(webgl('Adreno (TM) 740')), false);
+  assert.equal(gradeOnceFor(webgl(undefined)), false);
+  const mali = webgl('Mali-G57');
+  assert.deepEqual([undefined, false, true, 'auto', 'yes'].map((o) => resolveGradeOnce(o, mali)), [false, false, true, true, false]);
+  assert.deepEqual([true, 'auto'].map((o) => resolveGradeOnce(o, webgpu({ vendor: 'apple' }))), [true, false]);
+  const dts = fs.readFileSync(path.join(__dirname, '..', 'sdk', 'ganbate.d.ts'), 'utf8');
+  for (const token of ["readonly gradeOnce?: boolean | 'auto';", 'readonly gradeOnce: boolean;', 'export function gradeOnceFor(']) {
+    assert.ok(dts.includes(token), `missing TypeScript declaration: ${token}`);
+  }
+});
+
+test('createEngine grades once where gradeOnce resolves true and the engine can, and says whether it does', async () => {
+  const start = async (gradeOnce, renderer, overrides = {}) => {
+    const { canvas, gl, constants } = makeRecordingWebGl2Canvas();
+    const getParameter = gl.getParameter;
+    gl.getParameter = (p) => (p === constants.RENDERER ? renderer : getParameter(p));
+    gl.getExtension = (name) => (name === 'EXT_color_buffer_float' ? {} : null);
+    const asked = [];
+    const mock = makeMockWasm({
+      ganbate_rt_set_grade_once(on) {
+        asked.push(on);
+        return on;
+      },
+      ...overrides,
+    });
+    const engine = await createEngine({ canvas, wasm: mock.instance, api: 'webgl2', gradeOnce });
+    return [engine.gradeOnce, asked];
+  };
+  assert.deepEqual(await start('auto', 'Mali-G57 MC2'), [true, [1]]);
+  assert.deepEqual(await start('auto', 'Adreno (TM) 740'), [false, []]);
+  assert.deepEqual(await start(true, 'Adreno (TM) 740'), [true, [1]]);
+  assert.deepEqual(await start(undefined, 'Mali-G57 MC2'), [false, []]);
+  // An engine that cannot (no 32-bit float textures), or a module without the export.
+  assert.deepEqual(await start(true, 'Mali-G57 MC2', { ganbate_rt_set_grade_once: () => 0 }), [false, []]);
+  assert.deepEqual(await start(true, 'Mali-G57 MC2', { ganbate_rt_set_grade_once: undefined }), [false, []]);
 });
 
 /** Sets globals for one test and puts the previous values back afterwards. */
@@ -907,12 +958,12 @@ test('web/ganbate.d.ts and compiled ganbate_web.wasm expose Wave 8 ray-picking a
   assert.ok(exportedFns.has('ganbate_rt_pick_world_ray'), 'missing WASM export ganbate_rt_pick_world_ray');
 });
 
-test('both hosts provide every import of the compiled ganbate_web.wasm, which has the texture source exports', async () => {
+test('both hosts provide every import of the compiled ganbate_web.wasm, which has the texture source and grade-once exports', async () => {
   const wasmPath = path.join(REPO_ROOT, 'target', 'wasm32-unknown-unknown', 'release', 'ganbate_web.wasm');
   if (!fs.existsSync(wasmPath)) return;
   const mod = new WebAssembly.Module(fs.readFileSync(wasmPath));
   const exported = new Set(WebAssembly.Module.exports(mod).map((e) => e.name));
-  for (const name of ['ganbate_rt_texture_create_source', 'ganbate_rt_texture_update_source', 'ganbate_rt_texture_create_clear']) {
+  for (const name of ['ganbate_rt_texture_create_source', 'ganbate_rt_texture_update_source', 'ganbate_rt_texture_create_clear', 'ganbate_rt_set_grade_once']) {
     assert.ok(exported.has(name), `missing WASM export ${name}`);
   }
   const { gl, canvas } = makeRecordingWebGl2Canvas();

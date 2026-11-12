@@ -978,7 +978,7 @@ export function createGl(canvas) {
   const debug = gl.getExtension('WEBGL_debug_renderer_info');
   const renderer = debug ? gl.getParameter(debug.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
   const features = Object.entries(ext).filter(([, v]) => v).map(([k]) => k);
-  return { api: 'webgl2', gl, ext, canvas, adapterName: `WebGL 2 ${renderer}`, features, format: 'rgba8unorm' };
+  return { api: 'webgl2', gl, ext, canvas, renderer, adapterName: `WebGL 2 ${renderer}`, features, format: 'rgba8unorm' };
 }
 
 /** The import object for the wasm module on WebGL 2 and the host state behind it. */
@@ -2348,6 +2348,22 @@ export function resolveQualityCode(quality, still) {
   return still === true ? 1 : 0;
 }
 
+/**
+ * Whether the tone-map output should grade each pixel once on `gpu` (`createGpu` or `createGl`),
+ * as `createEngine`'s `gradeOnce: 'auto'` decides: on Arm Mali, whose arithmetic the fused pass's
+ * five grades a pixel bind. WebGPU: the adapter's vendor is 'arm'. WebGL 2: the renderer string
+ * names Mali and the context renders 32-bit floats (`EXT_color_buffer_float`).
+ */
+export function gradeOnceFor(gpu) {
+  if (gpu.api === 'webgl2') return Boolean(gpu.ext?.colorFloat) && /mali/i.test(gpu.renderer || '');
+  return String(gpu.adapter?.info?.vendor || '').toLowerCase() === 'arm';
+}
+
+/** `createEngine`'s `gradeOnce` option (true, false or 'auto') for `gpu`. */
+export function resolveGradeOnce(option, gpu) {
+  return option === 'auto' ? gradeOnceFor(gpu) : option === true;
+}
+
 function resolveStereoEyeCode(eye) {
   if (eye === undefined || eye === 'mono' || eye === 0) return 0;
   if (eye === 'left' || eye === -1) return -1;
@@ -2364,6 +2380,7 @@ function resolveStereoEyeCode(eye) {
  * world (URL, ArrayBuffer or Uint8Array of a cooked `.gbew`; omit for a scene of props only);
  * look (Look file as an object or JSON text; optional);
  * quality ('realtime' | 'still' | 'hybrid' | 'low-cost' | boolean; legacy `still?: boolean` also supported);
+ * gradeOnce (true, false or 'auto': the tone-map grades each pixel once, `gradeOnceFor`);
  * onLog(level, text); onPhase(text, progress).
  *
  * The page sizes the canvas (canvas.width/height in device pixels; `fitCanvas(dpr)` helps) and
@@ -2572,6 +2589,9 @@ export async function createEngine(options) {
   const [lookPtr] = place(lookBytes);
   (options.onPhase || (() => {}))('Compiling shaders and uploading', 1);
   ok('start', x.ganbate_rt_start(0, 0, lookPtr, lookBytes.length, resolveQualityCode(options.quality, options.still)));
+  // The engine answers 0, keeping the fused pass, where the device cannot read 32-bit float textures.
+  const gradeOnce = resolveGradeOnce(options.gradeOnce, gpu)
+    && typeof x.ganbate_rt_set_grade_once === 'function' && x.ganbate_rt_set_grade_once(1) === 1;
   const ao = world ? await bakedAo : null;
   if (ao) {
     const bytes = ao instanceof Uint8Array ? ao : new Uint8Array(ao);
@@ -2633,6 +2653,8 @@ export async function createEngine(options) {
     /** How frames reach the canvas: 'settled' (finished first, `createFrameGate`) or 'direct'. */
     present: settled ? 'settled' : 'direct',
     adapter: gpu.adapterName,
+    /** The tone-map output grades each pixel once (`gradeOnce`). */
+    gradeOnce,
     errors: () => [...errors, ...host.errors.filter((e) => !errors.includes(e))],
     /**
      * Sizes the canvas to its CSS box times `dpr` (default: the device pixel ratio). It reads the

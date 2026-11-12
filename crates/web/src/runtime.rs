@@ -581,6 +581,19 @@ pub extern "C" fn ganbate_rt_set_split_passes(on: u32) -> u32 {
     })
 }
 
+/// Draws the fused tone-map output grading each pixel once (`on` 1) or five times (0)
+/// ([`ganbate_engine::render::Renderer::set_grade_once`]): the same picture, a fifth of the
+/// grading and 32 bytes a pixel more memory traffic, for Arm Mali GPUs. Returns 1 when frames now
+/// grade once; 0 when they keep the fused pass (`on` 0, or a device that cannot read 32-bit float
+/// textures), before `ganbate_rt_start` and after logging an error.
+#[unsafe(no_mangle)]
+pub extern "C" fn ganbate_rt_set_grade_once(on: u32) -> u32 {
+    with(0, |rt| {
+        let once = rt.renderer.set_grade_once(&mut rt.device, on != 0)?;
+        Ok(u32::from(once))
+    })
+}
+
 /// Switches the renderer's quality preset at runtime (`0` = realtime, `1` = still,
 /// `2` = hybrid stage, `3` = low-cost fast-path; unknown codes fall back to realtime).
 /// Returns `1` on success, `0` on error.

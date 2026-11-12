@@ -40,6 +40,13 @@ export interface CreateEngineOptions {
   readonly quality?: GanbateQualityMode | boolean;
   /** Legacy boolean alias for `quality: 'still'`. */
   readonly still?: boolean;
+  /**
+   * The tone-map output grades each pixel once, in a pass of its own, rather than five times (the
+   * pixel and its four neighbours): the same picture, a fifth of the grading, 32 bytes a pixel more
+   * memory traffic. 'auto' asks `gradeOnceFor` (Arm Mali); a device that cannot read 32-bit float
+   * textures keeps the fused pass. Default false.
+   */
+  readonly gradeOnce?: boolean | 'auto';
   /** 0 info, 1 warning, 2 error. */
   readonly onLog?: (level: number, text: string) => void;
   /** Loading phases with progress 0..1. */
@@ -391,6 +398,8 @@ export interface GanbateEngine {
   /** How frames reach the canvas (`CreateEngineOptions.present`); WebGL 2 is always 'direct'. */
   readonly present: 'direct' | 'settled';
   readonly adapter: string;
+  /** The tone-map output grades each pixel once (`CreateEngineOptions.gradeOnce`). */
+  readonly gradeOnce: boolean;
   errors(): string[];
   /**
    * Sizes the canvas to its CSS box times `dpr` (default: the device pixel ratio). `box`: the CSS
@@ -656,3 +665,23 @@ export interface GanbatePlayerController {
 export function startSelfTest(options: StartSelfTestOptions): Promise<GanbateSelfTestResult>;
 export function startPlayer(options: StartPlayerOptions): Promise<GanbatePlayerController>;
 
+/**
+ * Whether the tone-map output should grade each pixel once on this GPU, as `gradeOnce: 'auto'`
+ * decides: a WebGPU adapter whose vendor is 'arm', or a WebGL 2 context whose renderer string
+ * names Mali and that renders 32-bit floats (`EXT_color_buffer_float`).
+ */
+export function gradeOnceFor(gpu: {
+  readonly api: 'webgpu' | 'webgl2';
+  readonly adapter?: { readonly info?: { readonly vendor?: string } };
+  readonly renderer?: string;
+  readonly ext?: { readonly colorFloat?: unknown };
+}): boolean;
+export function resolveGradeOnce(
+  option: boolean | 'auto' | undefined,
+  gpu: {
+    readonly api: 'webgpu' | 'webgl2';
+    readonly adapter?: { readonly info?: { readonly vendor?: string } };
+    readonly renderer?: string;
+    readonly ext?: { readonly colorFloat?: unknown };
+  },
+): boolean;
