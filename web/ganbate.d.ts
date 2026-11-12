@@ -16,13 +16,12 @@ export interface CreateEngineOptions {
   /** WebGPU where the browser has it, otherwise WebGL 2 (`auto`, the default). */
   readonly api?: GanbateApi;
   /**
-   * How frames reach a WebGPU canvas. 'settled' draws offscreen and copies each frame to the
-   * canvas once the GPU has finished it, with one frame on the GPU: Safari's WebGPU canvas takes
-   * frames with no fence, unfinished, and shows an undrawn buffer's three-frame-old picture.
-   * 'direct' draws into the canvas with up to two frames on the GPU. 'auto' (the default): settled
-   * on Apple's WebKit.
+   * How frames reach a WebGPU canvas. 'direct' (the default) draws into the canvas with up to two
+   * frames on the GPU. 'settled' draws offscreen and copies each frame to the canvas once the GPU
+   * has finished it, with one frame on the GPU, so a refused frame shows the last one again rather
+   * than an undrawn buffer's older picture (Safari); it costs throughput.
    */
-  readonly present?: 'auto' | 'direct' | 'settled';
+  readonly present?: 'direct' | 'settled';
   /**
    * WebGPU replays repeated passes from render bundles (the default, but on Apple's WebKit, which
    * refuses some of them); false encodes every pass.

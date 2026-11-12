@@ -120,13 +120,12 @@ function appleWebKit() {
 
 /**
  * How many frames are on the GPU at once and, on a settled host, when a finished frame is shown.
- * Safari's WebGPU canvas (26 and the fix after it for WebKit bug 320866 alike) hands each frame to
- * the compositor with no fence, before the GPU has finished it, and shows whichever of its three
- * buffers is next even if nothing was drawn into it, a picture three frames old: on an iPhone the
- * table judders and steps back and forth. Settled, the engine draws offscreen with one frame on the
- * GPU and copies a frame to the canvas only once the GPU has finished it, ahead of the next, so the
- * canvas only ever receives a finished picture (a frame the GPU refused shows the last one again).
- * Direct (every other browser), it draws into the canvas with up to two frames on the GPU.
+ * Direct (the default), the engine draws into the canvas with up to two frames on the GPU. Settled
+ * (`present: 'settled'`), it draws offscreen with one frame on the GPU and copies a frame to the
+ * canvas only once the GPU has finished it, ahead of the next: the canvas then only ever receives a
+ * finished picture, and a frame the GPU refused shows the last one again rather than whatever an
+ * undrawn canvas buffer held (Safari's WebGPU canvas shows a three-frame-old picture there). On an
+ * iPhone it costs throughput: Safari reports a 9 ms frame done some 35 ms after it was sent.
  */
 function createFrameGate(gpu, host, settled) {
   let inFlight = 0;
@@ -2025,10 +2024,8 @@ async function boot(options) {
     gpu = createGl(canvas);
   }
   onLog(0, `${gpu.adapterName}; features: ${gpu.features.join(', ') || 'none'}; canvas ${gpu.format}`);
-  // WebGPU on Apple's WebKit presents settled (`createFrameGate`); `present` forces either way.
-  const present = options.present && options.present !== 'auto' ? options.present
-    : appleWebKit() ? 'settled' : 'direct';
-  const settled = gpu.api === 'webgpu' && present === 'settled';
+  // Frames go straight into the canvas unless `present: 'settled'` asks otherwise (`createFrameGate`).
+  const settled = gpu.api === 'webgpu' && options.present === 'settled';
   const hostOptions = {
     onLog,
     onStatus: options.onStatus || (() => {}),
