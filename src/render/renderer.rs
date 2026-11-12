@@ -525,8 +525,9 @@ pub(super) struct Pipelines {
     bloom_up: PipelineId,
     tonemap: PipelineId,
     tonemap_final: PipelineId,
-    /// `fs_tonemap` and `fs_final` in one pass, where no painterly filter runs between them.
-    tonemap_output: PipelineId,
+    /// `fs_tonemap` and `fs_final` in one pass, where no painterly filter runs between them; then
+    /// the same for a Look whose grade changes nothing ([`Look::grade_is_identity`]).
+    tonemap_output: [PipelineId; 2],
     paint: PipelineId,
     output: PipelineId,
 }
@@ -595,7 +596,7 @@ pub(super) struct Slot {
     up: Vec<BindGroupId>,
     tonemap: BindGroupId,
     tonemap_final: BindGroupId,
-    tonemap_output: BindGroupId,
+    tonemap_output: [BindGroupId; 2],
     paint: BindGroupId,
     output: BindGroupId,
 }
@@ -1253,7 +1254,16 @@ impl Pipelines {
             bloom_up: fullscreen(device, &fsvs, "fs_bloom_up", HDR, Blend::Additive)?,
             tonemap: fullscreen(device, &fsvs, "fs_tonemap", HDR, Blend::Replace)?,
             tonemap_final: fullscreen(device, &fsvs, "fs_tonemap_final", output, Blend::Replace)?,
-            tonemap_output: fullscreen(device, &fsvs, "fs_tonemap_output", output, Blend::Replace)?,
+            tonemap_output: [
+                fullscreen(device, &fsvs, "fs_tonemap_output", output, Blend::Replace)?,
+                fullscreen(
+                    device,
+                    &fsvs,
+                    "fs_tonemap_output_plain",
+                    output,
+                    Blend::Replace,
+                )?,
+            ],
             paint: fullscreen(device, &fsvs, "fs_paint", HDR, Blend::Replace)?,
             output: fullscreen(device, &fsvs, "fs_final", output, Blend::Replace)?,
         })
@@ -2022,12 +2032,11 @@ impl Renderer {
             Resource::Texture(t.lit),
             Resource::TextureMip(t.bloom, 0),
         )?;
-        let tonemap_output = post(
-            device,
-            p.tonemap_output,
-            Resource::Texture(t.lit),
-            Resource::TextureMip(t.bloom, 0),
-        )?;
+        let [graded, plain] = p.tonemap_output.map(|pipe| {
+            let (lit, bloom) = (Resource::Texture(t.lit), Resource::TextureMip(t.bloom, 0));
+            post(device, pipe, lit, bloom)
+        });
+        let tonemap_output = [graded?, plain?];
         let tonemap_final = device.create_bind_group(
             p.tonemap_final,
             0,
@@ -2084,13 +2093,8 @@ impl Renderer {
                 .chain([
                     s.grass, s.flower, s.particle, s.restore, s.mask, s.ssao, s.air,
                 ])
-                .chain([
-                    s.tonemap,
-                    s.tonemap_final,
-                    s.tonemap_output,
-                    s.paint,
-                    s.output,
-                ])
+                .chain(s.tonemap_output)
+                .chain([s.tonemap, s.tonemap_final, s.paint, s.output])
             {
                 device.destroy_bind_group(g);
             }
@@ -3948,13 +3952,14 @@ impl Renderer {
                 grade[12] = l.sharpen.max(0.0);
                 grade[13] = if self.quality.fxaa { 1.0 } else { 0.0 };
                 grade[14] = if encode_srgb { 1.0 } else { 0.0 };
+                let plain = usize::from(l.grade_is_identity());
                 Self::post_pass(
                     enc,
                     dest,
                     0,
                     Load::DontCare,
-                    p.tonemap_output,
-                    slot.tonemap_output,
+                    p.tonemap_output[plain],
+                    slot.tonemap_output[plain],
                     grade,
                 );
             }
@@ -4996,5 +5001,180 @@ mod tests {
         assert!(errs.is_empty(), "validation errors: {errs:?}");
         still.destroy_props(&mut device);
         live.destroy_props(&mut device);
+    }
+
+    /// Draws a frame of a renderer presenting to `target` (an offscreen RGBA8 texture standing
+    /// in for the canvas) and reads it back.
+    fn present(
+        device: &mut Device<'_>,
+        r: &mut Renderer,
+        view: &View,
+        env: &Environment,
+        (target, readback): (TextureId, BufferId),
+    ) -> Vec<u8> {
+        let mut enc = device.encoder();
+        r.encode(device, &mut enc, view, env, [0.0; 2], 0, Some(target))
+            .expect("frame");
+        enc.copy_texture_to_buffer(target, 0, 0, readback, 0);
+        device.submit(enc).expect("submit");
+        device.read_buffer(readback).expect("read back")
+    }
+
+    /// An offscreen RGBA8 target standing in for a `size` canvas, and a buffer to read it into.
+    fn canvas(device: &mut Device<'_>, (w, h): (u32, u32)) -> (TextureId, BufferId) {
+        let usage = TextureUsage::COLOR_TARGET | TextureUsage::COPY_SRC;
+        let target = device
+            .create_texture(&TextureDesc::new(w, h, Format::Rgba8Unorm, usage))
+            .expect("target");
+        let readback = device
+            .create_buffer(&BufferDesc {
+                size: u64::from(w * h * 4),
+                usage: BufferUsage::COPY_DST,
+                memory: Memory::Readback,
+            })
+            .expect("readback");
+        (target, readback)
+    }
+
+    /// Of two pictures, the share of pixels where a channel differs by more than one 8-bit step,
+    /// and the largest difference.
+    fn off_by_more_than_a_step(a: &[u8], b: &[u8]) -> (f64, u8) {
+        let (mut off, mut largest) = (0usize, 0u8);
+        for (p, q) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+            let d = p
+                .iter()
+                .zip(q)
+                .map(|(x, y)| x.abs_diff(*y))
+                .max()
+                .unwrap_or(0);
+            off += usize::from(d > 1);
+            largest = largest.max(d);
+        }
+        (off as f64 / (a.len() / 4) as f64, largest)
+    }
+
+    /// A Look whose grade changes nothing is tone-mapped without grading, and the picture is the
+    /// one its grade gives: within one 8-bit step on 99.9 % of pixels of the same frame graded a
+    /// hair from the identity, which takes the full grade.
+    #[test]
+    fn an_identity_grade_is_skipped_without_changing_the_picture() {
+        let Ok(mut device) = Device::headless() else {
+            return;
+        };
+        let mut world = World::default();
+        world.materials.push(Material {
+            name: "floor".into(),
+            base_color: [0.6, 0.58, 0.55, 1.0],
+            ..Material::default()
+        });
+        world.meshes.push(make_quad_mesh(0.0, 4.0));
+        world.instances.push(Instance {
+            mesh: 0,
+            transform: Transform(math::IDENTITY),
+        });
+        let identity = Look {
+            painterly: 0.0,
+            saturation: 1.0,
+            contrast: 1.0,
+            lift: [0.0; 3],
+            gain: [1.0; 3],
+            ..Look::default()
+        };
+        assert!(identity.grade_is_identity() && !Look::default().grade_is_identity());
+        let size = (128, 96);
+        let mut r = Renderer::new(
+            &mut device,
+            &world,
+            identity.clone(),
+            Quality::realtime(),
+            size,
+            Output::Surface(Format::Rgba8Unorm),
+        )
+        .expect("renderer");
+        r.finish_ao(&mut device).expect("ao");
+        let (sp, sn, suv, sidx) = sphere_prop_data();
+        let sphere = r
+            .create_prop_mesh(
+                &mut device,
+                &MeshData {
+                    positions: &sp,
+                    normals: &sn,
+                    uvs: &suv,
+                    indices: &sidx,
+                },
+            )
+            .expect("mesh");
+        // A glowing ball by a matte one.
+        for (color, emissive, x) in [
+            ([0.2, 0.5, 0.9, 1.0], [6.0, 3.0, 1.0], 0.5),
+            ([0.8; 4], [0.0; 3], -0.6),
+        ] {
+            let material = r
+                .create_prop_material(
+                    &mut device,
+                    &MaterialDesc {
+                        name: "ball".into(),
+                        base_color: color,
+                        emissive,
+                        ..MaterialDesc::default()
+                    },
+                )
+                .expect("material");
+            let mut at = math::IDENTITY;
+            for k in [0, 5, 10] {
+                at[k] = 0.4;
+            }
+            at[12..15].copy_from_slice(&[x, 0.45, 0.0]);
+            r.create_prop_instance(sphere, material, &at).expect("ball");
+        }
+        let view = View {
+            name: "balls".into(),
+            eye: [0.0, 1.4, 2.6],
+            target: [0.0, 0.4, 0.0],
+            fov: 45.0,
+            ..View::default()
+        };
+        let env = Environment::resolve(
+            &TimeOfDay {
+                hours: 17.5,
+                ..TimeOfDay::default()
+            },
+            &Weather::default(),
+            &identity.palette,
+            1.0,
+        );
+        let out = canvas(&mut device, size);
+        let hair = 1.0 + f32::EPSILON;
+        for tonemap in ToneMap::ALL {
+            let identity = Look {
+                tonemap,
+                ..identity.clone()
+            };
+            r.set_look(identity.clone());
+            let plain = present(&mut device, &mut r, &view, &env, out);
+            for graded in [
+                Look {
+                    saturation: hair,
+                    ..identity.clone()
+                },
+                Look {
+                    contrast: hair,
+                    ..identity.clone()
+                },
+            ] {
+                assert!(!graded.grade_is_identity());
+                r.set_look(graded);
+                let full = present(&mut device, &mut r, &view, &env, out);
+                let (off, largest) = off_by_more_than_a_step(&plain, &full);
+                assert!(
+                    off <= 0.001,
+                    "{tonemap:?}: {:.3} % of pixels off by more than a step (up to {largest})",
+                    off * 100.0
+                );
+            }
+        }
+        let errs = device.validation_errors();
+        assert!(errs.is_empty(), "validation errors: {errs:?}");
+        r.destroy_props(&mut device);
     }
 }
