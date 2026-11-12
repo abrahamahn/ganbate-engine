@@ -348,17 +348,21 @@ fn perturb(n: vec3f, p: vec3f, uv: vec2f, m: vec3f) -> vec3f {
 // How much of a game light reaches `world` past the props' shadows (1 all), from its shadow map
 // `layer`, filtered over a texel and a half with eight taps turned per pixel.
 fn light_shadow(world: vec3f, n: vec3f, ld: vec3f, l: Light, layer: i32, frag: vec2f) -> f32 {
-  var m = frame.light_shadow0;
-  if (layer == 1) {
-    m = frame.light_shadow1;
-  }
   // A texel's width where the point is (the map spans the cone across), and the point moved off
   // its surface by about that much, more where the light grazes it.
   let c = l.spot.w;
   let spread = sqrt(max(1.0 - c * c, 0.0)) / max(c, 0.05);
   let texel = 2.0 * length(l.pos.xyz - world) * spread * frame.light_shadow.x;
   let graze = 1.0 - abs(dot(n, ld));
-  let p = m * vec4f(world + n * (texel * (1.0 + 2.0 * graze)), 1.0);
+  // The layer picks the product rather than the matrix: a matrix picked at run time is sixteen
+  // values held in registers (Mali spilled them).
+  let moved = vec4f(world + n * (texel * (1.0 + 2.0 * graze)), 1.0);
+  var p: vec4f;
+  if (layer == 1) {
+    p = frame.light_shadow1 * moved;
+  } else {
+    p = frame.light_shadow0 * moved;
+  }
   if (p.w <= 1e-4) {
     return 1.0;
   }
