@@ -18,15 +18,16 @@ The core workspace uses **zero third-party Cargo crates**, calling OS/GPU ABIs d
 | Path | Output | Responsibility |
 | --- | --- | --- |
 | `src/` (`ganbate-engine`) | lib + native bins | Unified GPU RHI (`gpu`), Vulkan/Metal/WebGPU/WebGL 2 backends, stylized `Look` renderer (`render`), GPU skinning & sparse facial morphs (`anim`), native windows (`window`) |
-| `crates/ganbate-core` | lib | Math, permanent 64/128-bit IDs, SHA-256 digests, canonical JSON reader/writer, frame pacing, `EntityTable` |
-| `crates/ganbate-shader` | lib | Custom WGSL subset compiler → Vulkan `SPIR-V`, Apple `MSL`, `WebGPU` WGSL, and `WebGL 2` GLSL ES 3.00 |
-| `crates/ganbate-assets` | lib | Embedded glTF 2.0 (`.glb`) loader, PNG/zlib codecs, cooked `.gbew` (v1–v4) world format (`--compact` ~7 B/tri) |
-| `crates/ganbate-scene` | lib | Canonical `.scene.json` & `.prefab.json` documents, component schemas, prefab overrides, invertible `Op` undo/redo |
-| `crates/ganbate-pipeline` | lib | `ganbate.project.json` discovery, `.meta.json` permanent ID sidecars, object-preserving GLB import, GBEW v4 cooking |
-| `crates/ganbate-physics` | lib | Deterministic 60 Hz rigid-body solver (`+`, `-`, `*`, `/`, `sqrt` only), 5 joints, CCD, spatial queries, character controller |
-| `crates/ganbate-web` + `web/` | `ganbate_web.wasm`, `ganbate.js`, `ganbate.d.ts` | Browser WASM runtime linking both WebGPU and WebGL 2; supports standalone viewer and `createEngine()` library mode |
-| `../ganbate-editor/crates/ganbate-studio` + `../ganbate-editor/editor/` | `ganbate-studio` | Local HTTP/WebSocket editor host (`localhost:7480`) + browser UI (Asset Library, Outliner, Inspector, `ganbate-web` viewport) |
-| `../ganbate-editor/crates/ganbate-agent` | `ganbate` | Single-line JSON CLI for AI agents & scripts (`scene inspect`, `validate`, `apply`, `undo`, `diff`, `render`) |
+| `crates/core` | lib | Math, permanent 64/128-bit IDs, SHA-256 digests, canonical JSON reader/writer, frame pacing, `EntityTable` |
+| `crates/shader` | lib | Custom WGSL subset compiler → Vulkan `SPIR-V`, Apple `MSL`, `WebGPU` WGSL, and `WebGL 2` GLSL ES 3.00 |
+| `crates/assets` | lib | Embedded glTF 2.0 (`.glb`) loader, PNG/zlib codecs, cooked `.gbew` (v1–v4) world format (`--compact` ~7 B/tri) |
+| `crates/scene` | lib | Canonical `.scene.json` & `.prefab.json` documents, component schemas, prefab overrides, invertible `Op` undo/redo |
+| `crates/pipeline` | lib | `ganbate.project.json` discovery, `.meta.json` permanent ID sidecars, object-preserving GLB import, GBEW v4 cooking |
+| `crates/physics` | lib | Deterministic 60 Hz rigid-body solver (`+`, `-`, `*`, `/`, `sqrt` only), 5 joints, CCD, spatial queries, character controller |
+| `crates/graph`, `audio`, `jobs`, `seq`, `vfx` | libs | Semantic spatial graph solver, QOA/DSP spatial audio, work-stealing SIMD culling, multi-track sequencer, and deterministic VFX |
+| `crates/web` + `web/` | `ganbate_web.wasm`, `ganbate.js`, `ganbate.d.ts`, React+TS player | Browser WASM runtime (`web/sdk/`), React 19 + TypeScript + Vite scene player (`web/player/`), and browser test suites (`web/test/`) |
+| `../ganbate-editor/server/ganbate-studio` + `../ganbate-editor/client/` | `ganbate-studio` | Local HTTP/WebSocket editor host (`localhost:7480`) + React/Vite Studio UI (Asset Library, Outliner, Inspector, `ganbate-web` viewport) |
+| `../ganbate-editor/server/ganbate-agent` | `ganbate` | Single-line JSON CLI for AI agents & scripts (`scene inspect`, `validate`, `apply`, `undo`, `diff`, `render`) |
 | `src/bin/ganbate-*` | `ganbate-player`, `ganbate-render`, `ganbate-build`, `ganbate-bench`, `ganbate-framecheck`, `ganbate-ios` | Native desktop player, headless renderer, asset importer/cooker, throughput benchmark, and 120/240 Hz display-pacing verifier |
 
 ---
@@ -74,11 +75,13 @@ cargo run --locked --offline --release --bin ganbate-build -- model character.gl
 
 ## 3. Run in a Browser (WebGPU & WebGL 2)
 
-`crates/ganbate-web` (`ganbate_web.wasm`) links **both** WebGPU (Chrome/Edge 113+, Safari 26 on macOS/iPhone/iPad) and WebGL 2 (older iOS, Android GPUs without WebGPU, Linux Firefox/Chrome) with zero third-party crates. `web/ganbate.js` selects WebGPU automatically (`?api=webgl2` forces WebGL 2; `?api=webgpu` disables fallback).
+`crates/web` (`ganbate_web.wasm`) links **both** WebGPU (Chrome/Edge 113+, Safari 26 on macOS/iPhone/iPad) and WebGL 2 (older iOS, Android GPUs without WebGPU, Linux Firefox/Chrome) with zero third-party Cargo crates. `web/sdk/ganbate.js` selects WebGPU automatically (`?api=webgl2` forces WebGL 2; `?api=webgpu` disables fallback), and `web/player/` provides a standalone React 19 + TypeScript + Vite scene viewer and GPU self-test launcher.
 
 ```sh
 rustup target add wasm32-unknown-unknown
-scripts/build-web.sh                  # writes web/dist/{index.html,ganbate.js,ganbate.d.ts,ganbate_web.wasm}
+scripts/build-web.sh                  # builds ganbate_web.wasm + React/TS player + SDK into web/dist/
+npm --prefix web run dev              # optional: Vite HMR dev server for web/player/
+npm --prefix web run check            # TypeScript check + SDK unit tests
 ```
 
 *(Without rustup's prebuilt `wasm32` stdlib, build std from source via `GANBATE_WEB_TOOLCHAIN=build-std GANBATE_WEB_RUSTC=rustc-1.91 GANBATE_WEB_CARGO=cargo-1.91 GANBATE_WEB_RUST_SRC=/path/to/rust-src-1.91/library scripts/build-web.sh`.)*
@@ -96,7 +99,7 @@ URL parameters: `scene`, `look`, `view=NAME`, `time=HOURS`, `weather=PRESET`, `s
 
 ### Library Mode: Driving the Engine from TypeScript / JavaScript
 
-Games with their own UI import `createEngine` (`web/ganbate.d.ts` ships full TypeScript declarations):
+Games with their own UI import `createEngine` (`web/sdk/ganbate.d.ts` ships full TypeScript declarations):
 
 ```js
 import { createEngine } from './ganbate.js';
@@ -151,7 +154,7 @@ cargo run -p ganbate-shader --example ganbate-shaderc -- shader.wgsl fragment fs
 
 ## 5. Deterministic 60 Hz Physics (`ganbate-physics`)
 
-`crates/ganbate-physics` provides rigid-body simulation with zero dependencies beyond `ganbate-core` ([physics design](docs/design/06-physics.md)):
+`crates/physics` provides rigid-body simulation with zero dependencies beyond `ganbate-core` ([physics design](docs/design/06-physics.md)):
 - **Shapes & Bodies:** Spheres, capsules, boxes, convex hulls, triangle meshes, heightfields; static, kinematic, and dynamic bodies; sleeping islands; CCD for fast-moving objects.
 - **Joints, Queries & Characters:** Ball, hinge, slider, fixed, and distance joints (limits, motors, springs); sensors & contact events; `raycast`, `shape_cast`, and `overlap`; kinematic character controller (slides, climbs steps, rejects steep slopes, rides moving platforms).
 - **Bit-Identical Determinism:** Steps execute only `+`, `−`, `×`, `÷`, and `sqrt`, producing the exact same 64-bit `state_hash` across native and WASM builds.
@@ -167,7 +170,7 @@ VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
 
 ## 6. AI Agent CLI (`ganbate`)
 
-`crates/ganbate-agent` (`ganbate`) lets AI agents and automation inspect, validate, edit, diff, undo, and render scenes without touching engine source or corrupting canonical JSON. Every command outputs a single JSON line (`{"ok":true,...}` or `{"ok":false,"error":{"code":"...","message":"..."}}`).
+`../ganbate-editor/server/ganbate-agent` (`ganbate`) lets AI agents and automation inspect, validate, edit, diff, undo, and render scenes without touching engine source or corrupting canonical JSON. Every command outputs a single JSON line (`{"ok":true,...}` or `{"ok":false,"error":{"code":"...","message":"..."}}`).
 
 ```sh
 cargo run --release --example studio_sample -- ~/ganbate-sample
@@ -212,7 +215,9 @@ GANBATE_IOS_TEAM=ABCDE12345 scripts/apple/build-ios.sh --device --world world.gb
 ## 8. Verify & Benchmark
 
 ```sh
-# Unit, Vulkan, presentation, renderer, agent, browser & Studio end-to-end suites
+# Unit, topology, Vulkan, presentation, renderer, browser & Studio end-to-end suites
+node scripts/audit-topology.mjs
+npm --prefix web run check
 cargo test --workspace --locked --offline
 cargo test --locked --offline --test vulkan -- --ignored
 cargo test --locked --offline --test present -- --ignored

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
-# Builds the Ganbate web player: crates/ganbate-web for wasm32-unknown-unknown (release, zero
-# third-party crates) plus web/index.html, web/ganbate.js and its declarations web/ganbate.d.ts, into
-# OUT_DIR (default web/dist).
+# Builds the Ganbate web runtime & React + TypeScript player:
+# 1. crates/web (ganbate-web) for wasm32-unknown-unknown (release, zero third-party Cargo crates)
+# 2. web/player (React + TypeScript + Vite) into OUT_DIR (default web/dist)
+# 3. web/sdk/{ganbate.js,ganbate.d.ts,character-customization.*,graph-session.*} + ganbate_web.wasm
 #
 #   scripts/build-web.sh [OUT_DIR]
 #
@@ -11,14 +12,16 @@
 # * A rustc without the wasm32 standard library (for example a distribution's rustc-1.91):
 #   the script rebuilds std from source with -Z build-std. Set
 #     GANBATE_WEB_RUSTC / GANBATE_WEB_CARGO   the compiler and cargo (default rustc-1.91, cargo-1.91)
-#     GANBATE_WEB_RUST_SRC                the matching rust-src `library` directory
-#     GANBATE_WEB_LINKER                  a wasm linker (default wasm-ld from LLVM/lld)
+#     GANBATE_WEB_RUST_SRC                    the matching rust-src `library` directory
+#     GANBATE_WEB_LINKER                      a wasm linker (default wasm-ld from LLVM/lld)
 #   std's own dependencies (dlmalloc and friends) come from crates.io on the first build.
 # Set GANBATE_WEB_TOOLCHAIN=rustup or =build-std to skip the detection.
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-out=${1:-$root/web/dist}
+raw_out=${1:-$root/web/dist}
+mkdir -p "$raw_out"
+out=$(cd "$raw_out" && pwd)
 target_dir=${CARGO_TARGET_DIR:-$root/target}
 target=wasm32-unknown-unknown
 
@@ -66,8 +69,26 @@ case "$mode" in
     ;;
 esac
 
-mkdir -p "$out"
+if [ ! -d "$root/web/node_modules" ]; then
+  if [ -f "$root/web/package-lock.json" ]; then
+    npm --prefix "$root/web" ci --prefer-offline --no-audit --no-fund >/dev/null
+  else
+    npm --prefix "$root/web" install --prefer-offline --no-audit --no-fund >/dev/null
+  fi
+fi
+
+npm --prefix "$root/web" run typecheck >/dev/null
+npm --prefix "$root/web" run build -- --outDir "$out" >/dev/null
+
 cp "$target_dir/$target/release/ganbate_web.wasm" "$out/ganbate_web.wasm"
-cp web/index.html web/ganbate.js web/ganbate.d.ts web/character-customization.{mjs,d.mts} web/graph-session.{mjs,d.mts} "$out/"
+cp \
+  "$root/web/sdk/ganbate.js" \
+  "$root/web/sdk/ganbate.d.ts" \
+  "$root/web/sdk/character-customization.mjs" \
+  "$root/web/sdk/character-customization.d.mts" \
+  "$root/web/sdk/graph-session.mjs" \
+  "$root/web/sdk/graph-session.d.mts" \
+  "$out/"
+
 size=$(wc -c < "$out/ganbate_web.wasm")
 echo "build-web: $out (ganbate_web.wasm $((size / 1024)) KiB, $mode)"

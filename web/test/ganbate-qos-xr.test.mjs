@@ -8,7 +8,7 @@ import {
   createEngine,
   qualityCodeFromMode,
   resolveQualityCode,
-} from '../ganbate.js';
+} from '../sdk/ganbate.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..', '..');

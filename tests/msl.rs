@@ -3,7 +3,7 @@
 //! and, when `clang++` is available, compile against ganbate-shader's stand-in `metal_stdlib`.
 //! A compile check on Linux, not a Metal run.
 
-#[path = "../crates/ganbate-shader/tests/msl/check.rs"]
+#[path = "../crates/shader/tests/msl/check.rs"]
 mod check;
 
 use ganbate_engine::gpu::shader::{MslIndex, compile_msl, entry_points};

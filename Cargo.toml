@@ -8,29 +8,29 @@ description = "Ganbate Studio's native 3D renderer"
 
 [workspace]
 members = [
-    "crates/ganbate-assets",
-    "crates/ganbate-audio",
-    "crates/ganbate-core",
-    "crates/ganbate-graph",
-    "crates/ganbate-jobs",
-    "crates/ganbate-physics",
-    "crates/ganbate-pipeline",
-    "crates/ganbate-scene",
-    "crates/ganbate-seq",
-    "crates/ganbate-shader",
-    "crates/ganbate-vfx",
-    "crates/ganbate-web",
+    "crates/assets",
+    "crates/audio",
+    "crates/core",
+    "crates/graph",
+    "crates/jobs",
+    "crates/physics",
+    "crates/pipeline",
+    "crates/scene",
+    "crates/seq",
+    "crates/shader",
+    "crates/vfx",
+    "crates/web",
 ]
 resolver = "3"
 
 [dependencies]
-ganbate-core = { path = "crates/ganbate-core" }
-ganbate-assets = { path = "crates/ganbate-assets" }
-ganbate-jobs = { path = "crates/ganbate-jobs" }
-ganbate-pipeline = { path = "crates/ganbate-pipeline" }
-ganbate-scene = { path = "crates/ganbate-scene" }
-ganbate-shader = { path = "crates/ganbate-shader" }
-ganbate-physics = { path = "crates/ganbate-physics" }
+ganbate-core = { path = "crates/core" }
+ganbate-assets = { path = "crates/assets" }
+ganbate-jobs = { path = "crates/jobs" }
+ganbate-pipeline = { path = "crates/pipeline" }
+ganbate-scene = { path = "crates/scene" }
+ganbate-shader = { path = "crates/shader" }
+ganbate-physics = { path = "crates/physics" }
 
 [profile.release]
 opt-level = 3

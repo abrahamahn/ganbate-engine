@@ -1,0 +1,10 @@
+[package]
+name = "ganbate-seq"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "Deterministic multi-track cinematic and gameplay sequencer for Ganbate"
+
+[dependencies]
+ganbate-core = { path = "../core" }

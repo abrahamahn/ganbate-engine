@@ -1,3 +1,5 @@
 /target
 /artifacts
+/web/dist
+/web/node_modules
 *.ppm

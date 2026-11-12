@@ -9,7 +9,7 @@
     target_os = "android",
     target_vendor = "apple"
 ))]
-#[path = "../crates/ganbate-shader/tests/msl/check.rs"]
+#[path = "../crates/shader/tests/msl/check.rs"]
 mod check;
 
 use ganbate_engine::gpu::shader::{Compiled, Stage, compile, compile_msl, entry_points};

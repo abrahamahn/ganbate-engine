@@ -3963,10 +3963,10 @@ mod tests {
         let two = |a: usize, b: usize| -> Vec<_> {
             changed_runs(200, 160, TEXTURE_ROW, |r| r == a || r == b).collect()
         };
-        assert_eq!(two(0, 50), [0..51]);
-        assert_eq!(two(0, 102), [0..103]);
+        assert_eq!(two(0, 50).as_slice(), std::slice::from_ref(&(0..51)));
+        assert_eq!(two(0, 102).as_slice(), std::slice::from_ref(&(0..103)));
         assert_eq!(two(0, 103), [0..1, 103..104]);
-        assert_eq!(two(101, 103), [101..104]);
+        assert_eq!(two(101, 103).as_slice(), std::slice::from_ref(&(101..104)));
     }
 
     fn bound_bits((lo, hi): (V3, V3)) -> [u32; 6] {

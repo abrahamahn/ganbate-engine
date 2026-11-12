@@ -15,13 +15,13 @@ rasterizers (lavapipe/llvmpipe, SwiftShader, ANGLE on llvmpipe) unless a row say
 
 | Subsystem | Status | Evidence | Why it is needed | Priority |
 | --- | --- | --- | --- | --- |
-| Core types and math | partial | `crates/ganbate-core/src/lib.rs`, `world.rs`, `src/render/math.rs`, `src/anim.rs` | Three vocabularies today (core `Vec3`/`Transform`, render arrays, animation quaternions); one math library with bounds, rays, frusta and quaternions is the base of picking, culling, physics and tools | P0: unify as systems need it |
-| Data layer: JSON read and canonical write, digests, ids | present (M1) | `crates/ganbate-core/src/json.rs`, `digest.rs`, `id.rs` | Every authored file, every content address, every entity and asset reference | P0 |
-| Reflection and schemas | present for data (M1) | `crates/ganbate-scene/src/schema.rs`, `engine.schema.json` | Inspectors, validation, the cook and runtime readers come from one description; games add kinds without engine code. Rust-side typed components with generated schemas come with the gameplay framework | P0 data, P1 Rust types |
+| Core types and math | partial | `crates/core/src/lib.rs`, `world.rs`, `src/render/math.rs`, `src/anim.rs` | Three vocabularies today (core `Vec3`/`Transform`, render arrays, animation quaternions); one math library with bounds, rays, frusta and quaternions is the base of picking, culling, physics and tools | P0: unify as systems need it |
+| Data layer: JSON read and canonical write, digests, ids | present (M1) | `crates/core/src/json.rs`, `digest.rs`, `id.rs` | Every authored file, every content address, every entity and asset reference | P0 |
+| Reflection and schemas | present for data (M1) | `crates/scene/src/schema.rs`, `engine.schema.json` | Inspectors, validation, the cook and runtime readers come from one description; games add kinds without engine code. Rust-side typed components with generated schemas come with the gameplay framework | P0 data, P1 Rust types |
 | Serialization of runtime state (save games, replays) | absent | | Story progress, local saves, deterministic replays of presentation | P1 |
-| Platform layer (windows, lifecycle, files, clocks) | partial | `src/window/*` (X11, Win32, AppKit, UIKit), `src/apple/objc.rs`, `crates/ganbate-web` | One window per device, no Android, no Wayland, no app lifecycle hooks (background, memory warnings) | P1 (M8): lifecycle and Android |
+| Platform layer (windows, lifecycle, files, clocks) | partial | `src/window/*` (X11, Win32, AppKit, UIKit), `src/apple/objc.rs`, `crates/web` | One window per device, no Android, no Wayland, no app lifecycle hooks (background, memory warnings) | P1 (M8): lifecycle and Android |
 | Input: keys, pointer, touch, gamepad, text, actions | partial | `src/window/mod.rs:19-43` | Missing modifiers, wheel, right button, gamepad, text input and IME, action mapping. On the web the host page owns input today | P1 (native apps, second game), gamepad P1 |
-| Frame loop, timing and pacing | partial | `crates/ganbate-core/src/timing.rs`, `src/bin/ganbate-framecheck.rs` | Render on demand with per-state cadences (motion at the display's own rate, 120 Hz and faster displays included; then 30, 15, a few and 0 frames per second as less moves), an adaptive resolution governor with device-class floors, visibility throttling, fixed-step simulation, presentation-time feedback for the device frame gates | P0 (M2) |
+| Frame loop, timing and pacing | partial | `crates/core/src/timing.rs`, `src/bin/ganbate-framecheck.rs` | Render on demand with per-state cadences (motion at the display's own rate, 120 Hz and faster displays included; then 30, 15, a few and 0 frames per second as less moves), an adaptive resolution governor with device-class floors, visibility throttling, fixed-step simulation, presentation-time feedback for the device frame gates | P0 (M2) |
 | Loading policy (priorities, deadlines, fallbacks, preloading) | absent | | Critical content before decoration; a defined fallback when an asset is late or fails | P0 (M2) |
 | Job system and threads | absent | (single-threaded by design: `src/vulkan/rhi/mod.rs:14-16`) | Cooking, decoding, streaming, animation and culling off the main thread; wasm threads where the browser allows; a single-thread fallback | P1 (P0 for the editor host's cook) |
 | Memory: arenas, pools, budgets | absent | one GPU allocation per resource (`src/vulkan/rhi/resources.rs:66-120`) | Zero per-frame allocation, zero growth over two-hour sessions, per-tier GPU memory budgets | P0 budgets, P1 allocators |
@@ -32,10 +32,10 @@ rasterizers (lavapipe/llvmpipe, SwiftShader, ANGLE on llvmpipe) unless a row say
 
 | Subsystem | Status | Evidence | Why | Priority |
 | --- | --- | --- | --- | --- |
-| Project and asset database (ids, sidecars, index) | present (M1) | `crates/ganbate-pipeline/src/project.rs` | References survive renames; the editor finds everything; duplicate ids are caught | P0 |
-| Importers: glTF static and animated, PNG | partial | `crates/ganbate-assets/src/glb.rs`, `model.rs`, `png.rs` | External geometry codecs (`KHR_draco_mesh_compression`, `EXT_meshopt_compression`) are intentionally excluded and refused (export uncompressed GLBs and cook with `--compact`); no spot or directional lights; no texture transforms or extra UV sets | P0: import keeps objects (done); P1: remaining glTF attributes |
+| Project and asset database (ids, sidecars, index) | present (M1) | `crates/pipeline/src/project.rs` | References survive renames; the editor finds everything; duplicate ids are caught | P0 |
+| Importers: glTF static and animated, PNG | partial | `crates/assets/src/glb.rs`, `model.rs`, `png.rs` | External geometry codecs (`KHR_draco_mesh_compression`, `EXT_meshopt_compression`) are intentionally excluded and refused (export uncompressed GLBs and cook with `--compact`); no spot or directional lights; no texture transforms or extra UV sets | P0: import keeps objects (done); P1: remaining glTF attributes |
 | Import that keeps objects | present (M1, static models) | `glb::import_nodes`, `ganbate_pipeline::cook::scene_from_model` | One entity per node with name, parent and transform; ends script-driven placement | P0 |
-| Cook: scenes to worlds with entity tables | present (M1) | `ganbate_pipeline::cook::cook_scene`, GBEW v4 (`crates/ganbate-assets/src/cooked.rs`) | The runtime keeps authored identity; objects move, hide and pick at run time | P0 |
+| Cook: scenes to worlds with entity tables | present (M1) | `ganbate_pipeline::cook::cook_scene`, GBEW v4 (`crates/assets/src/cooked.rs`) | The runtime keeps authored identity; objects move, hide and pick at run time | P0 |
 | Incremental, cached, parallel cook | absent | | Large projects cook in seconds after a change; the editor re-cooks only what changed | P0 for the editor, P1 at scale |
 | Per-platform packages and texture compression | absent | no block formats in `src/gpu/types.rs:47-80` | VRAM and download budgets (a phone room must stay small); BC on desktop, ASTC on mobile, ETC2 fallback, Basis-style transcoding for the web | P0 packages (M2); P1 texture compression |
 | Compressed geometry for models | partial | compact GBEW coding (`cooked.rs`, `--compact`) | Run-time models are loaded as plain GLB, about 3.5 times larger than compressed sources; cook models into the compact coding too | P0 (download budget) |
@@ -52,7 +52,7 @@ rasterizers (lavapipe/llvmpipe, SwiftShader, ANGLE on llvmpipe) unless a row say
 
 | Subsystem | Status | Evidence | Why | Priority |
 | --- | --- | --- | --- | --- |
-| Entities, hierarchy, components (authoring) | present (M1) | `crates/ganbate-scene/src/scene.rs` | Every placeable thing has an id, a parent and typed components | P0 |
+| Entities, hierarchy, components (authoring) | present (M1) | `crates/scene/src/scene.rs` | Every placeable thing has an id, a parent and typed components | P0 |
 | Prefabs with overrides and nesting | present (M1 data), editor UI M3 | `scene::flatten` | Seats, lamps, tables and trees reused with per-instance changes | P0 |
 | Runtime entity access for game code | partial (M1) | entity table (`ganbate_core::world::EntityTable`, read with `ganbate_assets::cooked::decode_scene`), `engine.worldEntities()` | Games find their markers and anchors by id or kind instead of constants | P0 |
 | Runtime transform hierarchy for props (parents, inherited visibility, batched updates) | absent | games build their own node graphs over flat instances | Every game stage needs it; doing it in the engine removes per-frame allocation and duplicate code | P0 (M3) |
@@ -70,7 +70,7 @@ Look files, with props, overlays, prop shaders and game lights for game-drawn co
 | GPU layer (RHI) with four backends | present | `src/gpu/*`, `src/vulkan/*`, `src/metal/*`, `src/gpu/webgpu`, `src/gpu/webgl` | One API everywhere; automatic barriers; same misuse rejected on every backend | P0 |
 | GPU features: compressed, integer, 3D, MSAA, stencil formats; timestamps; debug labels; multi-surface | absent | `src/gpu/types.rs:47-80` | Texture budgets, GPU profiling, readable captures, multiple editor viewports | P1 (one viewport switched between device shapes in M2) |
 | Device loss and context restore | absent | detection only (`src/vulkan/rhi/mod.rs:373-390`) | Phones lose GPU contexts; the game must recover without a reload | P0 |
-| Shader compiler (WGSL subset to SPIR-V, MSL, WGSL, GLSL ES) | present | `crates/ganbate-shader` | One shader source on every backend, compiled at run time even in the browser | P0 |
+| Shader compiler (WGSL subset to SPIR-V, MSL, WGSL, GLSL ES) | present | `crates/shader` | One shader source on every backend, compiled at run time even in the browser | P0 |
 | Shader modules, specialization, caches, hot reload | absent | sources joined by concatenation; prop-shader errors reported 1,360 lines off | Material editing with good errors, permutations without recompiling, cached pipelines on phones | P0 error positions, P1 the rest |
 | Stylized shading, shadows, water, sky, weather, grass, terrain detail, post | present | `src/render/*` | The game's whole look as data | P0 |
 | Props, overlays, blend layers, prop shaders, game lights, picking, projection | present | `src/render/props.rs`, `lights.rs` | Everything a game draws at run time | P0 |
@@ -118,8 +118,8 @@ Look files, with props, overlays, prop shaders and game lights for game-drawn co
 
 | Subsystem | Status | Evidence | Why | Priority |
 | --- | --- | --- | --- | --- |
-| Physics: collision shapes, broad and narrow phase, rigid bodies, joints, queries, character controller | present | `crates/ganbate-physics` ([physics](06-physics.md)) | A second, non-card game with movement and collision; open worlds; props that fall, roll and swing in any game | P1 (built ahead of M9) |
-| Raycasts and overlaps against scene geometry | present | the renderer's picking against triangles; the physics world's `raycast`, `shape_cast`, `overlap` and `contacts_with` (`crates/ganbate-physics/src/query.rs`) against its colliders | Placement in the editor, gameplay queries | P0 |
+| Physics: collision shapes, broad and narrow phase, rigid bodies, joints, queries, character controller | present | `crates/physics` ([physics](06-physics.md)) | A second, non-card game with movement and collision; open worlds; props that fall, roll and swing in any game | P1 (built ahead of M9) |
+| Raycasts and overlaps against scene geometry | present | the renderer's picking against triangles; the physics world's `raycast`, `shape_cast`, `overlap` and `contacts_with` (`crates/physics/src/query.rs`) against its colliders | Placement in the editor, gameplay queries | P0 |
 | Audio engine: buses, mixing, voices, scheduling, streaming, 3D panning | absent | the game's web audio lives in the game | Native apps have no Web Audio; one event-keyed audio system with buses, voice limits per family, music arrangements, ambience beds and ducking for every game | P0 (M7) |
 | Haptics | absent | | Turn and table-feel channels on phones | P1 |
 | Input actions and rebinding | absent | | Keyboard, touch and gamepad mapped to actions; gamepad focus for native and console | P1 |
@@ -154,7 +154,7 @@ Look files, with props, overlays, prop shaders and game lights for game-drawn co
 
 | Platform | Status | Evidence | Next step | Priority |
 | --- | --- | --- | --- | --- |
-| Web (WebGPU, WebGL 2) | partial | `crates/ganbate-web`, `web/ganbate.js`; headless Chromium only | Real devices: iPhone Safari 26, Android Chrome, desktop browsers; device loss; frame traces | P0 |
+| Web (WebGPU, WebGL 2) | partial | `crates/web`, `web/sdk/ganbate.js`; headless Chromium only | Real devices: iPhone Safari 26, Android Chrome, desktop browsers; device loss; frame traces | P0 |
 | Linux (Vulkan, X11) | partial | presented under Xvfb on lavapipe | A hardware GPU run; Wayland | P1 |
 | Windows (Vulkan, Win32) | partial | cross-built; Wine only | A native hardware run; D3D12 is a separate decision | P1 |
 | macOS (Metal, AppKit) | partial | compiled, never run | First hardware run | P1 |

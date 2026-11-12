@@ -1,0 +1,10 @@
+[package]
+name = "ganbate-scene"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "Ganbate's authoring model: scenes, prefabs, component schemas and undoable edits"
+
+[dependencies]
+ganbate-core = { path = "../core" }

@@ -60,8 +60,8 @@ instances and lamps, and carries every component the renderer does not draw. A w
 
 ## 4. Contracts across the boundary
 
-- **Versioned APIs.** The Rust crates and the schema format are versioned; the web library (`web/ganbate.js`,
-  `web/ganbate.d.ts`) and the edit protocol will be in M2 (a `version` constant the library exports, a `protocol` number
+- **Versioned APIs.** The Rust crates and the schema format are versioned; the web library (`web/sdk/ganbate.js`,
+  `web/sdk/ganbate.d.ts`) and the edit protocol will be in M2 (a `version` constant the library exports, a `protocol` number
   in `hello` and `welcome`). Additive changes keep old games working; a breaking change bumps the version and ships
   a migration note.
 - **A game pins the engine.** A web game vendors a built runtime with its engine revision; a native game pins the

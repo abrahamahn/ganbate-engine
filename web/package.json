@@ -1,0 +1,41 @@
+{
+  "name": "@ganbate/engine-web",
+  "version": "0.2.0",
+  "private": true,
+  "description": "Ganbate Engine browser WASM runtime SDK and React + TypeScript WebGPU/WebGL 2 scene player.",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./sdk/ganbate.d.ts",
+      "import": "./sdk/ganbate.js"
+    },
+    "./character-customization": {
+      "types": "./sdk/character-customization.d.mts",
+      "import": "./sdk/character-customization.mjs"
+    },
+    "./graph-session": {
+      "types": "./sdk/graph-session.d.mts",
+      "import": "./sdk/graph-session.mjs"
+    }
+  },
+  "scripts": {
+    "dev": "vite --config vite.config.ts",
+    "build": "vite build --config vite.config.ts",
+    "preview": "vite preview --config vite.config.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --test test/*.test.mjs",
+    "check": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.3.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8"
+  }
+}

@@ -31,27 +31,27 @@ Four rules govern everything in this repository:
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  LAYER 6 · TOOLS, WEB HOST & AGENT CLI                                      │
 │  crates/ganbate-studio + editor/  │  crates/ganbate-agent (`ganbate` CLI)   │
-│  crates/ganbate-web + web/        │  src/bin/ganbate-{build,render,player}  │
+│  crates/web + web/        │  src/bin/ganbate-{build,render,player}  │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  LAYER 5 · RUNTIME PRESENTATION & SIMULATION                                │
 │  src/render/* (Stylized Look renderer, props, shadows, water, sky/weather)  │
 │  src/anim.rs  (GPU skinning, weighted clip poses, sparse CPU facial morphs) │
-│  crates/ganbate-physics (Deterministic 60 Hz rigid bodies, joints, KCC)     │
+│  crates/physics (Deterministic 60 Hz rigid bodies, joints, KCC)     │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  LAYER 4 · SCENE DOCUMENTS & ASSET PIPELINE                                 │
-│  crates/ganbate-scene    (Entities, component schemas, prefabs, op undo)    │
-│  crates/ganbate-pipeline (`ganbate.project.json`, `.meta.json`, scene cook) │
+│  crates/scene    (Entities, component schemas, prefabs, op undo)    │
+│  crates/pipeline (`ganbate.project.json`, `.meta.json`, scene cook) │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  LAYER 3 · SHADER COMPILER & BINARY CODECS                                  │
-│  crates/ganbate-shader (WGSL subset → SPIR-V, MSL, WebGPU WGSL, GLSL ES 3) │
-│  crates/ganbate-assets (GLB loader, PNG/zlib codec, `.gbew` v1–v4 format)   │
+│  crates/shader (WGSL subset → SPIR-V, MSL, WebGPU WGSL, GLSL ES 3) │
+│  crates/assets (GLB loader, PNG/zlib codec, `.gbew` v1–v4 format)   │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  LAYER 2 · UNIFIED GPU RHI & PLATFORM WINDOWS                               │
 │  src/gpu/* → src/vulkan, src/metal, src/gpu/webgpu, src/gpu/webgl           │
 │  src/window/* (X11, Win32, macOS AppKit, iOS UIKit)                         │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  LAYER 1 · PORTABLE CORE                                                    │
-│  crates/ganbate-core (Math, Transform, SHA-256, permanent IDs, canon JSON)  │
+│  crates/core (Math, Transform, SHA-256, permanent IDs, canon JSON)  │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -59,14 +59,14 @@ Four rules govern everything in this repository:
 
 | Path / Crate | Binary / Output | Owns | Touch When… |
 | --- | --- | --- | --- |
-| `crates/ganbate-core` | lib | Permanent 64/128-bit IDs, SHA-256 digests, canonical JSON parser/writer, frame-pacing math, `EntityTable` | Changing IDs, canonical JSON rules, or shared world metadata |
-| `crates/ganbate-shader` | lib + `ganbate-shaderc` example | Custom WGSL subset parser, type checker, reflection, and codegen to SPIR-V, Metal MSL, WebGPU WGSL, and WebGL 2 GLSL ES 3.00 | Adding shader builtins, fixing backend codegen, or extending `ShadeInput` |
-| `crates/ganbate-assets` | lib | Embedded glTF 2.0 (`.glb`) static & skinned model loaders, PNG/zlib decoder, `.gbew` v1–v4 binary world encoder/decoder (`--compact` mesh compression) | Supporting new glTF attributes/codecs or changing `.gbew` wire layout |
-| `crates/ganbate-scene` | lib | `.scene.json` and `.prefab.json` data model, `engine.schema.json`, base-62 sibling ordering, prefab flattening/overrides, invertible `Op` undo/redo | Adding built-in engine component schemas (`camera`, `light`, `rigid_body`, etc.) |
-| `crates/ganbate-pipeline` | lib | `ganbate.project.json` discovery, `.meta.json` sidecar generation/indexing, object-preserving GLB→scene import, cooking scenes into GBEW v4 | Changing project indexing, asset sidecars, or scene cooking |
-| `crates/ganbate-physics` | lib | Deterministic 60 Hz soft-step rigid-body solver (`+`, `-`, `*`, `/`, `sqrt` only), GJK/EPA, shapes, 5 joint types, CCD, ray/shape/overlap queries, character controller | Modifying collision shapes, physics stepping, joints, or character movement |
+| `crates/core` | lib | Permanent 64/128-bit IDs, SHA-256 digests, canonical JSON parser/writer, frame-pacing math, `EntityTable` | Changing IDs, canonical JSON rules, or shared world metadata |
+| `crates/shader` | lib + `ganbate-shaderc` example | Custom WGSL subset parser, type checker, reflection, and codegen to SPIR-V, Metal MSL, WebGPU WGSL, and WebGL 2 GLSL ES 3.00 | Adding shader builtins, fixing backend codegen, or extending `ShadeInput` |
+| `crates/assets` | lib | Embedded glTF 2.0 (`.glb`) static & skinned model loaders, PNG/zlib decoder, `.gbew` v1–v4 binary world encoder/decoder (`--compact` mesh compression) | Supporting new glTF attributes/codecs or changing `.gbew` wire layout |
+| `crates/scene` | lib | `.scene.json` and `.prefab.json` data model, `engine.schema.json`, base-62 sibling ordering, prefab flattening/overrides, invertible `Op` undo/redo | Adding built-in engine component schemas (`camera`, `light`, `rigid_body`, etc.) |
+| `crates/pipeline` | lib | `ganbate.project.json` discovery, `.meta.json` sidecar generation/indexing, object-preserving GLB→scene import, cooking scenes into GBEW v4 | Changing project indexing, asset sidecars, or scene cooking |
+| `crates/physics` | lib | Deterministic 60 Hz soft-step rigid-body solver (`+`, `-`, `*`, `/`, `sqrt` only), GJK/EPA, shapes, 5 joint types, CCD, ray/shape/overlap queries, character controller | Modifying collision shapes, physics stepping, joints, or character movement |
 | `src/` (`ganbate-engine` root) | lib | Unified RHI (`src/gpu/`), Vulkan/Metal/WebGPU/WebGL 2 backends, stylized `Look` renderer (`src/render/`), GPU skinning & morphs (`src/anim.rs`), native windowing (`src/window/`) | Changing rendering passes, Look parameters, dynamic props, lights, or GPU backends |
-| `crates/ganbate-web` + `web/` | `ganbate_web.wasm`, `ganbate.js`, `ganbate.d.ts` | Browser WASM runtime (`ganbate_rt_*` exports) and JS/TS wrapper supporting standalone viewer mode and `createEngine()` library mode | Adding or updating methods exposed to TypeScript web games or the Studio viewport |
+| `crates/web` + `web/` | `ganbate_web.wasm`, `ganbate.js`, `ganbate.d.ts` | Browser WASM runtime (`ganbate_rt_*` exports) and JS/TS wrapper supporting standalone viewer mode and `createEngine()` library mode | Adding or updating methods exposed to TypeScript web games or the Studio viewport |
 | `crates/ganbate-studio` + `editor/` | `ganbate-studio` (`:7480`) | Local Rust HTTP + WebSocket project server (`crates/ganbate-studio`) and browser UI (`editor/studio.js`, Asset Library, Outliner, Inspector, Viewport gizmos) | Adding editor panels, gizmos, asset previews, rescan rules, or `project-tools.json` hooks |
 | `crates/ganbate-agent` | `ganbate` | Single-line JSON CLI (`scene inspect`, `validate`, `apply`, `undo`, `diff`, `render`) + `.ganbate/history/` undo journals | Extending AI-agent scene editing, validation, or headless verification |
 | `src/bin/ganbate-build.rs` | `ganbate-build` | Asset CLI (`import`, `cook`, `cook-scene`, `inspect`, `model`, `simulate`) | Adding offline asset build/cook subcommands |

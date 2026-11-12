@@ -1,0 +1,10 @@
+[package]
+name = "ganbate-physics"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+description = "Ganbate's rigid-body physics: shapes, collision, a soft-step solver, joints, queries and a character controller"
+
+[dependencies]
+ganbate-core = { path = "../core" }

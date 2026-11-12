@@ -1,7 +1,7 @@
 //! Uncapped offscreen throughput on the selected Vulkan driver, plus optional `--compute`
 //! microbenchmarks for physics, work-stealing SIMD culling, BC/ASTC texture compression, and JSON.
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]
-#[path = "../../samples/observatory/scene.rs"]
+#[path = "../../examples/common/gallery.rs"]
 mod demo;
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "android"))]

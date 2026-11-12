@@ -68,8 +68,9 @@ function parseArgs(argv) {
   return opts;
 }
 
-const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.wasm': 'application/wasm',
-  '.json': 'application/json', '.png': 'image/png', '.gbew': 'application/octet-stream' };
+const TYPES = { '.html': 'text/html', '.css': 'text/css', '.js': 'text/javascript',
+  '.mjs': 'text/javascript', '.wasm': 'application/wasm', '.json': 'application/json',
+  '.png': 'image/png', '.svg': 'image/svg+xml', '.gbew': 'application/octet-stream' };
 
 function serve(dist, assets, gzipped) {
   const server = http.createServer((req, res) => {

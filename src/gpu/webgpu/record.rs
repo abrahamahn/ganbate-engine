@@ -221,8 +221,8 @@ impl Gpu<'_> {
                     self.record_pass(e, desc, &commands[i + 1..end], out, ring, acquired)?;
                     i = end;
                 }
-                Command::Transfer(idx) => match &e.transfers[idx as usize] {
-                    &TransferCmd::Dispatch {
+                Command::Transfer(idx) => match e.transfers[idx as usize] {
+                    TransferCmd::Dispatch {
                         pipeline,
                         groups,
                         push,
@@ -235,14 +235,14 @@ impl Gpu<'_> {
                         out,
                         ring,
                     )?,
-                    &TransferCmd::CopyTextureToBuffer {
+                    TransferCmd::CopyTextureToBuffer {
                         src,
                         mip,
                         layer,
                         dst,
                         offset,
                     } => self.record_texture_copy((src, mip, layer), dst, offset, out, acquired)?,
-                    &TransferCmd::CopyBufferToBuffer {
+                    TransferCmd::CopyBufferToBuffer {
                         src,
                         src_offset,
                         dst,
@@ -251,7 +251,7 @@ impl Gpu<'_> {
                     } => {
                         self.record_buffer_copy((src, src_offset), (dst, dst_offset), size, out)?
                     }
-                    &TransferCmd::Blit { src, dst, filter } => {
+                    TransferCmd::Blit { src, dst, filter } => {
                         self.record_blit(src, dst, filter, out, acquired)?
                     }
                 },

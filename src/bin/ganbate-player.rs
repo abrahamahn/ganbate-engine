@@ -1,6 +1,6 @@
 //! Minimal standalone player. The example scene is also used by the offscreen oracle.
 #[cfg(any(target_os = "linux", target_os = "windows"))]
-#[path = "../../samples/observatory/scene.rs"]
+#[path = "../../examples/common/gallery.rs"]
 mod demo;
 
 #[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]

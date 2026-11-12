@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { createGraphSession, windowChannel } from '../graph-session.mjs';
+import { createGraphSession, windowChannel } from '../sdk/graph-session.mjs';
 
 // A stand-in for the engine's solver: graph-level operations only, the text as the digest.
 const engine = {

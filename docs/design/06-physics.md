@@ -1,6 +1,6 @@
 # Physics
 
-Ganbate implements rigid-body physics in `crates/ganbate-physics`, with no dependency beyond `ganbate-core`. A soft-step
+Ganbate implements rigid-body physics in `crates/physics`, with no dependency beyond `ganbate-core`. A soft-step
 solver advances the world in fixed time slices. Native and WebAssembly builds are designed to produce identical
 poses and velocities for the same inputs. Authors attach `rigid_body` and `collider` components to scene entities
 in Ganbate Studio. The scene cook writes them into the world's entity table.
@@ -96,7 +96,7 @@ own sweeps see triangles from both sides.
 
 ## 5. Authoring and runtime
 
-`rigid_body` and `collider` are engine components defined in `crates/ganbate-scene/src/engine.schema.json`, with
+`rigid_body` and `collider` are engine components defined in `crates/scene/src/engine.schema.json`, with
 Korean labels. A collider belongs to the nearest rigid body on its entity or an ancestor. With no such body it
 becomes static scenery. A child collider forms part of a compound body, and its instances and lamps move with
 that body.
