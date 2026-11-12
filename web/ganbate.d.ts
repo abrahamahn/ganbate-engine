@@ -23,7 +23,10 @@ export interface CreateEngineOptions {
    * on Apple's WebKit.
    */
   readonly present?: 'auto' | 'direct' | 'settled';
-  /** WebGPU replays repeated passes from render bundles (the default); false encodes every pass. */
+  /**
+   * WebGPU replays repeated passes from render bundles (the default, but on Apple's WebKit, which
+   * refuses some of them); false encodes every pass.
+   */
   readonly bundles?: boolean;
   /** A cooked `.gbew` world: URL or bytes. Omit for a scene of props only. */
   readonly world?: string | ArrayBuffer | Uint8Array;

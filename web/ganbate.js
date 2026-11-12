@@ -2035,7 +2035,10 @@ async function boot(options) {
     onError: fail,
     checkErrors: !!options.checkErrors,
     settled,
-    bundles: options.bundles !== false,
+    // Safari refuses some of the engine's render bundles as it records them ("setPipeline:
+    // validation failed"); every frame replaying one is then refused whole, and the table freezes
+    // between the few frames drawn after the bundle cache empties. Apple's WebKit encodes every pass.
+    bundles: options.bundles ?? !appleWebKit(),
   };
   const host = gpu.api === 'webgl2' ? createGlHost(gpu, hostOptions) : createHost(gpu, hostOptions);
   onPhase('Loading the engine', 0);
