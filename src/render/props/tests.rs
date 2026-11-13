@@ -180,6 +180,7 @@ fn instance_entry(mesh: PropMesh, material: PropMaterial) -> InstanceEntry {
         world_bounds: None,
         modelled: ([0.0; 3], [0.0; 3]),
         cached: None,
+        live: None,
         shadow: ShadowTrack::default(),
     }
 }

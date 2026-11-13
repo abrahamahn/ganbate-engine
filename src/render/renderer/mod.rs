@@ -241,6 +241,13 @@ pub struct FrameStats {
     /// The fused tone-map output graded each pixel once, in a pass of its own
     /// ([`Renderer::set_grade_once`]).
     pub graded_once: bool,
+    /// The ambient occlusion was kept from the last frame and computed again only where what it
+    /// reads changed and on the water (false: computed whole, or not at all).
+    pub ao_kept: bool,
+    /// Pixels of the CPU changed regions (`union_area(&ao_regions)`) when `ao_kept` is true,
+    /// `width * height` when >= 50% CPU region coverage triggers the whole-pass fallback, or 0
+    /// when skipped or drawn whole from scratch.
+    pub ao_changed_pixels: u32,
 }
 
 /// Where the final pass writes.
@@ -319,6 +326,9 @@ pub(in crate::render) struct Pipelines {
     flower: PipelineId,
     sky: PipelineId,
     particle: PipelineId,
+    ao_grass_tile: PipelineId,
+    ao_grass_union: PipelineId,
+    ao_grass_coarse: PipelineId,
     ssao: PipelineId,
     air: PipelineId,
     bloom_down: PipelineId,
@@ -360,8 +370,18 @@ pub(in crate::render) struct Targets {
     refl_depth: TextureId,
     refl_cleared: bool,
     ao: (u32, u32),
+    /// The AO, kept from frame to frame while what it was computed for (`ao_for`) holds.
     ao_tex: TextureId,
+    ao_for: Option<u64>,
     ao_cleared: bool,
+    /// Hierarchical 1/8-scale and 1/64-scale visible-grass coverage masks (`Format::R8Unorm`).
+    ao_grass: [TextureId; 2],
+    ao_grass_cur: usize,
+    ao_grass_valid: [bool; 2],
+    ao_grass_time: u32,
+    ao_grass_sway: u32,
+    ao_grass_union: TextureId,
+    ao_grass_coarse: TextureId,
     lit: TextureId,
     bloom: TextureId,
     bloom_size: (u32, u32),
@@ -396,7 +416,12 @@ pub(in crate::render) struct Slot {
     /// `fs_reshade_mask`'s group and its `Reshade` block.
     mask: BindGroupId,
     reshade: BufferId,
+    ao_grass_tile: BindGroupId,
+    ao_grass_union: BindGroupId,
+    ao_grass_coarse: BindGroupId,
+    /// `fs_ssao`'s group and its `AoChanged` block.
     ssao: BindGroupId,
+    ao_changed: BufferId,
     air: BindGroupId,
     down: Vec<BindGroupId>,
     up: Vec<BindGroupId>,
@@ -740,6 +765,7 @@ mod cache;
 mod encode;
 mod lifecycle;
 mod pipelines;
+mod ssao;
 #[cfg(test)]
 mod tests;
 
@@ -747,3 +773,4 @@ use cache::*;
 pub use pipelines::compose_shader;
 use pipelines::*;
 pub(in crate::render) use pipelines::{prop_shader_pipeline, prop_shader_stage};
+use ssao::*;

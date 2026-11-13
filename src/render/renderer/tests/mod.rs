@@ -1420,20 +1420,37 @@ fn cached_frames_match_frames_drawn_whole() {
     };
 
     frame(&mut device, 0.0, 0.0);
-    // The pawn moves every frame and the table settles: the maps are kept.
+    // The pawn moves every frame and the table settles: the maps are kept, and the AO is
+    // kept and computed again around the pawn (falling back to whole AO on frame 8 when the
+    // wide table settles across >= 50% of the view).
     for k in 1..12 {
         let stats = frame(&mut device, 0.0, k as f32 * 1e-3).0;
         assert!(stats.prop_shadows_kept && !stats.reshaded, "frame {k}");
+        if k == 8 {
+            assert!(
+                !stats.ao_kept && stats.ssao_drawn && stats.ao_changed_pixels == w * h,
+                "frame {k}: {stats:?}"
+            );
+        } else {
+            assert!(
+                stats.ao_kept && stats.ssao_drawn && stats.ao_changed_pixels > 0,
+                "frame {k}: {stats:?}"
+            );
+        }
     }
     // The figure re-posed by a hair (a twentieth of a millimetre) every frame: drawn again.
     for k in 1..6 {
         let stats = frame(&mut device, k as f32 * 5e-5, 0.0).0;
         assert!(!stats.prop_shadows_kept, "hair {k}");
     }
-    // Resting where the maps were last drawn, it settles into the cached picture under them.
+    // Resting where the maps were last drawn, it settles into the cached picture under them;
+    // then nothing the AO reads changes, and the AO stands as kept without a pass.
     for k in 0..12 {
         let stats = frame(&mut device, 25e-5, 0.0).0;
         assert!(stats.prop_shadows_kept && !stats.reshaded, "rest {k}");
+        assert!(stats.ao_kept);
+        // Both have settled into the picture by the ninth frame.
+        assert!(k < 9 || !stats.ssao_drawn, "rest {k}");
     }
     // Moved a long way, its shadow moves over the cached picture, shaded again.
     let before = frame(&mut device, 25e-5, 0.0).1;
@@ -2360,3 +2377,5 @@ fn reshade_plan_cost() {
         );
     }
 }
+
+mod ssao;

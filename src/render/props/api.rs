@@ -634,6 +634,7 @@ impl Renderer {
             world_bounds: None,
             modelled: ([0.0; 3], [0.0; 3]),
             cached: None,
+            live: None,
             shadow: ShadowTrack::default(),
         };
         Ok(PropInstance(self.props.instances.insert(entry)?))
@@ -1490,6 +1491,7 @@ impl Renderer {
         self.props.placed.clear();
         self.props.vacated.clear();
         self.props.vacated_boxes.clear();
+        self.props.vacated_live.clear();
         self.props.texture_edits.clear();
         self.forget_world_cache();
     }

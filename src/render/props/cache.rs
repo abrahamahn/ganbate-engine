@@ -201,6 +201,43 @@ pub(in crate::render) fn screen_rect(
     (r[0] < r[2] && r[1] < r[3]).then_some(r)
 }
 
+/// The pixels a box can cover in a `size` picture seen through `view_proj`, widened by `margin`
+/// pixels: its corners in front of the eye and where its edges cross the plane just before it,
+/// projected (nothing behind it is drawn). `None` when that is no pixel.
+pub(in crate::render) fn box_rect(
+    (lo, hi): (V3, V3),
+    view_proj: &M4,
+    size: (u32, u32),
+    margin: f32,
+) -> Option<Rect> {
+    const FRONT: f32 = 1e-4;
+    let clip = corners((lo, hi)).map(|p| math::transform(view_proj, [p[0], p[1], p[2], 1.0]));
+    let mut points: Vec<[f32; 4]> = clip.iter().copied().filter(|c| c[3] >= FRONT).collect();
+    for i in 0..8 {
+        for j in [1, 2, 4].map(|bit| i | bit).into_iter().filter(|&j| j != i) {
+            let (a, b) = (clip[i], clip[j]);
+            if (a[3] < FRONT) != (b[3] < FRONT) {
+                let f = (FRONT - a[3]) / (b[3] - a[3]);
+                points.push(std::array::from_fn(|k| a[k] + (b[k] - a[k]) * f));
+            }
+        }
+    }
+    let (w, h) = (size.0 as f32, size.1 as f32);
+    let (mut lo, mut hi) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+    for c in &points {
+        let p = [(c[0] / c[3] * 0.5 + 0.5) * w, (c[1] / c[3] * 0.5 + 0.5) * h];
+        lo = [lo[0].min(p[0]), lo[1].min(p[1])];
+        hi = [hi[0].max(p[0]), hi[1].max(p[1])];
+    }
+    let r = [
+        (lo[0] - margin).floor().clamp(0.0, w) as u32,
+        (lo[1] - margin).floor().clamp(0.0, h) as u32,
+        (hi[0] + margin).ceil().clamp(0.0, w) as u32,
+        (hi[1] + margin).ceil().clamp(0.0, h) as u32,
+    ];
+    (r[0] < r[2] && r[1] < r[3]).then_some(r)
+}
+
 pub(in crate::render) fn corners((lo, hi): (V3, V3)) -> [V3; 8] {
     std::array::from_fn(|c| {
         [
@@ -239,6 +276,10 @@ pub(in crate::render) struct CacheChanges {
     pub(in crate::render) moved: Vec<(V3, V3)>,
     /// The bounds of the props the picture holds.
     pub(in crate::render) settled: Vec<(V3, V3)>,
+    /// Where the props drawn over the picture changed the frame's depth and normals since the
+    /// last frame: the pixels each one that changed (moved, came or went, settled or woke)
+    /// covered then and covers now.
+    pub(in crate::render) live: Vec<Rect>,
     /// A caster came, went, changed as a whole or moved across a shadow map it lands in (by
     /// `drift_texels` of the finest or more) since the maps were drawn: they are drawn again.
     /// Otherwise the maps and the picture keep it as they were.
@@ -283,6 +324,7 @@ pub(in crate::render) fn track_cached_props(
 ) -> CacheChanges {
     let mut regions = std::mem::take(&mut props.vacated);
     let mut moved = std::mem::take(&mut props.vacated_boxes);
+    let mut live = std::mem::take(&mut props.vacated_live);
     let mut casters_moved = !moved.is_empty();
     let mut settled = vec![];
     let Props {
@@ -294,8 +336,20 @@ pub(in crate::render) fn track_cached_props(
     for (_, inst) in instances.iter_mut() {
         let Some(mat) = materials.get(inst.material.0) else {
             regions.extend(inst.cached.take());
+            live.extend(inst.live.take());
             continue;
         };
+        // Drawn over the picture, it writes the frame's depth and normals where it stands; they
+        // change where it changed (its signature, `still` 0) or came, went, settled or woke.
+        let drawn_live = inst
+            .world_bounds
+            .filter(|_| mat.layer() == Layer::Opaque && !settles(inst, mat))
+            .and_then(|b| box_rect(b, view.view_proj, view.size, 2.0));
+        if !full && (inst.still == 0 || drawn_live != inst.live) {
+            live.extend(inst.live);
+            live.extend(drawn_live);
+        }
+        inst.live = drawn_live;
         if settles(inst, mat) {
             if full || inst.cached.is_none() {
                 let image = inst
@@ -338,10 +392,12 @@ pub(in crate::render) fn track_cached_props(
         };
     }
     regions.retain(|r| r[0] < r[2] && r[1] < r[3]);
+    live.retain(|r| r[0] < r[2] && r[1] < r[3]);
     CacheChanges {
         regions,
         moved: merge_boxes(moved),
         settled,
+        live,
         casters_moved,
     }
 }
@@ -596,6 +652,8 @@ pub(in crate::render) struct Props {
     /// Where the shadow maps hold casters destroyed since they were drawn (their shadows are
     /// drawn away).
     pub(super) vacated_boxes: Vec<(V3, V3)>,
+    /// Where instances destroyed since the last frame were drawn over the cached picture.
+    pub(super) vacated_live: Vec<Rect>,
     /// Every skinned mesh's vertices' joints and weights, packed in mesh order of creation.
     pub(super) skin_records: Vec<[f32; 4]>,
     /// Their GPU copy (and how many records it holds), rewritten when `skin_dirty`.
@@ -727,6 +785,7 @@ impl Props {
         if let Some(i) = self.instances.remove(id) {
             self.vacated.extend(i.cached);
             self.vacated_boxes.extend(i.shadow.drawn.map(|d| d.bounds));
+            self.vacated_live.extend(i.live);
             self.release_joints(i.joints);
         }
     }

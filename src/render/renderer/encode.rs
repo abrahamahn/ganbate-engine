@@ -576,6 +576,7 @@ impl Renderer {
             self.world_drawn = false;
             self.static_shadows_vp = None;
             self.ground_cached_vp = None;
+            self.forget_ao();
             self.ao_quiet_frames = 0;
         } else {
             self.ao_quiet_frames = self.ao_quiet_frames.saturating_add(1);
@@ -743,10 +744,12 @@ impl Renderer {
             .collect();
         // The props the cached picture holds, and the regions of it to draw again: where props
         // settled or left, and where the shadows of casters moved over it.
+        let prev_ao = self.take_ao_state();
         let CacheChanges {
             regions,
             moved,
             settled,
+            live,
             casters_moved,
         } = if cached {
             let view = CacheView {
@@ -1003,11 +1006,6 @@ impl Renderer {
             enc.end_pass();
         }
 
-        let need_ao_clear = self.quality.ao_samples == 0 && !self.targets.ao_cleared;
-        if need_ao_clear {
-            self.targets.ao_cleared = true;
-        }
-
         let slot = &self.slots[slot_index];
         let t = &self.targets;
         let p = &self.pipelines;
@@ -1209,11 +1207,15 @@ impl Renderer {
             enc.set_pipeline(p.scene_opaque);
             enc.set_bind_group(0, slot.scene[0]);
         }
-        count(self.draw_world(enc, &mut push, &eye, true, WorldPart::Water, None));
+        let water_draws = self.draw_world(enc, &mut push, &eye, true, WorldPart::Water, None);
+        count(water_draws);
         split(enc);
         enc.set_pipeline(p.scene);
         enc.set_bind_group(0, slot.scene[0]);
-        count(self.draw_world(enc, &mut push, &eye, true, WorldPart::MaskedWater, None));
+        let masked_water_draws =
+            self.draw_world(enc, &mut push, &eye, true, WorldPart::MaskedWater, None);
+        count(masked_water_draws);
+        let water_drawn = water_draws.1 > 0 || masked_water_draws.1 > 0 || self.has_water_props();
 
         stats.world_cached = cached && !rebuild;
         stats.world_draws_total = total_draws;
@@ -1275,23 +1277,26 @@ impl Renderer {
         let l = &self.look;
         let px_scale = t.height as f32 / 1080.0;
         // Ambient occlusion (skipped when `ao_samples == 0`, relying on baked vertex AO).
-        if self.quality.ao_samples > 0 {
-            stats.ssao_drawn = true;
-            let mut pc = [0.0f32; 16];
-            pc[..4].copy_from_slice(&[
-                l.ao_radius,
-                self.quality.ao_samples as f32,
-                t.ao.0 as f32,
-                t.ao.1 as f32,
-            ]);
-            Self::post_pass(enc, t.ao_tex, 0, Load::DontCare, p.ssao, slot.ssao, pc);
-        } else if need_ao_clear {
-            enc.begin_pass(PassDesc {
-                colors: vec![Attachment::clear(t.ao_tex, [1.0; 4])],
-                depth: None,
-            });
-            enc.end_pass();
-        }
+        let ao_next = self.encode_ao(
+            device,
+            enc,
+            slot_index,
+            AoEncodeInput {
+                prev: prev_ao,
+                cached,
+                rebuild,
+                world_key,
+                eye: &eye,
+                size,
+                seed,
+                seconds: env.seconds,
+                cache_regions: &regions,
+                live_regions: &live,
+                water_drawn,
+                grass_drawn: blades > 0,
+            },
+            &mut stats,
+        )?;
         // Air.
         let mut pc = [0.0f32; 16];
         pc[..4].copy_from_slice(&[
@@ -1452,6 +1457,7 @@ impl Renderer {
         if let (Output::Still, Some(still), Some(rb)) = (self.output, t.still, t.readback) {
             enc.copy_texture_to_buffer(still, 0, 0, rb, 0);
         }
+        self.commit_ao_state(ao_next);
         self.stats = stats;
         Ok(())
     }

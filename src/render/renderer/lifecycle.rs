@@ -193,12 +193,14 @@ impl Renderer {
     /// Draws the cached picture afresh next frame.
     pub(in crate::render) fn forget_world_cache(&mut self) {
         self.world_cache = None;
+        self.forget_ao();
     }
     pub fn set_look(&mut self, look: Look) {
         (self.details, self.grassy) = material_details(&look, &self.scene);
         self.look = look;
         self.world_drawn = false;
         self.world_cache = None;
+        self.forget_ao();
         self.ground_cached_vp = None;
         self.lut_dirty = true;
         self.restyle_props();
@@ -229,6 +231,7 @@ impl Renderer {
     pub fn import_ao(&mut self, device: &mut Device<'_>, data: &[u8]) -> Result<()> {
         self.scene.import_ao(device, data)?;
         self.world_cache = None;
+        self.forget_ao();
         Ok(())
     }
 
@@ -289,6 +292,7 @@ impl Renderer {
         };
         let refl = scaled(q.reflection_scale);
         let ao = scaled(q.ao_scale);
+        let ((gw, gh), (cw, ch)) = ao_grass_sizes((width, height));
         let bloom_size = ((width / 2).max(1), (height / 2).max(1));
         let max_levels = 32 - bloom_size.0.min(bloom_size.1).leading_zeros();
         let bloom_levels = q.bloom_levels.clamp(1, max_levels.max(1));
@@ -327,7 +331,18 @@ impl Renderer {
             refl_cleared: false,
             ao,
             ao_tex: tex(device, ao.0, ao.1, Format::R16Float, rt)?,
+            ao_for: None,
             ao_cleared: false,
+            ao_grass: [
+                tex(device, gw, gh, Format::R8Unorm, rt)?,
+                tex(device, gw, gh, Format::R8Unorm, rt)?,
+            ],
+            ao_grass_cur: 0,
+            ao_grass_valid: [false; 2],
+            ao_grass_time: 0,
+            ao_grass_sway: 0,
+            ao_grass_union: tex(device, gw, gh, Format::R8Unorm, rt)?,
+            ao_grass_coarse: tex(device, cw, ch, Format::R8Unorm, rt)?,
             lit: tex(device, width, height, HDR, rt)?,
             bloom: device.create_texture(&TextureDesc {
                 width: bloom_size.0,
@@ -442,6 +457,8 @@ impl Renderer {
         let (frame, tiles, index) = (pair(frame), pair(tiles), pair(index));
         let (scene, sky) = (pair(scene), pair(sky));
         let (grass, flower, particle) = (blades[0], blades[1], blades[2]);
+        let ao_changed = upload(device, AO_CHANGED_BYTES, BufferUsage::UNIFORM)?;
+        device.write_buffer(ao_changed, 0, &[0; 32])?;
         let post = |d: &mut Device<'_>, pipe, src: Resource, extra: Resource| {
             d.create_bind_group(
                 pipe,
@@ -453,6 +470,7 @@ impl Renderer {
                     (3, src),
                     (4, extra),
                     (5, Resource::Sampler(self.linear_clamp)),
+                    (7, buf(ao_changed)),
                 ],
             )
         };
@@ -485,7 +503,25 @@ impl Renderer {
                 (18, Resource::Texture(t.cache_shadow)),
             ],
         )?;
-        let ssao = post(device, p.ssao, none, none)?;
+        let ao_grass_tile = post(device, p.ao_grass_tile, none, none)?;
+        let ao_grass_union = post(
+            device,
+            p.ao_grass_union,
+            Resource::Texture(t.ao_grass[0]),
+            Resource::Texture(t.ao_grass[1]),
+        )?;
+        let ao_grass_coarse = post(
+            device,
+            p.ao_grass_coarse,
+            Resource::Texture(t.ao_grass_union),
+            none,
+        )?;
+        let ssao = post(
+            device,
+            p.ssao,
+            Resource::Texture(t.ao_grass_coarse),
+            Resource::Texture(t.ao_grass_union),
+        )?;
         let air = post(
             device,
             p.air,
@@ -566,7 +602,11 @@ impl Renderer {
             restore,
             mask,
             reshade,
+            ao_grass_tile,
+            ao_grass_union,
+            ao_grass_coarse,
             ssao,
+            ao_changed,
             air,
             down,
             up,
@@ -587,7 +627,16 @@ impl Renderer {
                 .chain(s.sky)
                 .chain(s.water.map(|w| w.0))
                 .chain([
-                    s.grass, s.flower, s.particle, s.restore, s.mask, s.ssao, s.air,
+                    s.grass,
+                    s.flower,
+                    s.particle,
+                    s.restore,
+                    s.mask,
+                    s.ao_grass_tile,
+                    s.ao_grass_union,
+                    s.ao_grass_coarse,
+                    s.ssao,
+                    s.air,
                 ])
                 .chain(s.tonemap_output)
                 .chain(
@@ -607,7 +656,7 @@ impl Renderer {
                 .into_iter()
                 .chain(s.tiles)
                 .chain(s.index)
-                .chain([s.reshade])
+                .chain([s.reshade, s.ao_changed])
                 .chain(s.water.map(|w| w.1))
             {
                 device.destroy_buffer(b);
@@ -629,6 +678,10 @@ impl Renderer {
             old.refl_aux,
             old.refl_depth,
             old.ao_tex,
+            old.ao_grass[0],
+            old.ao_grass[1],
+            old.ao_grass_union,
+            old.ao_grass_coarse,
             old.lit,
             old.bloom,
             old.ldr,

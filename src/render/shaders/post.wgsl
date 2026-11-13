@@ -88,18 +88,227 @@ const KERNEL = array<vec3f, 16>(
   vec3f(-0.4776, 0.2847, 0.0271)
 );
 
-// pc.a = (radius metres, samples, ao width, ao height)
+// Visible grass and flowers per 8 x 8 pixel tile of the picture (`ao_grass`): exclusively
+// `fs_grass` and `fs_flower` write `aux = (0, 1, 0, 0)` at `depth > 0`.
+@fragment fn fs_ao_grass_tile(in: Screen) -> @location(0) vec4f {
+  let base = vec2i(in.clip.xy) * 8;
+  let end = min(base + vec2i(8), vec2i(frame.viewport.xy));
+  for (var y = base.y; y < end.y; y++) {
+    for (var x = base.x; x < end.x; x++) {
+      let p = vec2i(x, y);
+      let aux = textureLoad(aux_tex, p, 0);
+      if (aux.y > 0.5 && aux.w <= 0.0 && textureLoad(depth_tex, p, 0) > 0.0) {
+        return vec4f(1.0);
+      }
+    }
+  }
+  return vec4f(0.0);
+}
+
+// Union of last frame's and this frame's 1/8-scale grass tile masks (`pc.a.xy = (use_0, use_1)`).
+@fragment fn fs_ao_grass_union(in: Screen) -> @location(0) vec4f {
+  let p = vec2i(in.clip.xy);
+  if (pc.a.x > 0.5) {
+    if (textureLoad(src_tex, p, 0).r > 0.5) {
+      return vec4f(1.0);
+    }
+  }
+  if (pc.a.y > 0.5) {
+    if (textureLoad(extra_tex, p, 0).r > 0.5) {
+      return vec4f(1.0);
+    }
+  }
+  return vec4f(0.0);
+}
+
+// 1/64-scale coarse grass mask (`ao_grass_coarse`): 1 where any 8 x 8 block of fine tiles has grass.
+@fragment fn fs_ao_grass_coarse(in: Screen) -> @location(0) vec4f {
+  let base = vec2i(in.clip.xy) * 8;
+  let end = min(base + vec2i(8), vec2i(textureDimensions(src_tex)));
+  for (var y = base.y; y < end.y; y++) {
+    for (var x = base.x; x < end.x; x++) {
+      if (textureLoad(src_tex, vec2i(x, y), 0).r > 0.5) {
+        return vec4f(1.0);
+      }
+    }
+  }
+  return vec4f(0.0);
+}
+
+// The regions of the picture whose depth or aux may differ from those the AO kept in its target
+// was computed from (`Renderer::encode`), in pixels: left, top, right, bottom (exclusive).
+struct AoChanged {
+  head: vec4f,              // regions, the farthest a kernel point lies from its surface point
+                            // (in radii), unused, unused
+  rows: vec4f,              // the lengths of the xyz of view_proj's x, y and w rows, unused
+  rects: array<vec4f, 16>,
+};
+@group(0) @binding(7) var<uniform> ao_changed: AoChanged;
+
+// Every changed region (bits).
+fn ao_all_regions() -> u32 {
+  return (1u << u32(ao_changed.head.x)) - 1u;
+}
+
+// Whether pixel `q` lies in one of the changed regions marked in `regions` (bits), taken lowest
+// bit first.
+fn ao_changed_at(q: vec2i, regions: u32) -> bool {
+  let p = vec2f(q);
+  var m = regions;
+  while (m != 0u) {
+    let low = m & (0u - m);
+    let r = ao_changed.rects[countOneBits(low - 1u)];
+    if (all(p >= r.xy) && all(p < r.zw)) {
+      return true;
+    }
+    m = m ^ low;
+  }
+  return false;
+}
+
+// Whether pixel `q`'s 8 x 8 tile held visible grass on the last frame or this frame
+// (`extra_tex` = `ao_grass_union` in `fs_ssao`).
+fn grass_fine_at(q: vec2i) -> bool {
+  return textureLoad(extra_tex, q >> vec2u(3u), 0).r > 0.5;
+}
+
+struct AoReach {
+  a: vec2f,
+  z: vec2f,
+  near_eye: bool,
+};
+
+// Screen box `[a, z]` the kernel ball around `p` (`radius` times the kernel's reach) can span,
+// each clip coordinate moving by at most its row's length times the ball's radius, widened by
+// a pixel.
+fn ao_reach(p: vec3f, radius: f32) -> AoReach {
+  let c = frame.view_proj * vec4f(p, 1.0);
+  let reach = ao_changed.rows.xyz * (radius * ao_changed.head.y);
+  let w0 = c.w - reach.z;
+  let full = frame.viewport.xy;
+  var o: AoReach;
+  if (w0 <= 1e-3) {
+    o.a = vec2f(0.0);
+    o.z = full;
+    o.near_eye = true;
+    return o;
+  }
+  let w1 = c.w + reach.z;
+  let lo = c.xy - reach.xy;
+  let hi = c.xy + reach.xy;
+  o.a = clamp((min(lo / w0, lo / w1) * 0.5 + 0.5) * full, vec2f(0.0), full - 1.0) - 1.0;
+  o.z = clamp((max(hi / w0, hi / w1) * 0.5 + 0.5) * full, vec2f(0.0), full - 1.0) + 1.0;
+  o.near_eye = false;
+  return o;
+}
+
+fn ao_regions_met(reach: AoReach) -> u32 {
+  if (reach.near_eye) {
+    return ao_all_regions();
+  }
+  var met = 0u;
+  for (var i = 0u; i < u32(ao_changed.head.x); i++) {
+    let r = ao_changed.rects[i];
+    if (all(reach.a < r.zw) && all(r.xy <= reach.z)) {
+      met = met | (1u << i);
+    }
+  }
+  return met;
+}
+
+// Whether any 64 x 64 coarse grass tile (`src_tex` = `ao_grass_coarse` in `fs_ssao`) in
+// `reach` held visible grass on the last frame or this frame.
+fn grass_coarse_met(reach: AoReach) -> bool {
+  let full = frame.viewport.xy;
+  let lo = vec2i(max(reach.a, vec2f(0.0))) >> vec2u(6u);
+  let hi = vec2i(clamp(reach.z, vec2f(0.0), full - 1.0)) >> vec2u(6u);
+  for (var cy = lo.y; cy <= hi.y; cy++) {
+    for (var cx = lo.x; cx <= hi.x; cx++) {
+      if (textureLoad(src_tex, vec2i(cx, cy), 0).r > 0.5) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+fn ao_kernel_clip(p: vec3f, t: vec3f, b: vec3f, n: vec3f, radius: f32, i: i32) -> vec4f {
+  let k = KERNEL[i % 16];
+  let s = p + (t * k.x + b * k.y + n * (k.z + 0.08)) * radius;
+  return frame.view_proj * vec4f(s, 1.0);
+}
+
+fn ao_kernel_px(c: vec4f) -> vec2i {
+  let suv = c.xy / c.w * 0.5 + vec2f(0.5);
+  let size = vec2i(frame.viewport.xy);
+  return clamp(vec2i(suv * frame.viewport.xy), vec2i(0), size - vec2i(1));
+}
+
+fn ao_reads_changed(
+  p: vec3f,
+  t: vec3f,
+  b: vec3f,
+  n: vec3f,
+  radius: f32,
+  count: i32,
+  regions: u32,
+  grs_hit: bool,
+) -> bool {
+  for (var i = 0; i < count; i++) {
+    let c = ao_kernel_clip(p, t, b, n, radius, i);
+    if (c.w <= 1e-4) {
+      return true;
+    }
+    let sp = ao_kernel_px(c);
+    if ((regions != 0u && ao_changed_at(sp, regions)) || (grs_hit && grass_fine_at(sp))) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// pc.a = (radius metres, samples, ao width, ao height), pc.b = (kept, grass_active, 0, 0):
+// when `kept` (`pc.b.x > 0.5`), the target keeps last frame's AO and computes again only where
+// what a texel reads changed (`AoChanged` and, when `grass_active`, the hierarchical grass masks)
+// or on the water.
 @fragment fn fs_ssao(in: Screen) -> @location(0) vec4f {
   let full = frame.viewport.xy;
-  let px = vec2i(in.uv * full);
-  let d = depth_px(px);
-  let aux = textureLoad(aux_tex, clamp(px, vec2i(0), vec2i(full) - vec2i(1)), 0);
-  if (d <= 0.0 || aux.w <= 0.0) {
+  let size = vec2i(full);
+  let px = clamp(vec2i(in.uv * full), vec2i(0), size - vec2i(1));
+  let d = textureLoad(depth_tex, px, 0);
+  let kept = pc.b.x > 0.5;
+  if (d <= 0.0) {
+    if (kept && !ao_changed_at(px, ao_all_regions())) {
+      discard;
+    }
     return vec4f(1.0);
   }
+  let aux = textureLoad(aux_tex, px, 0);
+  if (aux.w <= 0.0) {
+    return vec4f(1.0);
+  }
+  let grass_active = pc.b.y > 0.5;
+  let water = abs(aux.w - WATER_AUX) < 0.05;
+  if (kept && !water && !grass_active && ao_changed.head.x < 0.5) {
+    discard;
+  }
   let p = world_at(in.uv, d);
-  let n = normalize(aux.xyz);
   let radius = pc.a.x * clamp(linear_depth(d) * 0.04, 0.6, 3.0);
+  let hit = !kept
+    || water
+    || ao_changed_at(px, ao_all_regions())
+    || (grass_active && grass_fine_at(px));
+  var reg_met = 0u;
+  var grs_hit = false;
+  if (!hit) {
+    let reach = ao_reach(p, radius);
+    reg_met = ao_regions_met(reach);
+    grs_hit = grass_active && grass_coarse_met(reach);
+    if (reg_met == 0u && !grs_hit) {
+      discard;
+    }
+  }
+  let n = normalize(aux.xyz);
   let spin = rand01(u32(in.clip.x) * 2749u + u32(in.clip.y) * 6151u + u32(frame.wind.w) * 15485863u) * 6.2831;
   var up = vec3f(0.0, 1.0, 0.0);
   if (abs(n.y) > 0.9) {
@@ -110,17 +319,17 @@ const KERNEL = array<vec3f, 16>(
   let t = t0 * cos(spin) + b0 * sin(spin);
   let b = cross(n, t);
   let count = i32(pc.a.y);
+  if (!hit && !ao_reads_changed(p, t, b, n, radius, count, reg_met, grs_hit)) {
+    discard;
+  }
   var occlusion = 0.0;
   for (var i = 0; i < count; i++) {
-    let k = KERNEL[i % 16];
-    let s = p + (t * k.x + b * k.y + n * (k.z + 0.08)) * radius;
-    let c = frame.view_proj * vec4f(s, 1.0);
+    let c = ao_kernel_clip(p, t, b, n, radius, i);
     if (c.w <= 0.0) {
       continue;
     }
     let sdepth = c.z / c.w;
-    let suv = c.xy / c.w * 0.5 + vec2f(0.5);
-    let scene = depth_px(vec2i(suv * full));
+    let scene = textureLoad(depth_tex, ao_kernel_px(c), 0);
     if (scene > sdepth * 1.0002) {
       let range = smoothstep(0.0, 1.0, radius / max(abs(linear_depth(scene) - linear_depth(sdepth)), 1e-3));
       occlusion += range;

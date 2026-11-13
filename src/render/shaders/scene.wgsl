@@ -689,7 +689,7 @@ fn shade_scene(in: VsOut, front: bool, frag: vec4f, cut: bool, reflects: bool, w
     let foam_lit = key * (0.35 + 0.65 * sh) * 0.8 + hemi * 0.9 + lamps * 0.4;
     col = mix(col, vec3f(0.86, 0.93, 0.92) * foam_lit, clamp(foam, 0.0, 0.7));
     out.color = vec4f(col, 1.0);
-    out.aux = vec4f(wn, 0.75);
+    out.aux = vec4f(wn, WATER_AUX);
     return out;
   }
 

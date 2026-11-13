@@ -110,6 +110,10 @@ fn skin_vertex(p: Prop, vertex: u32, position: vec3f, normal: vec3f) -> Skinned 
 
 const PI = 3.14159265;
 
+// The water's aux.w: its normal (aux.xyz) follows the clock, so the AO of a water pixel is
+// computed every frame (`fs_ssao`).
+const WATER_AUX = 0.75;
+
 fn hash_u(n: u32) -> u32 {
   var x = n;
   x = x ^ (x >> 16u);

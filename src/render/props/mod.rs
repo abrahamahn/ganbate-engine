@@ -547,6 +547,9 @@ struct InstanceEntry {
     modelled: (V3, V3),
     /// Where its image and shadows lie in the cached picture, while it is drawn there.
     cached: Option<Rect>,
+    /// Where it lay as last drawn over the cached picture with the depth and normals it writes
+    /// (live and opaque), while it was ([`track_cached_props`]).
+    live: Option<Rect>,
     shadow: ShadowTrack,
 }
 
@@ -621,8 +624,6 @@ mod cache;
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
-pub(in crate::render) use cache::units_sent;
 use cache::zeros;
 pub(in crate::render) use cache::{
     CacheChanges, CacheView, PropSet, Props, Rect, SHADOW_DRIFT_TEXELS, ShadowMap, bounds,
@@ -630,3 +631,5 @@ pub(in crate::render) use cache::{
     track_cached_props, union,
 };
 pub use cache::{Pick, WorldPick};
+#[cfg(test)]
+pub(in crate::render) use cache::{box_rect, units_sent};

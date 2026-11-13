@@ -14,6 +14,7 @@ const IGNORED_TOP_DIRS = new Set(['.git', '.github', 'target', 'artifacts']);
 const RETIRED_TOP_PATHS = ['samples', 'content', 'editor'];
 
 const ALLOWED_TOP_FILES = new Set([
+  '.git',
   '.gitignore',
   'AGENTS.md',
   'Cargo.lock',
