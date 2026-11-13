@@ -1,44 +1,66 @@
 //! The renderer's shaders as GLSL ES 3.00 for WebGL 2: every vertex/fragment pair the
-//! renderer builds compiles through `compile_glsl`, and each pair is validated and linked with
-//! `glslangValidator` when it is installed (skipped with a note otherwise). The browser check
-//! (ANGLE compiling and linking them) is `web/test/run.cjs --api webgl2`.
+//! renderer builds compiles through `compile_glsl_with_options`, and each pair is validated and
+//! linked with `glslangValidator` when it is installed (skipped with a note otherwise). The
+//! browser check (ANGLE compiling and linking them) is `web/test/run.cjs --api webgl2`.
 
 use std::process::Command;
 
-use ganbate_engine::gpu::shader::{Stage, compile_glsl};
+use ganbate_engine::gpu::shader::{
+    CompileOptions, SpecValue, Stage, compile_glsl, compile_glsl_with_options,
+};
 use ganbate_engine::render::compose_shader;
 
 const SCENE: &str = include_str!("../src/render/shaders/scene.wgsl");
 const WORLD_FX: &str = include_str!("../src/render/shaders/world_fx.wgsl");
 const POST: &str = include_str!("../src/render/shaders/post.wgsl");
 
-/// (body, vertex entry, fragment entry or `None` for depth-only pipelines).
-const PAIRS: &[(&str, &str, Option<&str>)] = &[
-    (SCENE, "vs_main", Some("fs_main")),
-    (SCENE, "vs_prop", Some("fs_main")),
-    (SCENE, "vs_prop", Some("fs_overlay")),
-    (WORLD_FX, "vs_shadow", None),
-    (WORLD_FX, "vs_shadow_masked", Some("fs_shadow_masked")),
-    (WORLD_FX, "vs_shadow_prop", None),
+type Spec = &'static [(&'static str, SpecValue)];
+type Pair = (&'static str, &'static str, Option<&'static str>, Spec);
+
+const WATER_STATICS: Spec = &[("WATER_STATICS", SpecValue::Bool(true))];
+
+/// (body, vertex entry, fragment entry or `None` for depth-only pipelines, specialization).
+const PAIRS: &[Pair] = &[
+    (SCENE, "vs_main", Some("fs_main"), &[]),
+    (SCENE, "vs_main", Some("fs_main_blend"), &[]),
+    (SCENE, "vs_main", Some("fs_main_opaque"), &[]),
+    (SCENE, "vs_main", Some("fs_main_cache"), &[]),
+    (SCENE, "vs_main", Some("fs_main_opaque_cache"), &[]),
+    (SCENE, "vs_main", Some("fs_water_static"), &[]),
+    (SCENE, "vs_main", Some("fs_water"), WATER_STATICS),
+    (SCENE, "vs_main", Some("fs_water_opaque"), &[]),
+    (SCENE, "vs_main", Some("fs_water_masked"), &[]),
+    (SCENE, "vs_prop", Some("fs_main"), &[]),
+    (SCENE, "vs_prop", Some("fs_main_blend"), &[]),
+    (SCENE, "vs_prop", Some("fs_main_opaque"), &[]),
+    (SCENE, "vs_prop", Some("fs_main_cache"), &[]),
+    (SCENE, "vs_prop", Some("fs_main_opaque_cache"), &[]),
+    (SCENE, "vs_prop", Some("fs_water_opaque"), &[]),
+    (SCENE, "vs_prop", Some("fs_water_masked"), &[]),
+    (SCENE, "vs_prop", Some("fs_overlay"), &[]),
+    (WORLD_FX, "vs_shadow", None, &[]),
+    (WORLD_FX, "vs_shadow_masked", Some("fs_shadow_masked"), &[]),
+    (WORLD_FX, "vs_shadow_prop", None, &[]),
     (
         WORLD_FX,
         "vs_shadow_prop_masked",
         Some("fs_shadow_prop_masked"),
+        &[],
     ),
-    (WORLD_FX, "vs_ground", Some("fs_ground")),
-    (SCENE, "vs_grass", Some("fs_grass")),
-    (SCENE, "vs_flower", Some("fs_flower")),
-    (WORLD_FX, "vs_sky", Some("fs_sky")),
-    (WORLD_FX, "vs_particle", Some("fs_particle")),
-    (POST, "vs_fullscreen", Some("fs_ssao")),
-    (POST, "vs_fullscreen", Some("fs_air")),
-    (POST, "vs_fullscreen", Some("fs_bloom_down")),
-    (POST, "vs_fullscreen", Some("fs_bloom_up")),
-    (POST, "vs_fullscreen", Some("fs_tonemap")),
-    (POST, "vs_fullscreen", Some("fs_tonemap_output")),
-    (POST, "vs_fullscreen", Some("fs_tonemap_output_plain")),
-    (POST, "vs_fullscreen", Some("fs_paint")),
-    (POST, "vs_fullscreen", Some("fs_final")),
+    (WORLD_FX, "vs_ground", Some("fs_ground"), &[]),
+    (SCENE, "vs_grass", Some("fs_grass"), &[]),
+    (SCENE, "vs_flower", Some("fs_flower"), &[]),
+    (WORLD_FX, "vs_sky", Some("fs_sky"), &[]),
+    (WORLD_FX, "vs_particle", Some("fs_particle"), &[]),
+    (POST, "vs_fullscreen", Some("fs_ssao"), &[]),
+    (POST, "vs_fullscreen", Some("fs_air"), &[]),
+    (POST, "vs_fullscreen", Some("fs_bloom_down"), &[]),
+    (POST, "vs_fullscreen", Some("fs_bloom_up"), &[]),
+    (POST, "vs_fullscreen", Some("fs_tonemap"), &[]),
+    (POST, "vs_fullscreen", Some("fs_tonemap_output"), &[]),
+    (POST, "vs_fullscreen", Some("fs_tonemap_output_plain"), &[]),
+    (POST, "vs_fullscreen", Some("fs_paint"), &[]),
+    (POST, "vs_fullscreen", Some("fs_final"), &[]),
 ];
 
 /// The fragment shader the WebGL backend pairs with depth-only pipelines.
@@ -81,15 +103,16 @@ fn renderer_shaders_compile_and_link_as_glsl_es() {
     }
     let dump = std::env::var_os("GANBATE_GLSL_DUMP").map(std::path::PathBuf::from);
     let mut failures = Vec::new();
-    for &(body, vs_entry, fs_entry) in PAIRS {
+    for &(body, vs_entry, fs_entry, spec) in PAIRS {
         let source = compose_shader(body).expect("compose shader");
-        let vs = compile_glsl(&source, Stage::Vertex, vs_entry)
+        let opts = CompileOptions::new().with_specialize(spec);
+        let vs = compile_glsl_with_options(&source, Stage::Vertex, vs_entry, &opts)
             .unwrap_or_else(|e| panic!("{vs_entry}: {e}"))
             .glsl
             .expect("glsl");
         let fs = match fs_entry {
             Some(f) => {
-                compile_glsl(&source, Stage::Fragment, f)
+                compile_glsl_with_options(&source, Stage::Fragment, f, &opts)
                     .unwrap_or_else(|e| panic!("{f}: {e}"))
                     .glsl
                     .expect("glsl")

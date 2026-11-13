@@ -97,6 +97,7 @@ pub struct MaterialDesc {
     /// Alpha-tested at this cutoff (`None`: opaque).
     pub alpha_cutoff: Option<f32>,
     pub base_texture: Option<PropTexture>,
+    /// Water surfaces ([`Shading::Water`]) use procedural wave normals (`normal_texture` is ignored).
     pub normal_texture: Option<PropTexture>,
     pub emissive_texture: Option<PropTexture>,
     pub normal_scale: f32,

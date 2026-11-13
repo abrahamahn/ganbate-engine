@@ -3,7 +3,7 @@
 // hemispheric ambient, foliage wrap and glow, tiled lamp lights, lamp emission that follows the
 // time of day, wet surfaces in rain, painted brushwork, procedural surface detail, reflective
 // water with shallows, foam and glitter, and instanced grass and flowers.
-// The same shader draws the mirrored reflection pass (frame.water_color.w = 1).
+// The same shader draws the mirrored reflection pass (frame.meadow.w = 1).
 
 #import common
 #import brdf
@@ -558,6 +558,62 @@ fn world_shore_at(texel: vec2i, off: vec2i, max_c: vec2i, shore_h: f32) -> bool 
   return qd < 1.0 && world_height(qd) > shore_h;
 }
 
+// Static water depth (`x`, 50 in open water) and shore map (`y`: 0 none, 1 ground, 2 world).
+// `mode`: 0 = depth only (no shore), 1 = depth + known shore, 2 = depth + 4-neighbor shore test.
+fn water_depth(world: vec3f, mode: i32) -> vec2f {
+  let water_x = frame.water.x;
+  let sw = frame.shallow.w;
+  var below = 50.0;
+  var shore = 0.0;
+  let g = ground_texel(world);
+  if (g.z >= 0.0) {
+    let texel = vec2i(g.xy);
+    let max_c = vec2i(i32(frame.ground.z) - 1);
+    let gd = textureLoad(ground_depth, clamp(texel, vec2i(0), max_c), 0);
+    if (gd < 1.0) {
+      below = water_x - ground_height(gd);
+    }
+    let shore_h = water_x - 0.05;
+    if (mode == 1 || (mode == 2 && below > 0.02 && below < 0.6 && sw > 0.0
+      && (ground_shore_at(texel, vec2i(2, 0), max_c, shore_h)
+        || ground_shore_at(texel, vec2i(-2, 0), max_c, shore_h)
+        || ground_shore_at(texel, vec2i(0, 2), max_c, shore_h)
+        || ground_shore_at(texel, vec2i(0, -2), max_c, shore_h)))) {
+      shore = 1.0;
+    }
+  } else {
+    let w = world_texel(world);
+    if (w.z >= 0.0) {
+      let max_c = vec2i(i32(frame.world.z) - 1);
+      let texel = clamp(vec2i(w.xy), vec2i(0), max_c);
+      let wd = textureLoad(world_depth, texel, 0);
+      if (wd < 1.0) {
+        below = water_x - world_height(wd);
+      }
+      let shore_h = water_x - 0.05;
+      if (mode == 1 || (mode == 2 && below > 0.02 && below < 1.0 && sw > 0.0
+        && (world_shore_at(texel, vec2i(1, 0), max_c, shore_h)
+          || world_shore_at(texel, vec2i(-1, 0), max_c, shore_h)
+          || world_shore_at(texel, vec2i(0, 1), max_c, shore_h)
+          || world_shore_at(texel, vec2i(0, -1), max_c, shore_h)))) {
+        shore = 2.0;
+      }
+    }
+  }
+  return vec2f(below, shore);
+}
+
+// Packs a static boolean into the sign of a non-negative `Rgba32Float` channel without touching
+// its exponent or mantissa (`zero_sentinel < cutoff < 0` represents `0.0` with `flag == true`).
+fn encode_flag(v: f32, flag: bool, zero_sentinel: f32) -> f32 {
+  let pos = select(0.0, v, v >= 1e-30);
+  return select(pos, select(zero_sentinel, -pos, pos > 0.0), flag);
+}
+
+fn decode_val(enc: f32, cutoff: f32) -> f32 {
+  return select(enc, select(-enc, 0.0, enc < cutoff), enc < 0.0);
+}
+
 #import scene_detail
 
 // Blended props (detail3.z = 1) write premultiplied colour; opaque draws keep alpha unused.
@@ -569,12 +625,12 @@ fn blended(c: vec4f) -> vec4f {
   return c;
 }
 
-// The water's lamp light and key-light shadow depend on where its surface lies and which way it
-// faces before its waves move it, so they hold while the cached picture holds: `fs_water_static`
-// writes them (lamps rgb, shadow a) to `cache_water` when the picture changes, and `fs_water`
-// (`shade_scene` with `WATER_STATICS` set) reads them there instead of looping over the lamps
-// and filtering the shadow maps every frame, but where props moved since can have changed
-// their shadows (`water_shadows_moved`), where it computes them.
+// The water's lamp light, key-light shadow, and whether it lies over shallows or a shore depend
+// on where its surface lies before its waves move it, so they hold while the cached picture holds:
+// `fs_water_static` writes them (lamps rgb, shadow a, with cached/shore/shallow flags in the signs
+// of r, b, and a) to `cache_water` when the picture changes, and `fs_water` (`WATER_STATICS`) reads
+// them there instead of looping over the lamps, filtering the shadow maps, or tapping `ground_depth`
+// and `world_depth` across open water every frame (`water_shadows_moved` recomputes moved shadows).
 @group(0) @binding(19) var cache_water: texture_2d<f32>;
 const WATER_STATICS: bool = false;
 // The lamp light and shadow a pixel's shading took (rgb, a), for `fs_water_static`.
@@ -606,17 +662,13 @@ fn shade_scene(
     base_s = textureSampleBias(base_tex, material_sampler, in.uv, bias);
   }
   var nrm_s = vec4f(0.0);
-  if (dry || draw.flags.y > 0.5) {
-    nrm_s = textureSampleBias(normal_tex, material_sampler, in.uv, bias * 0.5);
-  }
   var emi_s = vec4f(0.0);
-  if (dry) {
-    emi_s = textureSampleBias(emissive_tex, material_sampler, in.uv, bias);
-  }
   var dpx = vec3f(0.0);
   var dpy = vec3f(0.0);
   var dp_len = 0.0;
   if (dry) {
+    nrm_s = textureSampleBias(normal_tex, material_sampler, in.uv, bias * 0.5);
+    emi_s = textureSampleBias(emissive_tex, material_sampler, in.uv, bias);
     dpx = dpdx(in.world);
     dpy = dpdy(in.world);
     dp_len = length(dpx) + length(dpy);
@@ -628,7 +680,7 @@ fn shade_scene(
   }
   let geo_n = n;
   var mapped = n;
-  if (draw.flags.y > 0.5) {
+  if (dry && draw.flags.y > 0.5) {
     let mirror = select(1.0, -1.0, reflection_pass);
     var m = nrm_s.xyz * 2.0 - vec3f(1.0);
     m = vec3f(m.xy * (draw.flags.w * frame.style2.y * mirror), max(m.z, 0.05));
@@ -728,82 +780,68 @@ fn shade_scene(
     cast_shadows.w = 1.0;
   }
   if (only_statics) {
-    lamps_and_shadow = vec4f(lamps, sh);
+    let wd = water_depth(in.world, 2);
+    lamps_and_shadow = vec4f(
+      encode_flag(lamps.r, true, -1e30),
+      lamps.g,
+      encode_flag(lamps.b, wd.y > 0.5, -1e30),
+      encode_flag(sh, wd.x < 1.4, -2.0),
+    );
     var statics_out: FsOut;
     return statics_out;
   }
 
-  let to_cam = frame.camera.xyz - in.world;
-  let dist = length(to_cam);
-  let v = to_cam / max(dist, 1e-4);
-  let l = frame.key_dir.xyz;
-  let key = frame.key_color.rgb * frame.key_dir.w;
-  let baked_ao = clamp(in.ao, 0.0, 1.0);
-  let hemi = mix(frame.amb_ground.rgb, frame.amb_sky.rgb, mapped_ny * 0.5 + 0.5)
-    * mix(1.0, baked_ao, frame.lamps.y * 0.35);
-
   if (water && (!dry || shading == 2)) {
     let t = frame.camera.w;
+    var below = 50.0;
+    var shore = 0.0;
+    var is_shallow = true;
+    var mode = 2;
+    if (WATER_STATICS) {
+      if (lamps.x < 0.0) {
+        is_shallow = sh < 0.0;
+        mode = select(0, 1, lamps.z < 0.0);
+      }
+      lamps.x = decode_val(lamps.x, -1e29);
+      lamps.z = decode_val(lamps.z, -1e29);
+      sh = decode_val(sh, -1.5);
+    }
+    if (is_shallow) {
+      let wd = water_depth(in.world, mode);
+      below = wd.x;
+      shore = wd.y;
+    }
+    var foam = 0.0;
+    if (shore > 1.5) {
+      let churn = 0.35 + 0.65 * smoothstep(0.3, 0.7, noise2(in.world.xz * 1.7 + vec2f(t * 0.3, -t * 0.22)));
+      foam = smoothstep(1.0, 0.1, below) * churn * frame.shallow.w;
+    } else if (shore > 0.5) {
+      let churn = 0.35 + 0.65 * smoothstep(0.3, 0.7, noise2(in.world.xz * 4.3 + vec2f(t * 0.35, -t * 0.27)));
+      foam = smoothstep(0.6, 0.05, below) * churn * frame.shallow.w;
+    }
+    let shallows = (1.0 - smoothstep(0.0, 1.4, max(below, 0.0))) * 0.45;
+    let foam_k = clamp(foam, 0.0, 0.7);
     let wn = water_normal(in.world, t);
-    let cosv = clamp(dot(wn, v), 0.0, 1.0);
+    let to_cam_w = frame.camera.xyz - in.world;
+    let v_w = to_cam_w / max(length(to_cam_w), 1e-4);
+    let cosv = clamp(dot(wn, v_w), 0.0, 1.0);
     let fres = 0.03 + 0.97 * pow(1.0 - cosv, 5.0);
+    let r = reflect(-v_w, wn);
     var refl: vec3f;
     if (!reflection_pass && frame.water2.w > 0.5) {
       let uv = frag.xy * frame.viewport.zw + wn.xz * vec2f(0.06, 0.035);
       refl = textureSampleLevel(reflection, clamp_sampler, uv, 0.0).rgb;
     } else {
-      refl = sky_color(reflect(-v, wn));
+      refl = sky_color(r);
     }
-    let water_p = frame.water;
-    let shallow = frame.shallow;
-    var below = 50.0;
-    var foam = 0.0;
-    let g = ground_texel(in.world);
-    if (g.z >= 0.0) {
-      let texel = vec2i(g.xy);
-      let size = i32(frame.ground.z);
-      let max_c = vec2i(size - 1);
-      let gd = textureLoad(ground_depth, clamp(texel, vec2i(0), max_c), 0);
-      if (gd < 1.0) {
-        below = water_p.x - ground_height(gd);
-      }
-      if (below > 0.02 && below < 0.6 && shallow.w > 0.0) {
-        let shore_h = water_p.x - 0.05;
-        if (ground_shore_at(texel, vec2i(2, 0), max_c, shore_h)
-          || ground_shore_at(texel, vec2i(-2, 0), max_c, shore_h)
-          || ground_shore_at(texel, vec2i(0, 2), max_c, shore_h)
-          || ground_shore_at(texel, vec2i(0, -2), max_c, shore_h)) {
-          let churn = 0.35 + 0.65 * smoothstep(0.3, 0.7, noise2(in.world.xz * 4.3 + vec2f(t * 0.35, -t * 0.27)));
-          foam = smoothstep(0.6, 0.05, below) * churn * shallow.w;
-        }
-      }
-    } else {
-      let w = world_texel(in.world);
-      if (w.z >= 0.0) {
-        let size = i32(frame.world.z);
-        let max_c = vec2i(size - 1);
-        let texel = clamp(vec2i(w.xy), vec2i(0), max_c);
-        let wd = textureLoad(world_depth, texel, 0);
-        if (wd < 1.0) {
-          below = water_p.x - world_height(wd);
-        }
-        if (below > 0.02 && below < 1.0 && shallow.w > 0.0) {
-          let shore_h = water_p.x - 0.05;
-          if (world_shore_at(texel, vec2i(1, 0), max_c, shore_h)
-            || world_shore_at(texel, vec2i(-1, 0), max_c, shore_h)
-            || world_shore_at(texel, vec2i(0, 1), max_c, shore_h)
-            || world_shore_at(texel, vec2i(0, -1), max_c, shore_h)) {
-            let churn = 0.35 + 0.65 * smoothstep(0.3, 0.7, noise2(in.world.xz * 1.7 + vec2f(t * 0.3, -t * 0.22)));
-            foam = smoothstep(1.0, 0.1, below) * churn * shallow.w;
-          }
-        }
-      }
-    }
-    let shallows = (1.0 - smoothstep(0.0, 1.4, max(below, 0.0))) * 0.45;
-    let water_col = mix(frame.water_color.rgb, shallow.rgb, shallows);
+    let l = frame.key_dir.xyz;
+    let key = frame.key_color.rgb * frame.key_dir.w;
+    let baked_ao = clamp(in.ao, 0.0, 1.0);
+    let hemi = mix(frame.amb_ground.rgb, frame.amb_sky.rgb, mapped_ny * 0.5 + 0.5)
+      * mix(1.0, baked_ao, frame.lamps.y * 0.35);
+    let water_col = mix(frame.water_color.rgb, frame.shallow.rgb, shallows);
     let deep = water_col * (hemi + key * 0.25) + lamps * 0.05;
-    var col = mix(deep, refl, clamp(fres * 1.4 + 0.3, 0.0, 1.0) * water_p.y);
-    let r = reflect(-v, wn);
+    var col = mix(deep, refl, clamp(fres * 1.4 + 0.3, 0.0, 1.0) * frame.water.y);
     let rl = max(dot(r, l), 0.0);
     if (rl > 0.0 && sh > 0.0) {
       col += key * (pow(rl, 600.0) * 6.0 * sh);
@@ -817,12 +855,22 @@ fn shade_scene(
       }
     }
     let foam_lit = key * (0.35 + 0.65 * sh) * 0.8 + hemi * 0.9 + lamps * 0.4;
-    col = mix(col, vec3f(0.86, 0.93, 0.92) * foam_lit, clamp(foam, 0.0, 0.7));
+    col = mix(col, vec3f(0.86, 0.93, 0.92) * foam_lit, foam_k);
     var wout: FsOut;
     wout.color = vec4f(col, 1.0);
     wout.aux = vec4f(wn, WATER_AUX);
     return wout;
   }
+
+  let to_cam = frame.camera.xyz - in.world;
+  let dist = length(to_cam);
+  let v = to_cam / max(dist, 1e-4);
+
+  let l = frame.key_dir.xyz;
+  let key = frame.key_color.rgb * frame.key_dir.w;
+  let baked_ao = clamp(in.ao, 0.0, 1.0);
+  let hemi = mix(frame.amb_ground.rgb, frame.amb_sky.rgb, mapped_ny * 0.5 + 0.5)
+    * mix(1.0, baked_ao, frame.lamps.y * 0.35);
 
   var fog_a = -1.0;
   if (reflection_pass) {
