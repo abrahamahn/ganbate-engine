@@ -278,25 +278,32 @@ enum WorldPart {
 
 pub(in crate::render) struct Pipelines {
     pub(in crate::render) scene: PipelineId,
-    /// The scene shading without the alpha test, for opaque world surfaces and the water in the
-    /// main view: a shader that never discards lets the GPU drop hidden fragments before shading
-    /// them.
+    /// The scene shading without the alpha test, for opaque world surfaces in the main view: a
+    /// shader that never discards lets the GPU drop hidden fragments before shading them.
     scene_opaque: PipelineId,
-    /// The water in a frame that keeps the cached picture (`fs_water`): `scene_opaque` with its
+    /// The water in a frame that keeps the cached picture (`fs_water`): `water_opaque` with its
     /// lamp light and shadow read from `cache_water` where no prop moved since they were kept.
     water: PipelineId,
+    /// Uncached opaque water in the main view (`fs_water_opaque`).
+    water_opaque: PipelineId,
+    /// Alpha-tested water in the main view (`fs_water_masked`).
+    water_masked: PipelineId,
     /// Draws the water's lamp light and shadow into `cache_water` (`fs_water_static`).
     water_static: PipelineId,
     /// The scene shading for props (model-space vertices placed per instance).
     pub(in crate::render) scene_prop: PipelineId,
     /// The same without the alpha test, for opaque prop materials in the main view.
     pub(in crate::render) scene_prop_opaque: PipelineId,
+    /// Water shading for alpha-tested and opaque props in the main view.
+    pub(in crate::render) water_prop: PipelineId,
+    pub(in crate::render) water_prop_opaque: PipelineId,
     /// The same four drawing into the cached picture, which also keeps the shadows moved props
     /// can change (`fs_main_cache`): world cut and opaque, props cut and opaque.
     cache_scene: [PipelineId; 2],
     pub(in crate::render) cache_prop: [PipelineId; 2],
-    /// The same, blended over the scene without writing depth: alpha, additive.
+    /// Blended dry and water props over the scene without writing depth: alpha, additive.
     pub(in crate::render) scene_prop_blend: [PipelineId; 2],
+    pub(in crate::render) water_prop_blend: [PipelineId; 2],
     /// Props over the finished image: [opaque, alpha, additive][without the scene's depth, testing
     /// it, testing and writing it (opaque only; the others repeat the test)].
     pub(in crate::render) overlay: [[PipelineId; 3]; 3],

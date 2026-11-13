@@ -45,15 +45,15 @@ struct Frame {
   world: vec4f,         // world map: top height, depth range (m), texels per side, 1 when drawn
   terrain: vec4f,       // beach height above the water (m), rock slope start, rock slope full, patch size (m)
   sand: vec4f,          // rgb dry sand, w = strength of the broad meadow patches
-  wet_sand: vec4f,      // rgb sand at the water line
-  rock: vec4f,          // rgb bare rock
-  meadow: vec4f,        // rgb second grass tone of the broad patches
+  wet_sand: vec4f,      // rgb sand at the water line, w = water plane height (mirrors water.x)
+  rock: vec4f,          // rgb bare rock, w = shadow spin seed (mirrors wind.w)
+  meadow: vec4f,        // rgb second grass tone of the broad patches, w = 1 in reflection pass
   lamps: vec4f,         // lamp light on foliage (scale), baked AO strength, cluster near (m), cluster slices per doubling
   tide: vec4f,          // tide-mark height above the water (m, 0 = none), rgb stain multiplier
   tiles: vec4u,         // tiles across, tiles down, tile size in pixels, light count
   light_shadow0: mat4x4f, // world to the shadow maps of a game's shadowed lights (layers 0, 1):
   light_shadow1: mat4x4f, // perspective from each light, depth 0 at it to 1 at its range
-  light_shadow: vec4f,  // 1 / texels per side of those maps, unused, unused, unused
+  light_shadow: vec4f,  // 1 / texels per side, 1-based light indices of layers 0 & 1, w = 1 when prop shadows drawn
   surface_mode: vec4f,  // default SurfaceModel (0..5), clearcoat, sheen, subsurface
   subsurface_color: vec4f, // rgb subsurface scatter tint, w = clearcoat roughness
   grass_grid: vec4f,    // the part of the grass grid drawn: first column, first row, columns, unused

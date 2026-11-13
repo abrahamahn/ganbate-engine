@@ -127,10 +127,10 @@ fn plaster(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f) -> Detail {
 }
 
 // Irregular stones (a jittered cell pattern) with dark joints.
-fn stone(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy: vec3f) -> Detail {
+fn stone(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dp_len: f32) -> Detail {
   var o = no_detail(albedo, n);
   let size = draw.detail0.y;
-  let fade = 1.0 - smoothstep(0.25, 0.6, (length(dpx) + length(dpy)) / size);
+  let fade = 1.0 - smoothstep(0.25, 0.6, dp_len / size);
   let uv = plane_uv(p, geo) / size;
   let c = floor(uv);
   let f = fract(uv);
@@ -177,20 +177,22 @@ fn grass_ground(p: vec3f, n: vec3f, albedo: vec3f) -> Detail {
 // Terrain: grassy ground (as grass_ground) laid in broad meadow patches, giving way to beach
 // sand near the water (wet and dark at the water line) and to bare rock in layers on steep
 // slopes. Where sand and rock begin comes from terrain_cover, as in the ground map.
-fn terrain_ground(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy: vec3f) -> Detail {
+fn terrain_ground(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dp_len: f32) -> Detail {
   var o = grass_ground(p, n, albedo);
   let size = max(frame.terrain.w, 1.0);
   let broad = smoothstep(0.36, 0.66, fbm2(p.xz / size + vec2f(41.0, 13.0)));
   let meadow = frame.meadow.rgb * (0.9 + 0.2 * noise2(p.xz * 0.35));
   o.albedo = mix(o.albedo, meadow, broad * frame.sand.w);
-  let c = terrain_cover(p, geo.y, frame.water.x, frame.terrain);
+  let c = terrain_cover(p, geo.y, frame.wet_sand.w, frame.terrain);
   if (c.x + c.y <= 0.0) {
     return o;
   }
-  let above = p.y - frame.water.x;
+  let rock_w = c.y;
+  let above = p.y - frame.wet_sand.w;
   let dry = smoothstep(0.0, max(frame.terrain.x * 0.45, 0.05), above);
   let ripple = 0.94 + 0.06 * sin(dot(p.xz, vec2f(1.7, 0.6)) * 3.0 + noise2(p.xz * 0.8) * 4.0);
   let sand = mix(frame.wet_sand.rgb, frame.sand.rgb, dry) * ripple * (0.95 + 0.1 * noise2(p.xz * 2.3));
+  o.albedo = mix(o.albedo, sand, c.x);
   // Rock: big angular facets (a jittered cell pattern on the face, stretched along it), each
   // its own tone, warmth and tilt, with thin dark cracks between them and faint sedimentary
   // bands; the cracks fade out where a facet is only a few pixels across.
@@ -215,7 +217,7 @@ fn terrain_ground(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy
       }
     }
   }
-  let fade = 1.0 - smoothstep(0.08, 0.3, (length(dpx) + length(dpy)) / 3.6);
+  let fade = 1.0 - smoothstep(0.08, 0.3, dp_len / 3.6);
   let crack = mix(1.0, smoothstep(0.006, 0.045, sqrt(d2) - sqrt(d1)), fade);
   let tone = hash2(id) - 0.5;
   let warm = hash2(id + vec2f(5.0, 9.0)) - 0.5;
@@ -223,9 +225,9 @@ fn terrain_ground(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy
   let grain = noise2(face * 1.7) * 0.6 + noise2(face * 5.3) * 0.4;
   let rock = frame.rock.rgb * (1.0 + tone * 0.32 + band) * (vec3f(1.0) + vec3f(warm, warm * 0.3, -warm) * 0.14) * (0.9 + 0.2 * grain);
   let tilt = vec3f(hash2(id + vec2f(1.3, 0.0)) - 0.5, (hash2(id + vec2f(0.0, 4.1)) - 0.5) * 0.6, hash2(id + vec2f(2.7, 0.0)) - 0.5) * 0.7;
-  o.albedo = mix(mix(o.albedo, sand, c.x), rock, c.y);
-  o.cavity = mix(1.0, mix(0.62, 1.0, crack), c.y);
-  o.n = normalize(mix(o.n, normalize(n + tilt), c.y));
+  o.albedo = mix(o.albedo, rock, rock_w);
+  o.cavity = mix(1.0, mix(0.62, 1.0, crack), rock_w);
+  o.n = normalize(mix(o.n, normalize(n + tilt), rock_w));
   return o;
 }
 
@@ -258,7 +260,7 @@ fn lattice(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy: vec3f
   return o;
 }
 
-fn surface_detail(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy: vec3f) -> Detail {
+fn surface_detail(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy: vec3f, dp_len: f32) -> Detail {
   let preset = i32(draw.detail0.x + 0.5);
   var base = albedo;
   if (draw.detail2.x > 0.5 && preset != 6 && preset != 7 && preset != 8) {
@@ -274,13 +276,13 @@ fn surface_detail(p: vec3f, geo: vec3f, n: vec3f, albedo: vec3f, dpx: vec3f, dpy
     return plaster(p, geo, n, base);
   }
   if (preset == 4) {
-    return stone(p, geo, n, base, dpx, dpy);
+    return stone(p, geo, n, base, dp_len);
   }
   if (preset == 6) {
     return grass_ground(p, n, albedo);
   }
   if (preset == 7) {
-    return terrain_ground(p, geo, n, albedo, dpx, dpy);
+    return terrain_ground(p, geo, n, albedo, dp_len);
   }
   if (preset == 8) {
     return lattice(p, geo, n, albedo, dpx, dpy);

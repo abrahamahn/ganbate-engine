@@ -243,6 +243,28 @@ impl Pipelines {
             depth: Some(reverse_depth(Compare::Greater, true)),
             colors: mrt(),
         })?;
+        let water_opaque_fs = compile(SCENE, Stage::Fragment, "fs_water_opaque")?;
+        let water_masked_fs = compile(SCENE, Stage::Fragment, "fs_water_masked")?;
+        let water_opaque = device.create_render_pipeline(&RenderPipelineDesc {
+            vertex: &vs,
+            fragment: Some(&water_opaque_fs),
+            vertex_layout: Some(world_layout_cache.clone()),
+            topology: Topology::TriangleList,
+            cull: Cull::None,
+            front_ccw: true,
+            depth: Some(reverse_depth(Compare::Greater, true)),
+            colors: mrt(),
+        })?;
+        let water_masked = device.create_render_pipeline(&RenderPipelineDesc {
+            vertex: &vs,
+            fragment: Some(&water_masked_fs),
+            vertex_layout: Some(world_layout_cache.clone()),
+            topology: Topology::TriangleList,
+            cull: Cull::None,
+            front_ccw: true,
+            depth: Some(reverse_depth(Compare::Greater, true)),
+            colors: mrt(),
+        })?;
         // Tested against the cached picture's depth (a copy) and writing its own, so where water
         // lies over water the nearer keeps its light, as in the main pass.
         let water_static = device.create_render_pipeline(&RenderPipelineDesc {
@@ -270,6 +292,26 @@ impl Pipelines {
         let scene_prop_opaque = device.create_render_pipeline(&RenderPipelineDesc {
             vertex: &vs,
             fragment: Some(&opaque_fs),
+            vertex_layout: Some(layout.clone()),
+            topology: Topology::TriangleList,
+            cull: Cull::None,
+            front_ccw: true,
+            depth: Some(reverse_depth(Compare::Greater, true)),
+            colors: mrt(),
+        })?;
+        let water_prop = device.create_render_pipeline(&RenderPipelineDesc {
+            vertex: &vs,
+            fragment: Some(&water_masked_fs),
+            vertex_layout: Some(layout.clone()),
+            topology: Topology::TriangleList,
+            cull: Cull::None,
+            front_ccw: true,
+            depth: Some(reverse_depth(Compare::Greater, true)),
+            colors: mrt(),
+        })?;
+        let water_prop_opaque = device.create_render_pipeline(&RenderPipelineDesc {
+            vertex: &vs,
+            fragment: Some(&water_opaque_fs),
             vertex_layout: Some(layout.clone()),
             topology: Topology::TriangleList,
             cull: Cull::None,
@@ -311,28 +353,35 @@ impl Pipelines {
             }
         }
         // Blended props leave the aux target (normals for outlines and occlusion) alone.
+        let blend_fs = compile(SCENE, Stage::Fragment, "fs_main_blend")?;
         let mut scene_prop_blend = [scene_prop; 2];
+        let mut water_prop_blend = [water_prop; 2];
         for (i, blend) in [Blend::Premultiplied, Blend::Additive]
             .into_iter()
             .enumerate()
         {
-            scene_prop_blend[i] = device.create_render_pipeline(&RenderPipelineDesc {
-                vertex: &vs,
-                fragment: Some(&fs),
-                vertex_layout: Some(layout.clone()),
-                topology: Topology::TriangleList,
-                cull: Cull::None,
-                front_ccw: true,
-                depth: Some(reverse_depth(Compare::Greater, false)),
-                colors: vec![
-                    color(HDR, blend),
-                    ColorTarget {
-                        format: HDR,
-                        blend: Blend::Replace,
-                        write_mask: 0,
-                    },
-                ],
-            })?;
+            for (out, frag) in [
+                (&mut scene_prop_blend[i], &blend_fs),
+                (&mut water_prop_blend[i], &water_masked_fs),
+            ] {
+                *out = device.create_render_pipeline(&RenderPipelineDesc {
+                    vertex: &vs,
+                    fragment: Some(frag),
+                    vertex_layout: Some(layout.clone()),
+                    topology: Topology::TriangleList,
+                    cull: Cull::None,
+                    front_ccw: true,
+                    depth: Some(reverse_depth(Compare::Greater, false)),
+                    colors: vec![
+                        color(HDR, blend),
+                        ColorTarget {
+                            format: HDR,
+                            blend: Blend::Replace,
+                            write_mask: 0,
+                        },
+                    ],
+                })?;
+            }
         }
         let overlay_fs = compile(SCENE, Stage::Fragment, "fs_overlay")?;
         let prop_shader_bindings = sorted_bindings(
@@ -528,12 +577,17 @@ impl Pipelines {
             scene,
             scene_opaque,
             water,
+            water_opaque,
+            water_masked,
             water_static,
             scene_prop,
             scene_prop_opaque,
+            water_prop,
+            water_prop_opaque,
             cache_scene,
             cache_prop,
             scene_prop_blend,
+            water_prop_blend,
             overlay,
             output_format: output,
             prop_layout: layout,

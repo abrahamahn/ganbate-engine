@@ -233,11 +233,12 @@ impl Renderer {
             if self.world_drawn { 1.0 } else { 0.0 },
         );
         let t = &l.terrain;
+        let water_level = self.scene.water_level.unwrap_or(-1e6);
         b.f(t.beach, t.rock_slope[0], t.rock_slope[1], t.patch_size);
         b.v(t.sand, t.patches);
-        b.v(t.wet_sand, 0.0);
-        b.v(t.rock, 0.0);
-        b.v(t.meadow, 0.0);
+        b.v(t.wet_sand, water_level);
+        b.v(t.rock, seed as f32);
+        b.v(t.meadow, if reflection { 1.0 } else { 0.0 });
         b.f(
             l.lamp_foliage,
             l.ambient_occlusion,
@@ -266,11 +267,19 @@ impl Renderer {
         for layer in 0..crate::render::lights::MAX_SHADOWED_LIGHTS {
             b.m(views.get(layer).unwrap_or(&math::IDENTITY));
         }
+        let mut shadowed_indices = [0.0f32; 2];
+        let light_base = self.scene.lights.len();
+        for (idx, rec) in self.game_lights.records().iter().enumerate() {
+            let layer = (rec[14] + 0.5) as usize;
+            if (1..=2).contains(&layer) {
+                shadowed_indices[layer - 1] = (light_base + idx + 1) as f32;
+            }
+        }
         b.f(
             1.0 / self.quality.light_shadow_size.max(16) as f32,
-            0.0,
-            0.0,
-            0.0,
+            shadowed_indices[0],
+            shadowed_indices[1],
+            if has_prop_shadows { 1.0 } else { 0.0 },
         );
         b.f(
             l.surface_model as u32 as f32,
@@ -1225,13 +1234,13 @@ impl Renderer {
             enc.set_pipeline(p.water);
             enc.set_bind_group(0, group);
         } else {
-            enc.set_pipeline(p.scene_opaque);
+            enc.set_pipeline(p.water_opaque);
             enc.set_bind_group(0, slot.scene[0]);
         }
         let water_draws = self.draw_world(enc, &mut push, &eye, true, WorldPart::Water, None);
         count(water_draws);
         split(enc);
-        enc.set_pipeline(p.scene);
+        enc.set_pipeline(p.water_masked);
         enc.set_bind_group(0, slot.scene[0]);
         let masked_water_draws =
             self.draw_world(enc, &mut push, &eye, true, WorldPart::MaskedWater, None);

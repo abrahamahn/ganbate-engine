@@ -146,7 +146,7 @@ fn eval_stylized_character(s: SurfaceInput) -> vec3f {
 }
 
 // Model 2: Energy-conserving microfacet GGX + height-correlated Smith G2 + Burley diffuse + sky IBL.
-fn eval_standard_ggx(s: SurfaceInput) -> vec3f {
+fn eval_standard_ggx(s: SurfaceInput, crisp_ibl: vec3f, horizon_occl: f32) -> vec3f {
   let r = clamp(s.rough, 0.045, 1.0);
   let a = r * r;
   let a2 = a * a;
@@ -176,46 +176,37 @@ fn eval_standard_ggx(s: SurfaceInput) -> vec3f {
     diff_term += s.albedo * back * (1.0 / PI);
   }
 
-  let direct = (diff_term + spec_brdf * step(0.0, nl_raw)) * s.key * key_vis;
-
-  // Split-sum environment approximation with horizon & AO specular occlusion.
-  let r_dir = reflect(-s.v, s.n);
-  let horizon_occl = clamp(1.0 + dot(r_dir, s.geo_n), 0.0, 1.0);
-  let spec_ao = clamp(pow(nv + s.ao, a) - 1.0 + s.ao, 0.0, 1.0) * horizon_occl * horizon_occl;
+  var acc = (diff_term + spec_brdf * step(0.0, nl_raw)) * s.key * key_vis;
   let f_ibl = f_schlick_roughness(nv, f0, r);
   let kd_ibl = (vec3f(1.0) - f_ibl) * (1.0 - s.metallic);
-  let env_diff = kd_ibl * s.albedo * s.hemi * s.ao;
-  let env_spec = sky_ibl(r_dir, r, s.hemi) * f_ibl * (1.0 - r * 0.55) * spec_ao;
-  let lamp_contrib = s.albedo * (1.0 - 0.75 * s.metallic) * s.lamps + f0 * s.lamps * (1.0 - r * 0.6);
-
-  return direct + env_diff + env_spec + lamp_contrib;
+  acc += kd_ibl * s.albedo * s.hemi * s.ao;
+  let spec_ao = clamp(pow(nv + s.ao, a) - 1.0 + s.ao, 0.0, 1.0) * horizon_occl * horizon_occl;
+  acc += mix(crisp_ibl, s.hemi, r * r * 0.82) * f_ibl * (1.0 - r * 0.55) * spec_ao;
+  return acc + (s.albedo * (1.0 - 0.75 * s.metallic) * s.lamps + f0 * s.lamps * (1.0 - r * 0.6));
 }
 
 // Model 3: Base GGX substrate under a smooth dielectric clear-coat layer (automotive, lacquer, ceramics).
-fn eval_clearcoat(s: SurfaceInput) -> vec3f {
-  let base = eval_standard_ggx(s);
+fn eval_clearcoat_over(base: vec3f, s: SurfaceInput) -> vec3f {
   let coat_w = select(max(frame.surface_mode.y, 0.85), clamp(s.lobe_weight, 0.0, 1.0), s.lobe_weight >= 0.0);
   let coat_r = clamp(select(frame.subsurface_color.w, s.lobe_param, s.lobe_param >= 0.0), 0.03, 1.0);
   let ac = coat_r * coat_r;
   let ac2 = ac * ac;
 
   let cn = normalize(mix(s.geo_n, s.n, 0.25));
+  let r_dir = reflect(-s.v, cn);
   let nv = max(dot(cn, s.v), 1e-4);
   let nl = max(dot(cn, s.l), 0.0);
   let hv = normalize(s.l + s.v);
   let nh = max(dot(cn, hv), 0.0);
   let vh = max(dot(s.v, hv), 0.0);
 
+  let fc_ibl = f_schlick_roughness(nv, vec3f(0.04), coat_r).x * coat_w;
   let fc = f_schlick(vh, vec3f(0.04)).x * coat_w;
   let dc = d_ggx(nh, ac2);
   let vc = v_smith_ggx(nv, max(nl, 1e-4), ac2);
-  let coat_direct = s.key * (dc * vc * fc * nl * s.sh);
-
-  let r_dir = reflect(-s.v, cn);
-  let fc_ibl = f_schlick_roughness(nv, vec3f(0.04), coat_r).x * coat_w;
-  let coat_env = sky_ibl(r_dir, coat_r, s.hemi) * fc_ibl * s.ao;
-
-  return base * (1.0 - fc_ibl * 0.85) + coat_direct + coat_env + s.lamps * (fc_ibl * 0.35);
+  var acc = base * (1.0 - fc_ibl * 0.85) + s.key * (dc * vc * fc * nl * s.sh);
+  acc += sky_ibl(r_dir, coat_r, s.hemi) * fc_ibl * s.ao;
+  return acc + s.lamps * (fc_ibl * 0.35);
 }
 
 // Model 4: Estevez & Kulla Charlie sheen BRDF for woven cloth, velvet, silk, and felt-like fabrics.
@@ -248,7 +239,7 @@ fn eval_charlie_cloth(s: SurfaceInput) -> vec3f {
 }
 
 // Model 5: Dual-lobe specular + RGB wrapped subsurface profile + back-lit translucency (skin, wax, jade).
-fn eval_subsurface_skin(s: SurfaceInput) -> vec3f {
+fn eval_subsurface_skin(s: SurfaceInput, crisp_ibl: vec3f) -> vec3f {
   let r = clamp(s.rough, 0.08, 1.0);
   let a1 = r * r;
   let a2_primary = a1 * a1;
@@ -276,22 +267,16 @@ fn eval_subsurface_skin(s: SurfaceInput) -> vec3f {
   let d = mix(d_ggx(nh, a2_primary), d_ggx(nh, a2_secondary), 0.18);
   let vis = v_smith_ggx(nv, max(nl, 1e-4), a2_primary);
   let spec = d * vis * f * nl * s.sh;
+  var acc = (s.albedo * (vec3f(1.0) - f) * (1.0 / PI) * diff_light * s.key) + spec * s.key;
 
   // Back-lit thin translucency.
   let back = pow(clamp(dot(-s.l, s.v), 0.0, 1.0), 2.5) * sss_w * mix(0.25, 1.0, s.sh);
-  let trans = s.albedo * sss_col * s.key * (back * 0.45);
+  acc += s.albedo * sss_col * s.key * (back * 0.45);
+  acc += s.albedo * s.hemi * mix(vec3f(s.ao), pow(vec3f(max(s.ao, 0.05)), vec3f(1.0) - sss_col * 0.45), sss_w);
 
-  let r_dir = reflect(-s.v, s.n);
   let f_ibl = f_schlick_roughness(nv, vec3f(0.028), r);
-  let env_diff = s.albedo * s.hemi * mix(vec3f(s.ao), pow(vec3f(max(s.ao, 0.05)), vec3f(1.0) - sss_col * 0.45), sss_w);
-  let env_spec = sky_ibl(r_dir, r, s.hemi) * f_ibl * (1.0 - r * 0.5) * s.ao;
-
-  return (s.albedo * (vec3f(1.0) - f) * (1.0 / PI) * diff_light * s.key)
-    + spec * s.key
-    + trans
-    + env_diff
-    + env_spec
-    + s.albedo * s.lamps * (1.0 + sss_w * 0.15);
+  acc += mix(crisp_ibl, s.hemi, r * r * 0.82) * f_ibl * (1.0 - r * 0.5) * s.ao;
+  return acc + s.albedo * s.lamps * (1.0 + sss_w * 0.15);
 }
 
 fn evaluate_surface(s: SurfaceInput) -> vec3f {
@@ -300,27 +285,33 @@ fn evaluate_surface(s: SurfaceInput) -> vec3f {
   } else if (FIXED_SURFACE_MODEL == 1) {
     return eval_stylized_character(s);
   } else if (FIXED_SURFACE_MODEL == 2) {
-    return eval_standard_ggx(s);
+    let rd = reflect(-s.v, s.n);
+    return eval_standard_ggx(s, sky_base(rd), clamp(1.0 + dot(rd, s.geo_n), 0.0, 1.0));
   } else if (FIXED_SURFACE_MODEL == 3) {
-    return eval_clearcoat(s);
+    let rd = reflect(-s.v, s.n);
+    return eval_clearcoat_over(eval_standard_ggx(s, sky_base(rd), clamp(1.0 + dot(rd, s.geo_n), 0.0, 1.0)), s);
   } else if (FIXED_SURFACE_MODEL == 4) {
     return eval_charlie_cloth(s);
   } else if (FIXED_SURFACE_MODEL == 5) {
-    return eval_subsurface_skin(s);
+    return eval_subsurface_skin(s, sky_base(reflect(-s.v, s.n)));
   }
 
   if (ENABLE_PHOTOREAL) {
-    if (s.model == 2) {
-      return eval_standard_ggx(s);
-    }
-    if (s.model == 3) {
-      return eval_clearcoat(s);
-    }
     if (s.model == 4) {
       return eval_charlie_cloth(s);
     }
-    if (s.model == 5) {
-      return eval_subsurface_skin(s);
+    if (s.model == 2 || s.model == 3 || s.model == 5) {
+      let rd = reflect(-s.v, s.n);
+      let ho = clamp(1.0 + dot(rd, s.geo_n), 0.0, 1.0);
+      let crisp = sky_base(rd);
+      if (s.model == 5) {
+        return eval_subsurface_skin(s, crisp);
+      }
+      let base = eval_standard_ggx(s, crisp, ho);
+      if (s.model == 2) {
+        return base;
+      }
+      return eval_clearcoat_over(base, s);
     }
   }
   if (ENABLE_STYLIZED) {
@@ -329,5 +320,6 @@ fn evaluate_surface(s: SurfaceInput) -> vec3f {
     }
     return eval_stylized_ramp(s);
   }
-  return eval_standard_ggx(s);
+  let rd = reflect(-s.v, s.n);
+  return eval_standard_ggx(s, sky_base(rd), clamp(1.0 + dot(rd, s.geo_n), 0.0, 1.0));
 }

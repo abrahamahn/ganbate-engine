@@ -1339,12 +1339,27 @@ impl Renderer {
         } else {
             (self.pipelines.scene_prop_opaque, self.pipelines.scene_prop)
         };
-        let groups: Vec<(crate::gpu::PipelineId, Option<bool>)> = if view == 0 {
-            vec![(opaque_pipeline, Some(true)), (cut_pipeline, Some(false))]
+        let has_water = view == 0
+            && set != PropSet::Settled
+            && self.props.batches.iter().filter(opaque).any(|b| {
+                self.props
+                    .materials
+                    .get(b.material)
+                    .is_some_and(|m| m.data.params[3] == 2.0)
+            });
+        let mut groups: Vec<(crate::gpu::PipelineId, Option<bool>, bool)> = if view == 0 {
+            vec![
+                (opaque_pipeline, Some(true), false),
+                (cut_pipeline, Some(false), false),
+            ]
         } else {
-            vec![(self.pipelines.scene_prop, None)]
+            vec![(self.pipelines.scene_prop, None, false)]
         };
-        for (pipeline, no_cut) in groups {
+        if has_water {
+            groups.push((self.pipelines.water_prop_opaque, Some(true), true));
+            groups.push((self.pipelines.water_prop, Some(false), true));
+        }
+        for (pipeline, no_cut, water_only) in groups {
             enc.set_pipeline(pipeline);
             enc.set_bind_group(0, s.scene[view]);
             let mut bound = None;
@@ -1358,7 +1373,7 @@ impl Renderer {
                 if no_cut.is_some_and(|o| o != (mat.data.params[0] < 0.0)) {
                     continue;
                 }
-                if view == 1 && mat.data.params[3] == 2.0 {
+                if (mat.data.params[3] == 2.0) != water_only {
                     continue;
                 }
                 let (runs, n) = Self::instance_runs(&self.props.placed, b.first, b.count, within);
@@ -1397,7 +1412,12 @@ impl Renderer {
             ) else {
                 continue;
             };
-            let p = self.pipelines.scene_prop_blend[usize::from(mat.desc.blend == BlendMode::Add)];
+            let idx = usize::from(mat.desc.blend == BlendMode::Add);
+            let p = if mat.desc.shading == Shading::Water {
+                self.pipelines.water_prop_blend[idx]
+            } else {
+                self.pipelines.scene_prop_blend[idx]
+            };
             if pipeline != Some(p) {
                 enc.set_pipeline(p);
                 enc.set_bind_group(0, s.scene[0]);

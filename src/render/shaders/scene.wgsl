@@ -131,9 +131,15 @@ const TAPS = array<vec2f, 16>(
 
 // Percentage-closer filtering in one cascade with `count` of the 16 taps; returns -1 outside
 // the cascade. Static world shadows live in layers 0..2; dynamic prop shadows live in 2..4.
-fn shadow_cascade(world: vec3f, n: vec3f, layer: i32, m: mat4x4f, offset: f32, radius: f32, bias: f32, spin: f32, count: i32, prop_shadows: bool) -> f32 {
+fn shadow_cascade(world: vec3f, n: vec3f, layer: i32, offset: f32, radius: f32, bias: f32, spin: f32, count: i32, prop_shadows: bool) -> f32 {
   let ndl = dot(n, frame.key_dir.xyz);
-  let p = m * vec4f(world + n * (offset * (1.0 + 1.5 * (1.0 - abs(ndl)))), 1.0);
+  let moved = vec4f(world + n * (offset * (1.0 + 1.5 * (1.0 - abs(ndl)))), 1.0);
+  var p: vec4f;
+  if (layer == 1) {
+    p = frame.shadow1 * moved;
+  } else {
+    p = frame.shadow0 * moved;
+  }
   let uv = p.xy * 0.5 + vec2f(0.5);
   if (any(uv < vec2f(0.002)) || any(uv > vec2f(0.998)) || p.z >= 1.0 || p.z <= 0.0) {
     return -1.0;
@@ -162,22 +168,24 @@ fn shadow_taps(world: vec3f, n: vec3f, dist: f32, frag: vec2f, count: i32) -> f3
   if (frame.key_dir.w <= 0.0) {
     return 1.0;
   }
-  let prop_shadows = frame.water2.z > 0.5;
-  let spin = rand01(u32(frag.x) * 7919u + u32(frag.y) * 104729u + u32(frame.wind.w) * 15485863u) * 6.2831;
+  let prop_shadows = frame.light_shadow.w > 0.5;
+  let spin = rand01(u32(frag.x) * 7919u + u32(frag.y) * 104729u + u32(frame.rock.w) * 15485863u) * 6.2831;
   let sp = frame.shadow_params;
+  var s0 = -1.0;
+  var edge = 1.0;
   if (dist < frame.cascades.x) {
-    let s0 = shadow_cascade(world, n, 0, frame.shadow0, frame.cascades.y, sp.x, sp.z, spin, count, prop_shadows);
+    s0 = shadow_cascade(world, n, 0, frame.cascades.y, sp.x, sp.z, spin, count, prop_shadows);
     if (s0 >= 0.0) {
-      // Blend into the far cascade over the last 15% of the near one.
-      let edge = smoothstep(frame.cascades.x * 0.85, frame.cascades.x, dist);
+      edge = smoothstep(frame.cascades.x * 0.85, frame.cascades.x, dist);
       if (edge <= 0.0) {
         return s0;
       }
-      let s1 = shadow_cascade(world, n, 1, frame.shadow1, frame.cascades.z, sp.y, sp.w, spin, count, prop_shadows);
-      return mix(s0, select(s1, s0, s1 < 0.0), edge);
     }
   }
-  let s1 = shadow_cascade(world, n, 1, frame.shadow1, frame.cascades.z, sp.y, sp.w, spin, count, prop_shadows);
+  let s1 = shadow_cascade(world, n, 1, frame.cascades.z, sp.y, sp.w, spin, count, prop_shadows);
+  if (s0 >= 0.0) {
+    return mix(s0, select(s1, s0, s1 < 0.0), edge);
+  }
   return select(s1, 1.0, s1 < 0.0);
 }
 
@@ -275,7 +283,7 @@ fn game_light_share(world: vec3f, n: vec3f, l: Light, frag: vec2f) -> f32 {
   if (att <= 0.0) {
     return 1.0;
   }
-  return light_shadow(world, n, ld, l, i32(l.cone.z + 0.5) - 1, frag);
+  return light_shadow(world, n, dot(n, ld), length(d), l.spot.w, i32(l.cone.z + 0.5) - 1, frag);
 }
 
 // Marks the cached picture's pixels whose shading moved props changed: where a lookup of a
@@ -341,13 +349,10 @@ fn perturb(n: vec3f, p: vec3f, uv: vec2f, m: vec3f) -> vec3f {
 
 // How much of a game light reaches `world` past the props' shadows (1 all), from its shadow map
 // `layer`, filtered over a texel and a half with eight taps turned per pixel.
-fn light_shadow(world: vec3f, n: vec3f, ld: vec3f, l: Light, layer: i32, frag: vec2f) -> f32 {
-  // A texel's width where the point is (the map spans the cone across), and the point moved off
-  // its surface by about that much, more where the light grazes it.
-  let c = l.spot.w;
+fn light_shadow(world: vec3f, n: vec3f, nl: f32, dist_l: f32, c: f32, layer: i32, frag: vec2f) -> f32 {
   let spread = sqrt(max(1.0 - c * c, 0.0)) / max(c, 0.05);
-  let texel = 2.0 * length(l.pos.xyz - world) * spread * frame.light_shadow.x;
-  let graze = 1.0 - abs(dot(n, ld));
+  let texel = 2.0 * dist_l * spread * frame.light_shadow.x;
+  let graze = 1.0 - abs(nl);
   // The layer picks the product rather than the matrix: a matrix picked at run time is sixteen
   // values held in registers (Mali spilled them).
   let moved = vec4f(world + n * (texel * (1.0 + 2.0 * graze)), 1.0);
@@ -365,7 +370,7 @@ fn light_shadow(world: vec3f, n: vec3f, ld: vec3f, l: Light, layer: i32, frag: v
   if (any(uv <= vec2f(0.0)) || any(uv >= vec2f(1.0)) || q.z >= 1.0) {
     return 1.0;
   }
-  let spin = rand01(u32(frag.x) * 7919u + u32(frag.y) * 104729u + u32(frame.wind.w) * 15485863u) * 6.2831;
+  let spin = rand01(u32(frag.x) * 7919u + u32(frag.y) * 104729u + u32(frame.rock.w) * 15485863u) * 6.2831;
   let cs = cos(spin);
   let sn = sin(spin);
   let radius = 1.5 * frame.light_shadow.x;
@@ -381,15 +386,34 @@ fn light_shadow(world: vec3f, n: vec3f, ld: vec3f, l: Light, layer: i32, frag: v
 // Slices of view depth per screen tile (`CLUSTER_SLICES` in renderer.rs).
 const CLUSTER_SLICES: u32 = 16u;
 
-fn lamp_light(world: vec3f, n: vec3f, frag: vec2f, foliage: bool) -> vec3f {
-  // The lamps follow the time of day; a game's own lights shine at every hour.
+fn game_light_share_idx(world: vec3f, n: vec3f, idx: u32, layer: i32, frag: vec2f) -> f32 {
+  let at = lights[idx].pos;
+  let d = at.xyz - world;
+  let d2 = dot(d, d);
+  let r2 = at.w * at.w;
+  let spot = lights[idx].spot;
+  let cone = lights[idx].cone;
+  if (d2 >= r2 || spot.w <= -1.5) {
+    return -1.0;
+  }
+  let lit = select(frame.amb_sky.w, 1.0, cone.y > 0.5);
+  if (lit <= 0.001) {
+    return -1.0;
+  }
+  let ld = d * inverseSqrt(d2 + 1e-6);
+  let win = 1.0 - d2 / r2;
+  let att = win * win / (1.0 + d2 * 0.45) * lit * smoothstep(spot.w, cone.x, dot(-ld, spot.xyz));
+  if (att <= 0.0) {
+    return -1.0;
+  }
+  return light_shadow(world, n, dot(n, ld), length(d), spot.w, layer, frag);
+}
+
+fn lamp_light_water(world: vec3f, n: vec3f, frag: vec2f) -> vec3f {
   let level = frame.amb_sky.w;
   let size = f32(frame.tiles.z);
   let tx = min(u32(frag.x / size), frame.tiles.x - 1u);
   let ty = min(u32(frag.y / size), frame.tiles.y - 1u);
-  // The pixel's cluster: its tile and the slice of view depth it lies in (clip w is the view
-  // depth), as `Renderer::tile_lights` filled them; lamps.z the nearest slice's far edge,
-  // lamps.w slices per doubling of depth.
   let depth = (frame.view_proj * vec4f(world, 1.0)).w;
   var slice = 0u;
   if (depth > frame.lamps.z) {
@@ -398,8 +422,6 @@ fn lamp_light(world: vec3f, n: vec3f, frag: vec2f, foliage: bool) -> vec3f {
   let t = tiles[(slice * frame.tiles.y + ty) * frame.tiles.x + tx];
   var sum = vec3f(0.0);
   for (var k = 0u; k < t.y; k++) {
-    // Most of a tile's lights do not reach this pixel: read just the position and range first,
-    // and the rest of the light only for one that does.
     let index = light_index[t.x + k];
     let at = lights[index].pos;
     let d = at.xyz - world;
@@ -408,35 +430,97 @@ fn lamp_light(world: vec3f, n: vec3f, frag: vec2f, foliage: bool) -> vec3f {
     if (d2 >= r2) {
       continue;
     }
-    let l = lights[index];
-    let lit = select(level, 1.0, l.cone.y > 0.5);
+    let cone = lights[index].cone;
+    let lit = select(level, 1.0, cone.y > 0.5);
     if (lit <= 0.001) {
       continue;
     }
     let ld = d * inverseSqrt(d2 + 1e-6);
+    let nl = dot(n, ld);
+    let w = smoothstep(-0.2, 0.3, nl);
     let win = 1.0 - d2 / r2;
     var att = win * win / (1.0 + d2 * 0.45) * lit;
-    if (l.spot.w > -1.5) {
-      att *= smoothstep(l.spot.w, l.cone.x, dot(-ld, l.spot.xyz));
-      if (l.cone.z > 0.5 && att > 0.0) {
-        let layer = i32(l.cone.z + 0.5) - 1;
-        let lit_share = light_shadow(world, n, ld, l, layer, frag);
-        att *= 1.0 - l.cone.w * (1.0 - lit_share);
-        if (layer == 0) {
-          cast_shadows.y = lit_share;
-        } else {
-          cast_shadows.z = lit_share;
-        }
+    let spot = lights[index].spot;
+    if (spot.w > -1.5) {
+      att *= smoothstep(spot.w, cone.x, dot(-ld, spot.xyz));
+      if (cone.z > 0.5 && att > 0.0) {
+        let lit_share = light_shadow(world, n, nl, length(d), spot.w, i32(cone.z + 0.5) - 1, frag);
+        att *= 1.0 - cone.w * (1.0 - lit_share);
       }
     }
+    let col = lights[index].color;
+    sum += col.rgb * (col.w * att * w);
+  }
+  return sum * frame.style2.z;
+}
+
+fn lamp_light_inner(world: vec3f, n: vec3f, frag: vec2f, foliage: bool, keep_shadows: bool) -> vec3f {
+  var lit_shares = vec2f(1.0);
+  if (frame.light_shadow.y > 0.5) {
+    let s0 = game_light_share_idx(world, n, u32(frame.light_shadow.y + 0.5) - 1u, 0, frag);
+    if (s0 >= 0.0) {
+      lit_shares.x = s0;
+    }
+    if (frame.light_shadow.z > 0.5) {
+      let s1 = game_light_share_idx(world, n, u32(frame.light_shadow.z + 0.5) - 1u, 1, frag);
+      if (s1 >= 0.0) {
+        lit_shares.y = s1;
+      }
+    }
+  }
+  if (keep_shadows) {
+    cast_shadows.y = lit_shares.x;
+    cast_shadows.z = lit_shares.y;
+  }
+  let level = frame.amb_sky.w;
+  let size = f32(frame.tiles.z);
+  let tx = min(u32(frag.x / size), frame.tiles.x - 1u);
+  let ty = min(u32(frag.y / size), frame.tiles.y - 1u);
+  let depth = (frame.view_proj * vec4f(world, 1.0)).w;
+  var slice = 0u;
+  if (depth > frame.lamps.z) {
+    slice = min(u32(log2(depth / frame.lamps.z) * frame.lamps.w), CLUSTER_SLICES - 1u);
+  }
+  let t = tiles[(slice * frame.tiles.y + ty) * frame.tiles.x + tx];
+  var sum = vec3f(0.0);
+  for (var k = 0u; k < t.y; k++) {
+    let index = light_index[t.x + k];
+    let at = lights[index].pos;
+    let d = at.xyz - world;
+    let d2 = dot(d, d);
+    let r2 = at.w * at.w;
+    if (d2 >= r2) {
+      continue;
+    }
+    let cone = lights[index].cone;
+    let lit = select(level, 1.0, cone.y > 0.5);
+    if (lit <= 0.001) {
+      continue;
+    }
+    let ld = d * inverseSqrt(d2 + 1e-6);
     let nl = dot(n, ld);
     var w = smoothstep(-0.2, 0.3, nl);
     if (foliage) {
       w = (smoothstep(-0.8, 0.6, nl) * 0.8 + 0.2) * frame.lamps.x;
     }
-    sum += l.color.rgb * (l.color.w * att * w);
+    let win = 1.0 - d2 / r2;
+    var att = win * win / (1.0 + d2 * 0.45) * lit;
+    let spot = lights[index].spot;
+    if (spot.w > -1.5) {
+      att *= smoothstep(spot.w, cone.x, dot(-ld, spot.xyz));
+      if (cone.z > 0.5 && att > 0.0) {
+        let lit_share = select(lit_shares.y, lit_shares.x, cone.z < 1.5);
+        att *= 1.0 - cone.w * (1.0 - lit_share);
+      }
+    }
+    let col = lights[index].color;
+    sum += col.rgb * (col.w * att * w);
   }
   return sum * frame.style2.z;
+}
+
+fn lamp_light(world: vec3f, n: vec3f, frag: vec2f, foliage: bool) -> vec3f {
+  return lamp_light_inner(world, n, frag, foliage, false);
 }
 
 fn water_normal(world: vec3f, t: f32) -> vec3f {
@@ -489,26 +573,45 @@ var<private> lamps_and_shadow: vec4f;
 // The scene's surface shading. `cut` keeps the alpha test and the reflection's clip under the
 // water; without them (`fs_main_opaque`) the shader never discards, so the GPU can reject hidden
 // fragments before shading them (early depth, or a tiler's hidden-surface removal).
-// `reflects` is false in an entry point the mirrored reflection pass never draws with (it binds
-// the main view's frame alone), and `water` false in one that never draws the water (the cached
-// picture holds none: `draw_world`'s opaque and masked parts leave it out, and a water prop never
-// settles). Each entry point passes constants, so the GPU's compiler drops the code they rule out
-// and the registers and uniform slots that code took, while the bindings it reads stay in the
-// layout every scene pipeline shares.
-fn shade_scene(in: VsOut, front: bool, frag: vec4f, cut: bool, reflects: bool, water: bool) -> FsOut {
-  // Texture fetches and derivatives first, in uniform control flow. The water (`fs_water`)
-  // fetches its normal map only when it has one.
+// `reflects` is false in an entry point the mirrored reflection pass never draws with, `dry` and
+// `water` split land/prop shading from water shading, `blends` keeps premultiplied alpha for
+// blended props, `keep_shadows` records `cast_shadows` for the cached picture, and `only_statics`
+// stops once `fs_water_static` has `lamps_and_shadow`. Each entry point passes constants, so the
+// GPU's compiler drops the code they rule out while every scene pipeline shares one layout.
+fn shade_scene(
+  in: VsOut,
+  front: bool,
+  frag: vec4f,
+  cut: bool,
+  reflects: bool,
+  dry: bool,
+  water: bool,
+  blends: bool,
+  keep_shadows: bool,
+  only_statics: bool,
+) -> FsOut {
   let bias = frame.style2.x;
-  let base_s = textureSampleBias(base_tex, material_sampler, in.uv, bias);
+  var base_s = vec4f(0.0);
+  if (dry || cut) {
+    base_s = textureSampleBias(base_tex, material_sampler, in.uv, bias);
+  }
   var nrm_s = vec4f(0.0);
-  if (!WATER_STATICS || draw.flags.y > 0.5) {
+  if (dry || draw.flags.y > 0.5) {
     nrm_s = textureSampleBias(normal_tex, material_sampler, in.uv, bias * 0.5);
   }
-  let emi_s = textureSampleBias(emissive_tex, material_sampler, in.uv, bias);
-  let dpx = dpdx(in.world);
-  let dpy = dpdy(in.world);
-  // The mirrored reflection pass reverses winding: there the faces seen are back faces.
-  let reflection_pass = reflects && frame.water_color.w > 0.5;
+  var emi_s = vec4f(0.0);
+  if (dry) {
+    emi_s = textureSampleBias(emissive_tex, material_sampler, in.uv, bias);
+  }
+  var dpx = vec3f(0.0);
+  var dpy = vec3f(0.0);
+  var dp_len = 0.0;
+  if (dry) {
+    dpx = dpdx(in.world);
+    dpy = dpdy(in.world);
+    dp_len = length(dpx) + length(dpy);
+  }
+  let reflection_pass = reflects && frame.meadow.w > 0.5;
   var n = normalize(in.normal);
   if (front == reflection_pass) {
     n = -n;
@@ -523,94 +626,117 @@ fn shade_scene(in: VsOut, front: bool, frag: vec4f, cut: bool, reflects: bool, w
   }
   n = mapped;
 
-  if (cut && reflection_pass && in.world.y < frame.water.x - 0.02) {
+  if (cut && reflection_pass && in.world.y < frame.wet_sand.w - 0.02) {
     discard;
   }
-  var albedo = draw.base_color * in.tint;
-  if (draw.flags.x > 0.5) {
-    albedo *= base_s;
-  }
-  if (cut && albedo.a < draw.params.x) {
-    discard;
-  }
-  // `fs_water` (`WATER_STATICS`) draws only the water: there its shading is a constant, and all
-  // its branch never reads is dead code the GPU's compilers drop, the colour and glow fetches
-  // (left in the source so the material's bind group keeps the scene's layout), surface detail,
-  // brushwork and the derivatives they take, and the other surfaces' lighting. The normal map
-  // stays: `hemi` and the lamps take the normal it tilts.
-  let shading = select(i32(draw.params.w + 0.5), 2, WATER_STATICS);
-  let to_cam = frame.camera.xyz - in.world;
-  let dist = length(to_cam);
-  let v = to_cam / max(dist, 1e-4);
-  let l = frame.key_dir.xyz;
-  let key = frame.key_color.rgb * frame.key_dir.w;
-  let baked_ao = clamp(in.ao, 0.0, 1.0);
-  let hemi = mix(frame.amb_ground.rgb, frame.amb_sky.rgb, n.y * 0.5 + 0.5)
-    * mix(1.0, baked_ao, frame.lamps.y * 0.35);
-
-  var out: FsOut;
-  out.aux = vec4f(geo_n, 1.0 + baked_ao);
-
-  var emissive = draw.emissive.rgb;
-  if (draw.flags.z > 0.5) {
-    emissive *= emi_s.rgb;
-  }
-  if (draw.emissive.w > 0.5) {
-    emissive *= frame.amb_sky.w * frame.style2.w;
-  }
-
-  if (shading == 3) {
-    out.color = blended(vec4f(albedo.rgb + emissive, albedo.a));
-    return out;
-  }
-
-  // Procedural detail (tiles, planks, plaster, stone, lacquer, grassy ground) and brushwork.
-  var rough_override = -1.0;
-  var brush = 0.0;
-  if (shading == 0 && draw.detail0.x > 0.5) {
-    let d = surface_detail(in.world, geo_n, n, albedo.rgb, dpx, dpy);
-    albedo = vec4f(d.albedo * d.cavity, albedo.a);
-    n = d.n;
-    rough_override = d.rough;
-    // Joints, seams and lattice bars also shade a surface's own glow.
-    emissive *= d.cavity;
-  }
-  if (shading <= 1) {
-    let footprint = (length(dpx) + length(dpy)) / max(frame.paint.y, 1e-3);
-    let amount = frame.paint.x * (1.0 - smoothstep(0.3, 0.9, footprint));
-    if (amount > 0.0) {
-      brush = (brush_noise(in.world, geo_n, frame.paint.y) - 0.5) * amount;
-      albedo = vec4f(albedo.rgb * (1.0 + brush * 0.24), albedo.a);
+  var albedo = vec4f(0.0);
+  if (dry || cut) {
+    albedo = draw.base_color * in.tint;
+    if (draw.flags.x > 0.5) {
+      albedo *= base_s;
+    }
+    if (cut && albedo.a < draw.params.x) {
+      discard;
     }
   }
 
-  let foliage = shading == 1;
+  let shading = select(2, i32(draw.params.w + 0.5), dry);
+  var emissive = vec3f(0.0);
+  if (dry) {
+    emissive = draw.emissive.rgb;
+    if (draw.flags.z > 0.5) {
+      emissive *= emi_s.rgb;
+    }
+    if (draw.emissive.w > 0.5) {
+      emissive *= frame.amb_sky.w * frame.style2.w;
+    }
+  }
+  if (dry && shading == 3) {
+    if (keep_shadows) {
+      cast_shadows = vec4f(1.0, 1.0, 1.0, 0.0);
+    }
+    var unlit: FsOut;
+    if (blends) {
+      unlit.color = blended(vec4f(albedo.rgb + emissive, albedo.a));
+    } else {
+      unlit.color = vec4f(albedo.rgb + emissive, 1.0);
+    }
+    unlit.aux = vec4f(geo_n, 1.0 + clamp(in.ao, 0.0, 1.0));
+    return unlit;
+  }
+
+  let mapped_ny = n.y;
+  var rough_override = -1.0;
+  var brush = 0.0;
+  if (dry) {
+    if (shading == 0 && draw.detail0.x > 0.5) {
+      let d = surface_detail(in.world, geo_n, n, albedo.rgb, dpx, dpy, dp_len);
+      albedo = vec4f(d.albedo * d.cavity, albedo.a);
+      n = d.n;
+      rough_override = d.rough;
+      emissive *= d.cavity;
+    }
+    if (shading <= 1) {
+      let footprint = dp_len / max(frame.paint.y, 1e-3);
+      let amount = frame.paint.x * (1.0 - smoothstep(0.3, 0.9, footprint));
+      if (amount > 0.0) {
+        brush = (brush_noise(in.world, geo_n, frame.paint.y) - 0.5) * amount;
+        albedo = vec4f(albedo.rgb * (1.0 + brush * 0.24), albedo.a);
+      }
+    }
+    let preset = i32(draw.detail0.x + 0.5);
+    if (frame.tide.x > 0.0 && shading == 0 && preset != 6 && preset != 7) {
+      let above = in.world.y - frame.wet_sand.w + (noise2(in.world.xz * 0.9 + vec2f(in.world.y * 0.3)) - 0.5) * frame.tide.x * 0.35;
+      let band = (1.0 - smoothstep(frame.tide.x * 0.55, frame.tide.x, above)) * step(-1.5, above);
+      albedo = vec4f(albedo.rgb * mix(vec3f(1.0), frame.tide.yzw, band), albedo.a);
+    }
+  }
+
+  let foliage = dry && shading == 1;
   var sh: f32;
   var lamps: vec3f;
+  if (keep_shadows) {
+    cast_shadows = vec4f(1.0, 1.0, 1.0, 0.0);
+  }
   if (WATER_STATICS) {
-    if (water_shadows_moved(in.world, geo_n, dist)) {
-      sh = shadow(in.world, geo_n, dist, frag.xy);
-      lamps = lamp_light(in.world, n, frag.xy, foliage);
+    let dist_w = length(frame.camera.xyz - in.world);
+    if (water_shadows_moved(in.world, geo_n, dist_w)) {
+      sh = shadow(in.world, geo_n, dist_w, frag.xy);
+      lamps = lamp_light_water(in.world, n, frag.xy);
     } else {
       let kept = textureLoad(cache_water, vec2i(frag.xy), 0);
       lamps = kept.rgb;
       sh = kept.a;
     }
   } else {
-    sh = shadow(in.world, geo_n, dist, frag.xy);
-    lamps = lamp_light(in.world, n, frag.xy, foliage);
+    lamps = lamp_light_inner(in.world, n, frag.xy, foliage, keep_shadows);
+    let dist_s = length(frame.camera.xyz - in.world);
+    sh = shadow(in.world, geo_n, dist_s, frag.xy);
   }
-  cast_shadows.x = sh;
-  cast_shadows.w = 1.0;
-  lamps_and_shadow = vec4f(lamps, sh);
+  if (keep_shadows) {
+    cast_shadows.x = sh;
+    cast_shadows.w = 1.0;
+  }
+  if (only_statics) {
+    lamps_and_shadow = vec4f(lamps, sh);
+    var statics_out: FsOut;
+    return statics_out;
+  }
 
-  if (water && shading == 2) {
+  let to_cam = frame.camera.xyz - in.world;
+  let dist = length(to_cam);
+  let v = to_cam / max(dist, 1e-4);
+  let l = frame.key_dir.xyz;
+  let key = frame.key_color.rgb * frame.key_dir.w;
+  let baked_ao = clamp(in.ao, 0.0, 1.0);
+  let hemi = mix(frame.amb_ground.rgb, frame.amb_sky.rgb, mapped_ny * 0.5 + 0.5)
+    * mix(1.0, baked_ao, frame.lamps.y * 0.35);
+
+  if (water && (!dry || shading == 2)) {
     let t = frame.camera.w;
     let wn = water_normal(in.world, t);
     let cosv = clamp(dot(wn, v), 0.0, 1.0);
     let fres = 0.03 + 0.97 * pow(1.0 - cosv, 5.0);
-    // The reflection pass's picture where there is one; the sky (stars, moon, clouds) only where
-    // there is not, as it would be thrown away.
     var refl: vec3f;
     if (!reflection_pass && frame.water2.w > 0.5) {
       let uv = frag.xy * frame.viewport.zw + wn.xz * vec2f(0.06, 0.035);
@@ -618,8 +744,6 @@ fn shade_scene(in: VsOut, front: bool, frag: vec4f, cut: bool, reflects: bool, w
     } else {
       refl = sky_color(reflect(-v, wn));
     }
-    // Depth below the surface from the ground map: shallows turn clear and green, and foam
-    // lines the shore and anything standing in the water.
     var below = 50.0;
     var foam = 0.0;
     let g = ground_texel(in.world);
@@ -633,19 +757,17 @@ fn shade_scene(in: VsOut, front: bool, frag: vec4f, cut: bool, reflects: bool, w
       if (below > 0.02) {
         var near = 0.0;
         var offs = array<vec2i, 4>(vec2i(2, 0), vec2i(-2, 0), vec2i(0, 2), vec2i(0, -2));
-        for (var k = 0; k < 4; k++) {
-          let q = clamp(texel + offs[k], vec2i(0), vec2i(size - 1));
+        for (var i = 0; i < 4; i++) {
+          let q = clamp(texel + offs[i], vec2i(0), vec2i(size - 1));
           let qd = textureLoad(ground_depth, q, 0);
           if (qd < 1.0 && ground_height(qd) > frame.water.x - 0.05) {
             near = 1.0;
           }
         }
-        // Foam only where the water meets something: a thin, broken line.
         let churn = 0.35 + 0.65 * smoothstep(0.3, 0.7, noise2(in.world.xz * 4.3 + vec2f(t * 0.35, -t * 0.27)));
         foam = near * smoothstep(0.6, 0.05, below) * churn * frame.shallow.w;
       }
     } else {
-      // Beyond the ground map, the coarser world map: shallows and foam along distant shores.
       let w = world_texel(in.world);
       if (w.z >= 0.0) {
         let size = i32(frame.world.z);
@@ -657,8 +779,8 @@ fn shade_scene(in: VsOut, front: bool, frag: vec4f, cut: bool, reflects: bool, w
         if (below > 0.02) {
           var near = 0.0;
           var offs = array<vec2i, 4>(vec2i(1, 0), vec2i(-1, 0), vec2i(0, 1), vec2i(0, -1));
-          for (var k = 0; k < 4; k++) {
-            let q = clamp(texel + offs[k], vec2i(0), vec2i(size - 1));
+          for (var i = 0; i < 4; i++) {
+            let q = clamp(texel + offs[i], vec2i(0), vec2i(size - 1));
             let qd = textureLoad(world_depth, q, 0);
             if (qd < 1.0 && world_height(qd) > frame.water.x - 0.05) {
               near = 1.0;
@@ -676,86 +798,80 @@ fn shade_scene(in: VsOut, front: bool, frag: vec4f, cut: bool, reflects: bool, w
     let r = reflect(-v, wn);
     col += key * (pow(max(dot(r, l), 0.0), 600.0) * 6.0 * sh);
     col += key * (pow(max(dot(r, l), 0.0), 40.0) * 0.08 * sh);
-    // Glitter: brief sparks in the sun's (or moon's) path.
     let cell = floor(in.world.xz * 7.0);
     let spark = step(0.92, hash2(cell + vec2f(floor(t * 5.0) * 13.0, 0.0)));
     col += key * (spark * pow(max(dot(r, l), 0.0), 90.0) * 9.0 * frame.water2.x * sh);
     let foam_lit = key * (0.35 + 0.65 * sh) * 0.8 + hemi * 0.9 + lamps * 0.4;
     col = mix(col, vec3f(0.86, 0.93, 0.92) * foam_lit, clamp(foam, 0.0, 0.7));
-    out.color = vec4f(col, 1.0);
-    out.aux = vec4f(wn, WATER_AUX);
-    return out;
+    var wout: FsOut;
+    wout.color = vec4f(col, 1.0);
+    wout.aux = vec4f(wn, WATER_AUX);
+    return wout;
   }
 
-  // Tide marks: what stands in the water is wet and stained just above it, the line broken.
-  let preset = i32(draw.detail0.x + 0.5);
-  if (frame.tide.x > 0.0 && shading == 0 && preset != 6 && preset != 7) {
-    let above = in.world.y - frame.water.x + (noise2(in.world.xz * 0.9 + vec2f(in.world.y * 0.3)) - 0.5) * frame.tide.x * 0.35;
-    let band = (1.0 - smoothstep(frame.tide.x * 0.55, frame.tide.x, above)) * step(-1.5, above);
-    albedo = vec4f(albedo.rgb * mix(vec3f(1.0), frame.tide.yzw, band), albedo.a);
+  var fog_a = -1.0;
+  if (reflection_pass) {
+    fog_a = fog_amount(frame.camera.xyz, in.world, dist);
   }
 
-  // Rain darkens and glosses upward-facing surfaces.
   let wet = frame.amb_ground.w * smoothstep(0.5, 0.9, geo_n.y);
   albedo = vec4f(albedo.rgb * (1.0 - 0.38 * wet), albedo.a);
+
+  var wet_sheen = vec3f(-1.0, 0.0, 0.0);
+  if (wet > 0.0) {
+    let r = reflect(-v, n);
+    let f = 0.04 + 0.96 * pow(1.0 - clamp(dot(n, v), 0.0, 1.0), 5.0);
+    wet_sheen = (sky_base(r) * 0.6 + lamps * 0.05) * (wet * f);
+  }
+  let fog_dir = -v;
 
   var rough = clamp(draw.params.y * (1.0 - 0.6 * wet), 0.05, 1.0);
   if (rough_override >= 0.0) {
     rough = min(rough, rough_override);
   }
-  if (foliage) {
-    out.aux = vec4f(geo_n, 0.5);
-  }
   var model = i32(frame.surface_mode.x + 0.5);
   if (draw.detail2.z > 0.5) {
     model = i32(draw.detail2.z + 0.5) - 1;
   }
-  var surf: SurfaceInput;
-  surf.albedo = albedo.rgb;
-  surf.n = n;
-  surf.geo_n = geo_n;
-  surf.v = v;
-  surf.l = l;
-  surf.key = key;
-  surf.hemi = hemi;
-  surf.lamps = lamps;
-  surf.sh = sh;
-  surf.rough = rough;
-  surf.metallic = draw.params.z;
-  surf.ao = baked_ao;
-  surf.brush = brush;
-  surf.foliage = foliage;
-  surf.model = model;
-  surf.lobe_weight = draw.detail2.w;
-  surf.lobe_param = draw.detail3.w;
+  let surf = SurfaceInput(
+    albedo.rgb, n, geo_n, v, l, key, hemi, lamps,
+    sh, rough, draw.params.z, baked_ao, brush, foliage, model,
+    draw.detail2.w, draw.detail3.w,
+  );
   var col = evaluate_surface(surf);
 
-  // Wet sheen: the sky mirrored on puddled ground.
-  if (wet > 0.0) {
-    let r = reflect(-v, n);
-    let f = 0.04 + 0.96 * pow(1.0 - clamp(dot(n, v), 0.0, 1.0), 5.0);
-    col += (sky_base(r) * 0.6 + lamps * 0.05) * (wet * f);
+  if (wet_sheen.x >= 0.0) {
+    col += wet_sheen;
   }
 
   col += emissive;
-  if (reflection_pass) {
-    col = mix(col, fog_color(-v), fog_amount(frame.camera.xyz, in.world, dist));
+  if (fog_a >= 0.0) {
+    col = mix(col, fog_color(fog_dir), fog_a);
   }
-  out.color = blended(vec4f(col, albedo.a));
+  var out: FsOut;
+  if (blends) {
+    out.color = blended(vec4f(col, albedo.a));
+  } else {
+    out.color = vec4f(col, 1.0);
+  }
+  out.aux = vec4f(geo_n, select(1.0 + baked_ao, 0.5, foliage));
   return out;
 }
 
 @fragment fn fs_main(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> FsOut {
-  return shade_scene(in, front, frag, true, true, true);
+  return shade_scene(in, front, frag, true, true, true, false, false, false, false);
+}
+
+// Blended props in the main view (premultiplied or additive).
+@fragment fn fs_main_blend(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> FsOut {
+  return shade_scene(in, front, frag, true, false, true, false, true, false, false);
 }
 
 // Opaque world surfaces and props in the main view, drawn nearest first.
 @fragment fn fs_main_opaque(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> FsOut {
-  return shade_scene(in, front, frag, false, false, true);
+  return shade_scene(in, front, frag, false, false, true, false, false, false, false);
 }
 
-// The cached picture's shading: as `fs_main` and `fs_main_opaque` in the main view, with the
-// shadows moved props can change; the picture holds no water.
 struct CacheOut {
   @location(0) color: vec4f,
   @location(1) aux: vec4f,
@@ -771,25 +887,32 @@ fn cache_out(o: FsOut) -> CacheOut {
 }
 
 @fragment fn fs_main_cache(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> CacheOut {
-  return cache_out(shade_scene(in, front, frag, true, false, false));
+  return cache_out(shade_scene(in, front, frag, true, false, true, false, false, true, false));
 }
 
 @fragment fn fs_main_opaque_cache(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> CacheOut {
-  return cache_out(shade_scene(in, front, frag, false, false, false));
+  return cache_out(shade_scene(in, front, frag, false, false, true, false, false, true, false));
 }
 
-// The water's lamp light and shadow, shaded as `fs_main_opaque` shades the water, into
-// `cache_water`.
+// The water's lamp light and shadow, written into `cache_water`.
 @fragment fn fs_water_static(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> @location(0) vec4f {
-  _ = shade_scene(in, front, frag, false, false, true);
+  _ = shade_scene(in, front, frag, false, false, false, true, false, false, true);
   return lamps_and_shadow;
 }
 
-// The water in a frame that keeps the cached picture, its lamp light and shadow read from
-// `cache_water` where no prop moved since they were kept (compiled with `WATER_STATICS`; its
-// group binds `reshade` to the water's own block).
+// The water in a frame that keeps the cached picture (`WATER_STATICS`).
 @fragment fn fs_water(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> FsOut {
-  return shade_scene(in, front, frag, false, false, true);
+  return shade_scene(in, front, frag, false, false, false, true, false, false, false);
+}
+
+// Uncached opaque water and opaque water props in the main view.
+@fragment fn fs_water_opaque(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> FsOut {
+  return shade_scene(in, front, frag, false, false, false, true, false, false, false);
+}
+
+// Alpha-tested water and water props in the main view.
+@fragment fn fs_water_masked(in: VsOut, @builtin(front_facing) front: bool, @builtin(position) frag: vec4f) -> FsOut {
+  return shade_scene(in, front, frag, true, false, false, true, false, false, false);
 }
 
 #import scene_grass

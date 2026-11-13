@@ -188,9 +188,33 @@ fn the_cached_water_reads_its_light_within_webgl_units() {
         kind,
     });
     assert_eq!(water, sorted_bindings(&[&opaque[..], &kept].concat()));
-    // The statics take the scene's group, which must not hold the target they draw into.
+    // The statics and specialized dry/water entry points share the scene's group layout.
     assert_eq!(statics, opaque);
-    for (entry, spec) in [("fs_water", &WATER_STATICS[..]), ("fs_water_static", &[])] {
+    for entry in [
+        "fs_main",
+        "fs_main_blend",
+        "fs_main_cache",
+        "fs_main_opaque_cache",
+        "fs_water_opaque",
+        "fs_water_masked",
+    ] {
+        let (units, bindings) = glsl(entry, &[]);
+        assert!(
+            units <= 16,
+            "WebGL 2 fragment texture units: {entry} {units}"
+        );
+        assert_eq!(
+            bindings, opaque,
+            "{entry} bindings must match fs_main_opaque"
+        );
+    }
+    for (entry, spec) in [
+        ("fs_main_blend", &[][..]),
+        ("fs_water", &WATER_STATICS[..]),
+        ("fs_water_static", &[][..]),
+        ("fs_water_opaque", &[][..]),
+        ("fs_water_masked", &[][..]),
+    ] {
         let opts = CompileOptions {
             imports: &[],
             specialize: spec,
