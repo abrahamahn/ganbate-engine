@@ -354,8 +354,8 @@ impl Renderer {
             })?,
             bloom_size,
             bloom_levels,
-            ldr: tex(device, width, height, HDR, rt)?,
-            paint: tex(device, width, height, HDR, rt)?,
+            ldr: None,
+            paint: None,
             graded: grade_once
                 .then(|| tex(device, width, height, GRADED_FORMAT, rt))
                 .transpose()?,
@@ -581,13 +581,14 @@ impl Renderer {
                 (6, Resource::Texture(self.lut)),
             ],
         )?;
-        let paint = post(device, p.paint, Resource::Texture(t.ldr), none)?;
-        let final_src = if self.quality.painterly {
-            t.paint
-        } else {
-            t.ldr
+        let (paint, output) = match (t.ldr, t.paint) {
+            (Some(ldr), Some(paint_tex)) => {
+                let (pg, og) =
+                    self.create_paint_groups(device, frame[0], ao_changed, ldr, paint_tex)?;
+                (Some(pg), Some(og))
+            }
+            _ => (None, None),
         };
-        let output = post(device, p.output, Resource::Texture(final_src), none)?;
         Ok(Slot {
             frame,
             tiles,
@@ -619,6 +620,138 @@ impl Renderer {
         })
     }
 
+    pub(super) fn create_paint_groups(
+        &self,
+        device: &mut Device<'_>,
+        frame0: BufferId,
+        ao_changed: BufferId,
+        ldr: TextureId,
+        paint_tex: TextureId,
+    ) -> Result<(BindGroupId, BindGroupId)> {
+        let t = &self.targets;
+        let p = &self.pipelines;
+        let buf = |id| Resource::Buffer {
+            id,
+            offset: 0,
+            size: 0,
+        };
+        let none = Resource::Texture(self.dummy);
+        let post = |d: &mut Device<'_>, pipe, src: Resource| {
+            d.create_bind_group(
+                pipe,
+                0,
+                &[
+                    (0, buf(frame0)),
+                    (1, Resource::Texture(t.depth)),
+                    (2, Resource::Texture(t.aux)),
+                    (3, src),
+                    (4, none),
+                    (5, Resource::Sampler(self.linear_clamp)),
+                    (7, buf(ao_changed)),
+                ],
+            )
+        };
+        let paint = post(device, p.paint, Resource::Texture(ldr))?;
+        let final_src = if self.quality.painterly {
+            paint_tex
+        } else {
+            ldr
+        };
+        match post(device, p.output, Resource::Texture(final_src)) {
+            Ok(output) => Ok((paint, output)),
+            Err(e) => {
+                device.destroy_bind_group(paint);
+                Err(e)
+            }
+        }
+    }
+
+    /// Push constants and active flag for `fs_paint` (painterly Kuwahara filter + depth of field).
+    pub(super) fn paint_push(&self, view: &View) -> ([f32; 16], bool) {
+        let mut pc = [0.0f32; 16];
+        if !self.quality.painterly {
+            return (pc, false);
+        }
+        let l = &self.look;
+        let px_scale = self.targets.height as f32 / 1080.0;
+        pc[..4].copy_from_slice(&[
+            (l.painterly * px_scale * 0.6).clamp(0.0, 6.0),
+            (l.painterly * l.painterly_far.max(0.0) * px_scale).clamp(0.0, 6.0),
+            0.85,
+            0.0,
+        ]);
+        // Depth of field, drawn with the painterly filter.
+        if let Some(f) = view.focus.filter(Focus::blurs) {
+            pc[4..8].copy_from_slice(&[
+                f.distance.max(0.0),
+                f.depth,
+                (f.blur * self.targets.height as f32).min(MAX_FOCUS_BLUR_PX),
+                1.0,
+            ]);
+        }
+        // At radii under a pixel and without depth of field the filter copies each pixel
+        // through. Then one pass tone-maps, grades, sharpens and smooths edges as the three
+        // passes would, two full-screen passes fewer.
+        let painted = pc[0].round() >= 1.0 || pc[1].round() >= 1.0 || pc[7] > 0.5;
+        (pc, painted)
+    }
+
+    /// Lazily allocates `Targets::ldr` and `Targets::paint` (plus each slot's `paint` and `output`
+    /// bind groups) the first time a frame needs `fs_paint`.
+    pub(super) fn ensure_paint_targets(
+        &mut self,
+        device: &mut Device<'_>,
+    ) -> Result<(TextureId, TextureId)> {
+        if let (Some(ldr), Some(paint)) = (self.targets.ldr, self.targets.paint) {
+            return Ok((ldr, paint));
+        }
+        let (w, h) = (self.targets.width, self.targets.height);
+        let desc = TextureDesc::new(
+            w,
+            h,
+            HDR,
+            TextureUsage::COLOR_TARGET | TextureUsage::SAMPLED,
+        );
+        let ldr = device.create_texture(&desc)?;
+        let paint = match device.create_texture(&desc) {
+            Ok(t) => t,
+            Err(e) => {
+                device.destroy_texture(ldr);
+                return Err(e);
+            }
+        };
+        let mut groups = Vec::with_capacity(self.slots.len());
+        for s in &self.slots {
+            match self.create_paint_groups(device, s.frame[0], s.ao_changed, ldr, paint) {
+                Ok(pair) => groups.push(pair),
+                Err(e) => {
+                    for (pg, og) in groups {
+                        device.destroy_bind_group(pg);
+                        device.destroy_bind_group(og);
+                    }
+                    device.destroy_texture(ldr);
+                    device.destroy_texture(paint);
+                    return Err(e);
+                }
+            }
+        }
+        for (s, (pg, og)) in self.slots.iter_mut().zip(groups) {
+            if let Some(old) = s.paint.replace(pg) {
+                device.destroy_bind_group(old);
+            }
+            if let Some(old) = s.output.replace(og) {
+                device.destroy_bind_group(old);
+            }
+        }
+        if let Some(old) = self.targets.ldr.replace(ldr) {
+            device.destroy_texture(old);
+        }
+        if let Some(old) = self.targets.paint.replace(paint) {
+            device.destroy_texture(old);
+        }
+        Ok((ldr, paint))
+    }
+
     pub(super) fn destroy_slots(device: &mut Device<'_>, slots: Vec<Slot>) {
         for s in slots {
             for g in s
@@ -644,7 +777,9 @@ impl Renderer {
                         .into_iter()
                         .flat_map(|(grade, read)| grade.into_iter().chain([read])),
                 )
-                .chain([s.tonemap, s.tonemap_final, s.paint, s.output])
+                .chain([s.tonemap, s.tonemap_final])
+                .chain(s.paint)
+                .chain(s.output)
             {
                 device.destroy_bind_group(g);
             }
@@ -684,10 +819,10 @@ impl Renderer {
             old.ao_grass_coarse,
             old.lit,
             old.bloom,
-            old.ldr,
-            old.paint,
         ]
         .into_iter()
+        .chain(old.ldr)
+        .chain(old.paint)
         .chain(old.graded)
         .chain(old.still)
         .chain(old.cache_water)

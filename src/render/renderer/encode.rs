@@ -568,6 +568,12 @@ impl Renderer {
             Output::Still => 0,
             Output::Surface(_) => device.frame_slot() % self.slots.len(),
         };
+        let (paint_pc, painted) = self.paint_push(view);
+        let paint_targets = if painted {
+            Some(self.ensure_paint_targets(device)?)
+        } else {
+            None
+        };
         // The world map is drawn in this frame's first passes, before anything reads it. After
         // a move it is drawn again, over the land's new bounds (as a cook of the moved world).
         if std::mem::take(&mut self.world_moved) {
@@ -1148,10 +1154,21 @@ impl Renderer {
         if cached {
             enc.blit((t.cache_depth, 0, 0), (t.depth, 0, 0), Filter::Nearest);
         }
+        let main_color_load = if cached {
+            Load::DontCare
+        } else {
+            Load::Clear(clear)
+        };
         enc.begin_pass(PassDesc {
             colors: vec![
-                Attachment::clear(t.hdr, clear),
-                Attachment::clear(t.aux, clear),
+                Attachment {
+                    load: main_color_load,
+                    ..Attachment::clear(t.hdr, clear)
+                },
+                Attachment {
+                    load: main_color_load,
+                    ..Attachment::clear(t.aux, clear)
+                },
             ],
             depth: Some(Attachment {
                 load: if cached {
@@ -1380,43 +1397,27 @@ impl Renderer {
             grade[7] = l.vignette;
             grade[8..11].copy_from_slice(&l.gain);
             grade[11] = l.tonemap as u32 as f32;
-            let mut pc = [0.0f32; 16];
-            pc[..4].copy_from_slice(&[
-                (l.painterly * px_scale * 0.6).clamp(0.0, 6.0),
-                (l.painterly * l.painterly_far.max(0.0) * px_scale).clamp(0.0, 6.0),
-                0.85,
-                0.0,
-            ]);
-            // Depth of field, drawn with the painterly filter.
-            if let Some(f) = view.focus.filter(Focus::blurs) {
-                pc[4..8].copy_from_slice(&[
-                    f.distance.max(0.0),
-                    f.depth,
-                    (f.blur * t.height as f32).min(MAX_FOCUS_BLUR_PX),
-                    1.0,
-                ]);
-            }
-            // At radii under a pixel and without depth of field the filter copies each pixel
-            // through. Then one pass tone-maps, grades, sharpens and smooths edges as the three
-            // passes would, two full-screen passes fewer.
-            let painted = pc[0].round() >= 1.0 || pc[1].round() >= 1.0 || pc[7] > 0.5;
             stats.painted = painted;
-            if painted {
+            if let Some((ldr, paint_tex)) = paint_targets {
+                let (paint_group, output_group) = (
+                    slot.paint.ok_or("paint bind group missing")?,
+                    slot.output.ok_or("output bind group missing")?,
+                );
+                Self::post_pass(enc, ldr, 0, Load::DontCare, p.tonemap, slot.tonemap, grade);
                 Self::post_pass(
                     enc,
-                    t.ldr,
+                    paint_tex,
                     0,
                     Load::DontCare,
-                    p.tonemap,
-                    slot.tonemap,
-                    grade,
+                    p.paint,
+                    paint_group,
+                    paint_pc,
                 );
-                Self::post_pass(enc, t.paint, 0, Load::DontCare, p.paint, slot.paint, pc);
                 let mut pc = [0.0f32; 16];
                 pc[0] = if self.quality.fxaa { 1.0 } else { 0.0 };
                 pc[1] = if encode_srgb { 1.0 } else { 0.0 };
                 pc[2] = l.sharpen.max(0.0);
-                Self::post_pass(enc, dest, 0, Load::DontCare, p.output, slot.output, pc);
+                Self::post_pass(enc, dest, 0, Load::DontCare, p.output, output_group, pc);
             } else {
                 grade[12] = l.sharpen.max(0.0);
                 grade[13] = if self.quality.fxaa { 1.0 } else { 0.0 };

@@ -386,8 +386,8 @@ pub(in crate::render) struct Targets {
     bloom: TextureId,
     bloom_size: (u32, u32),
     bloom_levels: u32,
-    ldr: TextureId,
-    paint: TextureId,
+    ldr: Option<TextureId>,
+    paint: Option<TextureId>,
     /// Each pixel's grade, where frames grade once ([`Renderer::set_grade_once`]).
     graded: Option<TextureId>,
     still: Option<TextureId>,
@@ -430,8 +430,8 @@ pub(in crate::render) struct Slot {
     tonemap_output: [BindGroupId; 2],
     /// `Pipelines::grade_once`'s groups, where frames grade once.
     grade_once: Option<([BindGroupId; 2], BindGroupId)>,
-    paint: BindGroupId,
-    output: BindGroupId,
+    paint: Option<BindGroupId>,
+    output: Option<BindGroupId>,
 }
 
 pub struct Renderer {

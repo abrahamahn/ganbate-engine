@@ -285,8 +285,10 @@ fn sky_color(dir: vec3f) -> vec3f {
   let moon_ang = sqrt(max(2.0 * md, 0.0));
   if (frame.glow_dir.w > 0.0 && moon_r > 0.0) {
     let disc = 1.0 - smoothstep(moon_r * 0.92, moon_r, moon_ang);
-    let surface = 0.82 + 0.18 * noise2((dir.xy - m.xy) * 220.0);
-    col = mix(col, vec3f(1.0, 0.97, 0.9) * (2.6 * surface), disc * frame.glow_dir.w);
+    if (disc > 0.0) {
+      let surface = 0.82 + 0.18 * noise2((dir.xy - m.xy) * 220.0);
+      col = mix(col, vec3f(1.0, 0.97, 0.9) * (2.6 * surface), disc * frame.glow_dir.w);
+    }
     col += vec3f(0.55, 0.65, 0.95) * (exp(-moon_ang * 18.0) * 0.35 * frame.glow_dir.w);
   }
   if (frame.glow.w > 0.0) {

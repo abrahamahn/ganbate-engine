@@ -2378,4 +2378,5 @@ fn reshade_plan_cost() {
     }
 }
 
+mod post;
 mod ssao;

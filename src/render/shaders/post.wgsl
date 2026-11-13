@@ -380,65 +380,84 @@ fn light_shafts(uv: vec2f, frag: vec2f) -> vec3f {
   return frame.glow.rgb * (sum / total * falloff * low * haze * strength);
 }
 
+fn outline_tap(q: vec2i, lin: f32, use_norm: bool, aux_n: vec3f) -> f32 {
+  let dq = depth_px(q);
+  let lq = select(linear_depth(dq), 1e6, dq <= 0.0);
+  let rel = (lq - lin) / lin;
+  var tap = smoothstep(0.04, 0.15, rel);
+  if (use_norm) {
+    let nq = textureLoad(aux_tex, clamp(q, vec2i(0), vec2i(frame.viewport.xy) - vec2i(1)), 0);
+    if (nq.w > 0.0) {
+      tap = max(tap, smoothstep(0.75, 0.35, dot(normalize(nq.xyz), aux_n)) * 0.6);
+    }
+  }
+  return tap;
+}
+
 // Air: occlusion, outlines, aerial perspective, mist and light shafts.
 // pc.a = (ao strength, outline strength, outline width px, unused), pc.b = ao tint rgb,
 // pc.c = outline colour rgb
 @fragment fn fs_air(in: Screen) -> @location(0) vec4f {
   let px = vec2i(in.clip.xy);
-  var col = textureLoad(src_tex, px, 0).rgb;
   let d = depth_px(px);
   let cam = frame.camera.xyz;
   let world = world_at(in.uv, d);
   let to = world - cam;
   let dist = length(to);
+  var edge = 0.0;
+  var aux_w = 0.0;
+  if (d > 0.0) {
+    let aux = textureLoad(aux_tex, px, 0);
+    aux_w = aux.w;
+    // Grass and flowers (aux.w = 0) get no outlines, and leaves and petals (aux.w = 0.5) only a
+    // trace: a line round every leaf cluster of a canopy speckles it.
+    let edge_weight = pc.a.y * smoothstep(90.0, 15.0, dist) * select(1.0, 0.15, aux_w < 0.6) * step(0.01, aux_w);
+    if (edge_weight > 0.0) {
+      // Soft illustrated outlines on depth and normal breaks, fading with distance.
+      let w = i32(max(pc.a.z, 1.0));
+      let lin = linear_depth(d);
+      let use_norm = aux_w > 0.6;
+      var aux_n = vec3f(0.0);
+      if (use_norm) {
+        aux_n = normalize(aux.xyz);
+      }
+      edge = max(edge, outline_tap(px + vec2i(w, 0), lin, use_norm, aux_n));
+      edge = max(edge, outline_tap(px + vec2i(-w, 0), lin, use_norm, aux_n));
+      edge = max(edge, outline_tap(px + vec2i(0, w), lin, use_norm, aux_n));
+      edge = max(edge, outline_tap(px + vec2i(0, -w), lin, use_norm, aux_n));
+      edge *= edge_weight;
+    }
+  }
+  var col = textureLoad(src_tex, px, 0).rgb;
   let dir = to / max(dist, 1e-4);
-  let shafts = light_shafts(in.uv, in.clip.xy);
+  let fc = fog_color(dir);
   if (d <= 0.0) {
     // Sky: a mist veil near the horizon.
     let mist = frame.fog2.z;
-    col = mix(col, fog_color(dir), mist * 0.5 * smoothstep(0.3, 0.0, dir.y));
-    return vec4f(col + shafts * 0.5, 1.0);
-  }
-  let aux = textureLoad(aux_tex, px, 0);
-  var ao = textureSampleLevel(extra_tex, lin_sampler, in.uv, 0.0).r;
-  if (aux.w >= 0.99) {
-    ao = min(ao, clamp(aux.w - 1.0, 0.0, 1.0));
-  }
-  let occl = mix(pc.b.rgb, vec3f(1.0), ao);
-  col *= mix(vec3f(1.0), occl, pc.a.x);
+    col = mix(col, fc, mist * 0.5 * smoothstep(0.3, 0.0, dir.y));
+  } else {
+    var ao = textureSampleLevel(extra_tex, lin_sampler, in.uv, 0.0).r;
+    if (aux_w >= 0.99) {
+      ao = min(ao, clamp(aux_w - 1.0, 0.0, 1.0));
+    }
+    let occl = mix(pc.b.rgb, vec3f(1.0), ao);
+    col *= mix(vec3f(1.0), occl, pc.a.x);
+    if (edge > 0.0) {
+      col = mix(col, pc.c.rgb * (0.4 + 0.6 * luminance(col)), edge);
+    }
 
-  // Soft illustrated outlines on depth and normal breaks, fading with distance.
-  let w = i32(max(pc.a.z, 1.0));
-  let lin = linear_depth(d);
-  var edge = 0.0;
-  let offs = array<vec2i, 4>(vec2i(w, 0), vec2i(-w, 0), vec2i(0, w), vec2i(0, -w));
-  for (var i = 0; i < 4; i++) {
-    let q = px + offs[i];
-    let dq = depth_px(q);
-    let lq = select(linear_depth(dq), 1e6, dq <= 0.0);
-    let rel = (lq - lin) / lin;
-    edge = max(edge, smoothstep(0.04, 0.15, rel));
-    let nq = textureLoad(aux_tex, clamp(q, vec2i(0), vec2i(frame.viewport.xy) - vec2i(1)), 0);
-    if (nq.w > 0.0 && aux.w > 0.6) {
-      edge = max(edge, smoothstep(0.75, 0.35, dot(normalize(nq.xyz), normalize(aux.xyz))) * 0.6);
+    // Aerial perspective, then low mist that pools over water and low ground.
+    let fog = fog_amount(cam, world, dist);
+    col = mix(col, fc, fog);
+    let mist = frame.fog2.z;
+    if (mist > 0.0) {
+      let low = exp(-max(world.y - frame.water.x - 0.3, 0.0) * 0.35);
+      let m = mist * (1.0 - exp(-dist * 0.03)) * mix(0.35, 1.0, low);
+      col = mix(col, fc * 1.05, clamp(m, 0.0, 0.92));
     }
   }
-  // Grass and flowers (aux.w = 0) get no outlines, and leaves and petals (aux.w = 0.5) only a
-  // trace: a line round every leaf cluster of a canopy speckles it.
-  let weight = select(1.0, 0.15, aux.w < 0.6) * step(0.01, aux.w);
-  edge *= pc.a.y * smoothstep(90.0, 15.0, dist) * weight;
-  col = mix(col, pc.c.rgb * (0.4 + 0.6 * luminance(col)), edge);
-
-  // Aerial perspective, then low mist that pools over water and low ground.
-  let fog = fog_amount(cam, world, dist);
-  col = mix(col, fog_color(dir), fog);
-  let mist = frame.fog2.z;
-  if (mist > 0.0) {
-    let low = exp(-max(world.y - frame.water.x - 0.3, 0.0) * 0.35);
-    let m = mist * (1.0 - exp(-dist * 0.03)) * mix(0.35, 1.0, low);
-    col = mix(col, fog_color(dir) * 1.05, clamp(m, 0.0, 0.92));
-  }
-  return vec4f(col + shafts, 1.0);
+  let shafts = light_shafts(in.uv, in.clip.xy);
+  return vec4f(col + select(shafts, shafts * 0.5, d <= 0.0), 1.0);
 }
 
 // Bloom. pc.a = (source texel w, source texel h, threshold, first pass)

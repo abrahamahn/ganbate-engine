@@ -165,6 +165,11 @@ struct FlowerOut {
   @location(2) uv: vec2f,
 };
 
+const FLOWER_CORNERS = array<vec2f, 6>(
+  vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0),
+  vec2f(-1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0)
+);
+
 // Flower heads: small upturned discs on some of the grass sites, above the blades.
 @vertex fn vs_flower(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> FlowerOut {
   var o: FlowerOut;
@@ -174,8 +179,7 @@ struct FlowerOut {
     return o;
   }
   let seed = site.seed;
-  var corners = array<vec2f, 6>(vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0));
-  let c = corners[vi];
+  let c = FLOWER_CORNERS[vi];
   let height = frame.grass.x * (0.75 + 0.6 * rand01(seed + 12u));
   let centre = site.base + vec3f(0.0, height, 0.0) + grass_wind(site.base, seed) * height;
   let to_cam = normalize(frame.camera.xyz - centre);
