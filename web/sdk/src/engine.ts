@@ -296,9 +296,9 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
     },
     cacheStats() {
       if (typeof x.ganbate_rt_cache_stats !== 'function') return null;
-      const p = reserve(32);
+      const p = reserve(40);
       if (!x.ganbate_rt_cache_stats(p)) return null;
-      const w = new Uint32Array(x.memory.buffer, p, 8);
+      const w = new Uint32Array(x.memory.buffer, p, 10);
       return {
         worldCached: w[0] !== 0,
         regions: w[1],
@@ -308,6 +308,8 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
         waterStaticsRegions: w[5],
         waterFootprints: w[6],
         reshadePixels: w[7],
+        aoKept: w[8] !== 0,
+        aoChangedPixels: w[9],
       };
     },
     setStereoEye(eye: GanbateStereoEyeName | GanbateStereoEye = 'mono', ipdMetres = 0.063) {

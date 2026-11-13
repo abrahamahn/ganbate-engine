@@ -303,11 +303,11 @@ test('without ResizeObserver, project and fitCanvas read the CSS box on every ca
   assert.equal(probe.reads, 6);
 });
 
-test('cacheStats reads the eight words of the last frame\'s cached picture, the re-shaded pixels last', async () => {
+test('cacheStats reads the ten words of the last frame\'s cached picture, the kept AO\'s changed pixels last', async () => {
   const { canvas } = makeRecordingWebGl2Canvas();
   const mock = makeMockWasm({
     ganbate_rt_cache_stats(outPtr) {
-      new Uint32Array(mock.memory.buffer, outPtr >>> 0, 8).set([1, 2, 1, 0, 1, 3, 4, 450892]);
+      new Uint32Array(mock.memory.buffer, outPtr >>> 0, 10).set([1, 2, 1, 0, 1, 3, 4, 450892, 1, 81234]);
       return 1;
     },
   });
@@ -321,9 +321,12 @@ test('cacheStats reads the eight words of the last frame\'s cached picture, the 
     waterStaticsRegions: 3,
     waterFootprints: 4,
     reshadePixels: 450892,
+    aoKept: true,
+    aoChangedPixels: 81234,
   });
   const dts = fs.readFileSync(path.join(__dirname, '..', 'dist', 'ganbate.d.ts'), 'utf8');
   assert.ok(dts.includes('readonly reshadePixels: number;'));
+  assert.ok(dts.includes('readonly aoChangedPixels: number;'));
   const without = makeMockWasm({ ganbate_rt_cache_stats: undefined });
   const bare = await createEngine({ canvas, wasm: without.instance, api: 'webgl2' });
   assert.equal(bare.cacheStats(), null);

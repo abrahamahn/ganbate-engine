@@ -513,16 +513,19 @@ pub unsafe extern "C" fn ganbate_rt_frame_stats(out: *mut u8) -> u32 {
     })
 }
 
-/// Writes what the last frame did with the room's cached picture as eight words at `out`: 1 when
+/// Writes what the last frame did with the room's cached picture as ten words at `out`: 1 when
 /// it started from the picture as it was (0: drew it whole), the regions of it drawn again, 1
 /// when pixels of it that moved props' shadows reach were shaded again; then 1 when the water
 /// read its lamp light and shadow as kept with the picture (0: computed them), 1 when those were
 /// drawn whole, the regions of them drawn again, and the footprints of moved props' shadows
 /// within which the water computed them; then the pixels of the region the moved props'
-/// shadows were sought in and shaded again within (0: none).
+/// shadows were sought in and shaded again within (0: none); then 1 when the ambient occlusion
+/// was kept from the frame before (0: computed whole, or not at all), and the pixels whose depth
+/// or normals changed since, which it was computed again around (`width * height` on whole-pass
+/// fallback).
 ///
 /// # Safety
-/// `out` must address 32 writable bytes.
+/// `out` must address 40 writable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ganbate_rt_cache_stats(out: *mut u8) -> u32 {
     with(0, |rt| {
@@ -539,13 +542,15 @@ pub unsafe extern "C" fn ganbate_rt_cache_stats(out: *mut u8) -> u32 {
             s.water_statics_regions,
             s.water_footprints,
             s.reshade_pixels,
+            u32::from(s.ao_kept),
+            s.ao_changed_pixels,
         ];
-        let mut buf = [0u8; 32];
+        let mut buf = [0u8; 40];
         for (i, w) in words.iter().enumerate() {
             buf[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
         }
-        // SAFETY: the caller passes 32 writable bytes.
-        unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), out, 32) };
+        // SAFETY: the caller passes 40 writable bytes.
+        unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), out, 40) };
         Ok(1)
     })
 }

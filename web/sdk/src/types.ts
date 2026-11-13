@@ -123,6 +123,10 @@ export interface GanbateCacheStats {
   readonly waterFootprints: number;
   /** Pixels of the region moved props' shadows were sought in and shaded again within (0: none). */
   readonly reshadePixels: number;
+  /** The ambient occlusion was kept from the frame before and computed again only where what it reads changed and on the water (false: computed whole, or not at all). */
+  readonly aoKept: boolean;
+  /** Pixels of the CPU changed regions (`union_area`) when `aoKept` is true, `width * height` on >= 50% whole-pass fallback, or 0 when skipped or computed whole from scratch. */
+  readonly aoChangedPixels: number;
 }
 
 export interface GanbateStereoViews {
