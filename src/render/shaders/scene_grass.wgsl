@@ -11,7 +11,7 @@ struct GrassSite {
   seed: u32,
 };
 
-fn grass_site(ii: u32) -> GrassSite {
+fn grass_site_for(ii: u32, flower_limit: f32) -> GrassSite {
   var o: GrassSite;
   o.keep = 0.0;
   o.widen = 1.0;
@@ -27,6 +27,9 @@ fn grass_site(ii: u32) -> GrassSite {
   let cz = i32(floor(cam.z / GRASS_SPACING)) + row - half;
   let seed = hash_u((bitcast<u32>(cx) * 73856093u) ^ hash_u(bitcast<u32>(cz) * 19349663u + 7u));
   o.seed = seed;
+  if (flower_limit <= 1.0 && (flower_limit <= 0.0 || rand01(seed + 11u) > flower_limit)) {
+    return o;
+  }
   let jx = rand01(seed);
   let jz = rand01(seed + 1u);
   let x = (f32(cx) + jx) * GRASS_SPACING;
@@ -58,6 +61,10 @@ fn grass_site(ii: u32) -> GrassSite {
   o.keep = 1.0;
   o.widen = min(inverseSqrt(max(density, 0.05)), 3.0);
   return o;
+}
+
+fn grass_site(ii: u32) -> GrassSite {
+  return grass_site_for(ii, 2.0);
 }
 
 fn grass_wind(base: vec3f, seed: u32) -> vec3f {
@@ -174,8 +181,8 @@ const FLOWER_CORNERS = array<vec2f, 6>(
 @vertex fn vs_flower(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> FlowerOut {
   var o: FlowerOut;
   o.clip = vec4f(0.0, 0.0, -1.0, 1.0);
-  let site = grass_site(ii);
-  if (site.keep <= 0.0 || rand01(site.seed + 11u) > frame.grass.z) {
+  let site = grass_site_for(ii, frame.grass.z);
+  if (site.keep <= 0.0) {
     return o;
   }
   let seed = site.seed;
@@ -203,6 +210,9 @@ const FLOWER_CORNERS = array<vec2f, 6>(
 
 @fragment fn fs_flower(in: FlowerOut, @builtin(position) frag: vec4f) -> FsOut {
   let r = length(in.uv);
+  if (r > 1.0) {
+    discard;
+  }
   let a = atan2(in.uv.y, in.uv.x);
   let petals = 0.62 + 0.38 * abs(cos(a * 2.5));
   if (r > petals) {

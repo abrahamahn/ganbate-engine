@@ -1083,7 +1083,11 @@ impl Renderer {
             enc.end_pass();
             enc.begin_pass(PassDesc {
                 colors: vec![keep(t.cache_hdr), keep(t.cache_aux), keep(t.cache_shadow)],
-                depth: Some(keep(t.reshade_depth)),
+                depth: Some(Attachment {
+                    load: Load::Load,
+                    store: false,
+                    ..Attachment::clear(t.reshade_depth, clear)
+                }),
             });
             enc.set_scissor(x0, y0, x1 - x0, y1 - y0);
             let within = eye.within(&plan.region, size);

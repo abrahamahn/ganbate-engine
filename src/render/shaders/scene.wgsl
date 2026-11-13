@@ -200,10 +200,6 @@ struct Reshade {
 @group(0) @binding(17) var<uniform> reshade: Reshade;
 @group(0) @binding(18) var cache_shadow: texture_2d<f32>;
 
-struct Marked {
-  @builtin(frag_depth) depth: f32,
-};
-
 // Whether a lookup at `c` (clip coordinates in shadow map `map`) can see what moved: inside a
 // footprint and behind its nearest point; or, `loose`, a lookup made for the point at `c`
 // (within the footprint's margins of it).
@@ -284,15 +280,14 @@ fn game_light_share(world: vec3f, n: vec3f, l: Light, frag: vec2f) -> f32 {
 
 // Marks the cached picture's pixels whose shading moved props changed: where a lookup of a
 // shadow they cast into falls in their footprint and the shadow it finds now differs from the
-// one the picture was shaded with (`cast_shadows`). Depth 0 there (a re-shade pass then draws
-// what the picture holds over them), 1 elsewhere.
-@fragment fn fs_reshade_mask(@builtin(position) frag: vec4f) -> Marked {
-  var o: Marked;
-  o.depth = 1.0;
+// one the picture was shaded with (`cast_shadows`). Fixed-function depth 0 there (a re-shade
+// pass then draws what the picture holds over them); discarded elsewhere so the cleared depth 1
+// and its hardware Hi-Z / HTILE state stand untouched.
+@fragment fn fs_reshade_mask(@builtin(position) frag: vec4f) {
   let px = vec2i(frag.xy);
   let d = textureLoad(cache_depth, px, 0);
   if (d <= 0.0) {
-    return o;
+    discard;
   }
   let uv = frag.xy * frame.viewport.zw;
   let h = frame.inv_view_proj * vec4f(uv * 2.0 - 1.0, d, 1.0);
@@ -308,7 +303,7 @@ fn game_light_share(world: vec3f, n: vec3f, l: Light, frag: vec2f) -> f32 {
   let key = moved_footprint(0u, c0, true)
     || (!near_cascade_only(c0, dist, reshade.near.xy) && moved_footprint(1u, frame.shadow1 * p, true));
   if (!(lit0 || lit1 || key)) {
-    return o;
+    discard;
   }
   // The surface's normal as its shading offset its shadow lookups (aux.xyz).
   let n = textureLoad(cache_aux, px, 0).xyz;
@@ -319,16 +314,15 @@ fn game_light_share(world: vec3f, n: vec3f, l: Light, frag: vec2f) -> f32 {
     if (select(lit0, lit1, layer == 1u)) {
       let now = game_light_share(world, n, lights[index - 1u], frag.xy);
       if (abs(now - select(was.y, was.z, layer == 1u)) > changed) {
-        o.depth = 0.0;
-        return o;
+        return;
       }
     }
   }
   if (key && was.w > 0.5 && key_moved(world, n, dist)
       && abs(shadow(world, n, dist, frag.xy) - was.x) > changed) {
-    o.depth = 0.0;
+    return;
   }
-  return o;
+  discard;
 }
 
 // Normal mapping without stored tangents (screen-space cotangent frame).

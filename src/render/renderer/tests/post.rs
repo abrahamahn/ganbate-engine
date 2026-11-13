@@ -9,7 +9,9 @@ fn air_sky_and_flower_shaders_compile_on_all_backends() {
         (POST, Stage::Fragment, "fs_tonemap_output_plain"),
         (POST, Stage::Fragment, "fs_tonemap_final"),
         (WORLD_FX, Stage::Fragment, "fs_sky"),
+        (WORLD_FX, Stage::Vertex, "vs_particle"),
         (SCENE, Stage::Vertex, "vs_flower"),
+        (SCENE, Stage::Fragment, "fs_flower"),
     ] {
         compile(src, stage, entry).unwrap_or_else(|e| panic!("{entry} spirv: {e}"));
         let composed = ganbate_shader::compose(src, &shader_modules()).expect("compose");
@@ -303,5 +305,274 @@ fn tonemap_passes_read_near_sharpen_without_binding_depth() {
             .map(|b| b.binding)
             .collect();
         assert_eq!(bound, expected, "{entry} ({spec:?})");
+    }
+}
+
+#[test]
+fn reshade_mask_omits_frag_depth_and_matches_still_frames() {
+    use crate::render::lights::{LightDesc, SpotCone};
+
+    let spv = compile(SCENE, Stage::Fragment, "fs_reshade_mask").expect("spirv");
+    assert!(spv.outputs.is_empty(), "fs_reshade_mask has colour outputs");
+    let mut idx = 5;
+    let mut saw_kill = false;
+    while idx < spv.words.len() {
+        let word = spv.words[idx];
+        let count = (word >> 16) as usize;
+        let op = word & 0xffff;
+        assert!(count > 0 && idx + count <= spv.words.len());
+        // OpExecutionMode (16): mode 12 is DepthReplacing.
+        if op == 16 && count >= 3 {
+            assert_ne!(
+                spv.words[idx + 2],
+                12,
+                "fs_reshade_mask emitted SPIR-V DepthReplacing"
+            );
+        }
+        // OpDecorate (71) / OpMemberDecorate (72): Decoration::BuiltIn (11) FragDepth (22).
+        if op == 71 && count >= 4 && spv.words[idx + 2] == 11 {
+            assert_ne!(
+                spv.words[idx + 3],
+                22,
+                "fs_reshade_mask decorated FragDepth"
+            );
+        }
+        if op == 72 && count >= 5 && spv.words[idx + 3] == 11 {
+            assert_ne!(
+                spv.words[idx + 4],
+                22,
+                "fs_reshade_mask member-decorated FragDepth"
+            );
+        }
+        // OpKill (252).
+        if op == 252 {
+            saw_kill = true;
+        }
+        idx += count;
+    }
+    assert!(saw_kill, "fs_reshade_mask must discard unchanged pixels");
+
+    let composed = ganbate_shader::compose(SCENE, &shader_modules()).expect("compose");
+    let opts = CompileOptions::default();
+    let glsl = compile_glsl_with_options(&composed, Stage::Fragment, "fs_reshade_mask", &opts)
+        .expect("glsl")
+        .glsl
+        .expect("glsl source");
+    assert!(!glsl.source.contains("gl_FragDepth"));
+    assert!(glsl.source.contains("discard"));
+    let msl = compile_msl_with_options(&composed, Stage::Fragment, "fs_reshade_mask", &opts)
+        .expect("msl")
+        .msl
+        .expect("msl source");
+    assert!(!msl.source.contains("[[depth("));
+    assert!(msl.source.contains("discard_fragment()"));
+    let wgsl = compile_wgsl_with_options(&composed, Stage::Fragment, "fs_reshade_mask", &opts)
+        .expect("wgsl")
+        .wgsl
+        .expect("wgsl source");
+    assert!(!wgsl.source.contains("frag_depth"));
+    assert!(wgsl.source.contains("discard"));
+
+    let Ok(mut device) = Device::headless() else {
+        return;
+    };
+    let mut world = World::default();
+    world.materials.push(Material {
+        name: "floor".into(),
+        base_color: [0.62, 0.6, 0.56, 1.0],
+        roughness: 0.8,
+        alpha: AlphaMode::Opaque,
+        shading: Shading::Standard,
+        ..Material::default()
+    });
+    world.meshes.push(make_quad_mesh(0.0, 4.0));
+    world.instances.push(Instance {
+        mesh: 0,
+        transform: Transform(math::IDENTITY),
+    });
+    let look = Look {
+        painterly: 0.0,
+        ..Look::default()
+    };
+    let size = (80, 60);
+    let view = View {
+        name: "reshade".into(),
+        eye: [0.0, 1.9, 2.4],
+        target: [0.0, 0.6, 0.0],
+        fov: 45.0,
+        ..View::default()
+    };
+    let env = Environment::resolve(
+        &TimeOfDay {
+            hours: 15.0,
+            ..TimeOfDay::default()
+        },
+        &Weather::default(),
+        &look.palette,
+        1.0,
+    );
+    let (sp, sn, suv, sidx) = sphere_prop_data();
+    let place = |x: f32, y: f32, z: f32, s: f32| {
+        let mut m = math::IDENTITY;
+        for k in [0, 5, 10] {
+            m[k] = s;
+        }
+        m[12..15].copy_from_slice(&[x, y, z]);
+        m
+    };
+    let setup = |device: &mut Device<'_>, output: Output| {
+        let mut r = Renderer::new(
+            device,
+            &world,
+            look.clone(),
+            Quality::realtime(),
+            size,
+            output,
+        )
+        .expect("renderer");
+        r.finish_ao(device).expect("ao");
+        let sphere = r
+            .create_prop_mesh(
+                device,
+                &MeshData {
+                    positions: &sp,
+                    normals: &sn,
+                    uvs: &suv,
+                    indices: &sidx,
+                },
+            )
+            .expect("mesh");
+        let receiver_mat = r
+            .create_prop_material(
+                device,
+                &MaterialDesc {
+                    name: "slab".into(),
+                    base_color: [0.55, 0.36, 0.24, 1.0],
+                    casts_shadow: true,
+                    ..MaterialDesc::default()
+                },
+            )
+            .expect("slab mat");
+        let caster_mat = r
+            .create_prop_material(
+                device,
+                &MaterialDesc {
+                    name: "caster".into(),
+                    base_color: [0.82, 0.62, 0.5, 1.0],
+                    casts_shadow: true,
+                    ..MaterialDesc::default()
+                },
+            )
+            .expect("caster mat");
+        let mut slab = math::IDENTITY;
+        (slab[0], slab[5], slab[10], slab[13]) = (1.1, 0.06, 0.8, 0.65);
+        r.create_prop_instance(sphere, receiver_mat, &slab)
+            .expect("slab");
+        let caster = r
+            .create_prop_instance(sphere, caster_mat, &place(-0.25, 1.15, 0.05, 0.24))
+            .expect("caster");
+        r.create_light(&LightDesc {
+            position: [0.25, 2.8, 0.35],
+            range: 8.0,
+            color: [1.0, 0.92, 0.82],
+            intensity: 6.0,
+            spot: Some(SpotCone {
+                direction: [-0.1, -1.0, -0.1],
+                inner: 0.35,
+                outer: 0.65,
+            }),
+            follows_lamps: false,
+            shadow: 1.0,
+        })
+        .expect("spot");
+        (r, caster)
+    };
+
+    let (mut cached, cached_caster) = setup(&mut device, Output::Surface(Format::Rgba8Unorm));
+    let (mut whole, whole_caster) = setup(&mut device, Output::Surface(Format::Rgba8Unorm));
+    let (mut cached_srgb, srgb_caster) = setup(&mut device, Output::Surface(Format::Rgba8Srgb));
+    let (mut still, still_caster) = setup(&mut device, Output::Still);
+    let cached_out = canvas(&mut device, size);
+    let whole_out = canvas(&mut device, size);
+    let srgb_tex = device
+        .create_texture(&TextureDesc::new(
+            size.0,
+            size.1,
+            Format::Rgba8Srgb,
+            TextureUsage::COLOR_TARGET | TextureUsage::COPY_SRC,
+        ))
+        .expect("srgb target");
+    let srgb_rb = device
+        .create_buffer(&BufferDesc {
+            size: u64::from(size.0 * size.1 * 4),
+            usage: BufferUsage::COPY_DST,
+            memory: Memory::Readback,
+        })
+        .expect("srgb readback");
+
+    // Settle both props into the cached picture first across all presented renderers.
+    for _ in 0..10 {
+        for (r, tex) in [
+            (&mut cached, cached_out.0),
+            (&mut whole, whole_out.0),
+            (&mut cached_srgb, srgb_tex),
+        ] {
+            let mut enc = device.encoder();
+            r.encode(&mut device, &mut enc, &view, &env, [0.0; 2], 0, Some(tex))
+                .expect("settle encode");
+            device.submit(enc).expect("settle submit");
+        }
+    }
+    assert!(cached.last_frame_stats().world_cached);
+
+    // Move the shadow-casting sphere across the settled slab and floor: every reshaded frame
+    // must match a whole-drawn surface frame byte-for-byte, and match Output::Still within the
+    // single sRGB quantization step of Still's f16 readback.
+    for x in [0.22, -0.32, 0.05] {
+        let m = place(x, 1.15, 0.05, 0.24);
+        for (r, c) in [
+            (&mut cached, cached_caster),
+            (&mut whole, whole_caster),
+            (&mut cached_srgb, srgb_caster),
+            (&mut still, still_caster),
+        ] {
+            r.set_prop_instance(c, &m, true).expect("move caster");
+        }
+        let a = present(&mut device, &mut cached, &view, &env, cached_out);
+        let stats = cached.last_frame_stats();
+        assert!(
+            stats.world_cached && stats.reshaded && stats.reshade_pixels > 0,
+            "expected reshade at x={x}: {stats:?}"
+        );
+        whole.world_cache = None;
+        whole.prop_shadows_for = None;
+        let b = present(&mut device, &mut whole, &view, &env, whole_out);
+        assert_same_frame(&device, &a, &b, &format!("reshade vs whole at x={x}"));
+
+        let srgb_live = frame_srgb(
+            &mut device,
+            &mut cached_srgb,
+            &view,
+            &env,
+            Some((srgb_tex, srgb_rb)),
+        );
+        assert!(cached_srgb.last_frame_stats().reshaded);
+        let srgb_still = frame_srgb(&mut device, &mut still, &view, &env, None);
+        let max_step = srgb_live
+            .chunks_exact(4)
+            .zip(srgb_still.chunks_exact(4))
+            .flat_map(|(p, q)| (0..3).map(move |ch| p[ch].abs_diff(q[ch])))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_step <= 1,
+            "reshaded frame vs Output::Still differed by {max_step} at x={x}"
+        );
+    }
+
+    let errs = device.validation_errors();
+    assert!(errs.is_empty(), "validation errors: {errs:?}");
+    for r in [&mut cached, &mut whole, &mut cached_srgb, &mut still] {
+        r.destroy_props(&mut device);
     }
 }

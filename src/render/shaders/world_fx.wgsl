@@ -165,12 +165,12 @@ struct ParticleOut {
   @location(1) color: vec4f,
 };
 
+const PARTICLE_CORNERS = array<vec2f, 6>(
+  vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0),
+  vec2f(-1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0)
+);
+
 @vertex fn vs_particle(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> ParticleOut {
-  let corners = array<vec2f, 6>(
-    vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0),
-    vec2f(-1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0)
-  );
-  let c = corners[vi];
   let kind = particle.params.x;
   let box = particle.params.z;
   let t = frame.camera.w;
@@ -192,6 +192,17 @@ struct ParticleOut {
   let centre = particle.centre.xyz;
   let rel = (pos - centre) / box + vec3f(0.5);
   let world_c = centre + (rel - floor(rel) - vec3f(0.5)) * box;
+  // Thin out near the camera so drops never fill the lens; petals drift only near the ground.
+  let d = length(world_c - cam);
+  let near_fade = smoothstep(0.6, 2.2, d) * particle.params.w;
+  let height_fade = select(1.0, smoothstep(11.0, 5.0, world_c.y - particle.params.y), kind >= 0.5);
+  let cw = (frame.view_proj * vec4f(world_c, 1.0)).w;
+  if (particle.tint.a <= 0.0 || near_fade <= 0.0 || height_fade <= 0.0 || cw < -1.0) {
+    var o: ParticleOut;
+    o.clip = vec4f(0.0, 0.0, -1.0, 1.0);
+    return o;
+  }
+  let c = PARTICLE_CORNERS[vi];
   let to_cam = normalize(cam - world_c);
   var world = world_c;
   var color = particle.tint;
@@ -212,11 +223,9 @@ struct ParticleOut {
     let lit = frame.amb_sky.rgb * 0.8 + frame.key_color.rgb * (frame.key_dir.w * 0.28) + vec3f(1.0, 0.6, 0.3) * (frame.amb_sky.w * 0.18);
     color = vec4f(particle.tint.rgb * lit * (0.75 + 0.5 * r.y), particle.tint.a);
   }
-  // Thin out near the camera so drops never fill the lens; petals drift only near the ground.
-  let d = length(world_c - cam);
-  color.a *= smoothstep(0.6, 2.2, d) * particle.params.w;
+  color.a *= near_fade;
   if (kind >= 0.5) {
-    color.a *= smoothstep(11.0, 5.0, world_c.y - particle.params.y);
+    color.a *= height_fade;
   }
   var o: ParticleOut;
   o.clip = frame.view_proj * vec4f(world, 1.0);
