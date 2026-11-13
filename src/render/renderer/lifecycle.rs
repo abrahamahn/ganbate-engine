@@ -573,8 +573,6 @@ impl Renderer {
             0,
             &[
                 (0, buf(frame[0])),
-                (1, Resource::Texture(t.depth)),
-                (2, Resource::Texture(t.aux)),
                 (3, Resource::Texture(t.lit)),
                 (4, Resource::TextureMip(t.bloom, 0)),
                 (5, Resource::Sampler(self.linear_clamp)),
@@ -652,12 +650,7 @@ impl Renderer {
             )
         };
         let paint = post(device, p.paint, Resource::Texture(ldr))?;
-        let final_src = if self.quality.painterly {
-            paint_tex
-        } else {
-            ldr
-        };
-        match post(device, p.output, Resource::Texture(final_src)) {
+        match post(device, p.output, Resource::Texture(paint_tex)) {
             Ok(output) => Ok((paint, output)),
             Err(e) => {
                 device.destroy_bind_group(paint);

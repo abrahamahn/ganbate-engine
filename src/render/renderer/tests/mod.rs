@@ -202,8 +202,8 @@ fn the_cached_water_reads_its_light_within_webgl_units() {
 }
 
 /// The grade-once passes compile for every backend the player draws with, and the output
-/// reading the grades (`GRADED`) binds the frame, the depth and the grades alone: nothing the
-/// grading reads (the bloom, its sampler) is left in it.
+/// reading the grades (`GRADED`) binds the frame and the grades alone: nothing the grading
+/// reads (the bloom, its sampler) or the scene's depth is left in it.
 #[test]
 fn the_grade_once_shaders_compile_everywhere() {
     let composed = ganbate_shader::compose(POST, &shader_modules()).expect("compose");
@@ -227,7 +227,7 @@ fn the_grade_once_shaders_compile_everywhere() {
         .iter()
         .map(|b| b.binding)
         .collect();
-    assert_eq!(bound, [0, 1, 3]);
+    assert_eq!(bound, [0, 3]);
 }
 
 #[test]

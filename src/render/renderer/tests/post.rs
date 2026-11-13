@@ -5,6 +5,9 @@ fn air_sky_and_flower_shaders_compile_on_all_backends() {
     let opts = CompileOptions::default();
     for (src, stage, entry) in [
         (POST, Stage::Fragment, "fs_air"),
+        (POST, Stage::Fragment, "fs_tonemap_output"),
+        (POST, Stage::Fragment, "fs_tonemap_output_plain"),
+        (POST, Stage::Fragment, "fs_tonemap_final"),
         (WORLD_FX, Stage::Fragment, "fs_sky"),
         (SCENE, Stage::Vertex, "vs_flower"),
     ] {
@@ -283,5 +286,22 @@ fn paint_targets_allocate_lazily_across_still_surface_resize_and_set_quality() {
         &mut still_fresh_paint,
     ] {
         r.destroy_props(&mut device);
+    }
+}
+
+#[test]
+fn tonemap_passes_read_near_sharpen_without_binding_depth() {
+    for (entry, spec, expected) in [
+        ("fs_tonemap_output", &[][..], &[0u32, 3, 4, 5][..]),
+        ("fs_tonemap_output_plain", &[], &[0, 3, 4, 5]),
+        ("fs_tonemap_output", &GRADED, &[0, 3]),
+        ("fs_tonemap_final", &[], &[0, 3, 4, 5, 6]),
+    ] {
+        let c = compile_specialized(POST, Stage::Fragment, entry, spec).expect(entry);
+        let bound: Vec<u32> = sorted_bindings(&c.bindings)
+            .iter()
+            .map(|b| b.binding)
+            .collect();
+        assert_eq!(bound, expected, "{entry} ({spec:?})");
     }
 }

@@ -457,7 +457,8 @@ fn outline_tap(q: vec2i, lin: f32, use_norm: bool, aux_n: vec3f) -> f32 {
     }
   }
   let shafts = light_shafts(in.uv, in.clip.xy);
-  return vec4f(col + select(shafts, shafts * 0.5, d <= 0.0), 1.0);
+  let near = select(1.0 - smoothstep(6.0, 18.0, linear_depth(d)), 0.0, d <= 0.0);
+  return vec4f(col + select(shafts, shafts * 0.5, d <= 0.0), near);
 }
 
 // Bloom. pc.a = (source texel w, source texel h, threshold, first pass)
@@ -726,16 +727,18 @@ fn defocus(uv: vec2f, px: vec2i, r: f32) -> vec3f {
   return vec4f(col, 1.0);
 }
 
-// The lit picture at pixel `p` tone-mapped, graded and vignetted, clamped to display range: what
-// `fs_tonemap` writes there. pc.a = (exposure, bloom, saturation, contrast), pc.b = lift rgb +
-// vignette, pc.c = (gain rgb, tonemap operator). `identity`: the grade is saturation 1, contrast
-// 1, lift 0 and gain 1, which leave the tone-mapped colour as it is, held to [0, 1] (the
-// saturation's floor, the contrast's ceiling): it is held there without them.
-fn graded_at(p: vec2i, identity: bool) -> vec3f {
+// The lit picture at pixel `p` tone-mapped, graded and vignetted, clamped to display range (with
+// `src_tex`'s near-sharpening factor preserved in `.a`): what `fs_tonemap` writes there.
+// pc.a = (exposure, bloom, saturation, contrast), pc.b = lift rgb + vignette,
+// pc.c = (gain rgb, tonemap operator). `identity`: the grade is saturation 1, contrast 1, lift 0
+// and gain 1, which leave the tone-mapped colour as it is, held to [0, 1] (the saturation's floor,
+// the contrast's ceiling): it is held there without them.
+fn graded_at(p: vec2i, identity: bool) -> vec4f {
   let size = vec2i(frame.viewport.xy);
   let q = clamp(p, vec2i(0), size - vec2i(1));
   let uv = (vec2f(q) + vec2f(0.5)) * frame.viewport.zw;
-  var col = textureLoad(src_tex, q, 0).rgb;
+  let src = textureLoad(src_tex, q, 0);
+  var col = src.rgb;
   let bloom = textureSampleLevel(extra_tex, lin_sampler, uv, 0.0).rgb;
   col = (col + bloom * pc.a.y) * pc.a.x;
   col = apply_tonemap(col, i32(pc.c.w + 0.5));
@@ -751,17 +754,17 @@ fn graded_at(p: vec2i, identity: bool) -> vec3f {
   }
   let v = length(uv - vec2f(0.5)) * 1.35;
   col *= 1.0 - pc.b.w * pow(v, 2.6);
-  return clamp(col, vec3f(0.0), vec3f(1.0));
+  return vec4f(clamp(col, vec3f(0.0), vec3f(1.0)), src.a);
 }
 
 // `graded_at` for every pixel, into a 32-bit float target that holds it exactly, for
 // `fs_tonemap_output` compiled with `GRADED` to read (`Renderer::set_grade_once`).
 @fragment fn fs_grade(in: Screen) -> @location(0) vec4f {
-  return vec4f(graded_at(vec2i(in.clip.xy), false), 1.0);
+  return graded_at(vec2i(in.clip.xy), false);
 }
 
 @fragment fn fs_grade_plain(in: Screen) -> @location(0) vec4f {
-  return vec4f(graded_at(vec2i(in.clip.xy), true), 1.0);
+  return graded_at(vec2i(in.clip.xy), true);
 }
 
 // Set, `tonemap_output` reads each pixel's grade from `src_tex`, where `fs_grade` wrote it,
@@ -769,10 +772,10 @@ fn graded_at(p: vec2i, identity: bool) -> vec3f {
 // picture, for one grade a pixel instead of five.
 const GRADED: bool = false;
 
-fn graded(p: vec2i, identity: bool) -> vec3f {
+fn graded(p: vec2i, identity: bool) -> vec4f {
   if (GRADED) {
     let size = vec2i(frame.viewport.xy);
-    return textureLoad(src_tex, clamp(p, vec2i(0), size - vec2i(1)), 0).rgb;
+    return textureLoad(src_tex, clamp(p, vec2i(0), size - vec2i(1)), 0);
   } else {
     return graded_at(p, identity);
   }
@@ -785,16 +788,16 @@ fn graded(p: vec2i, identity: bool) -> vec3f {
 // smoothing on, encode sRGB, unused).
 fn tonemap_output(in: Screen, identity: bool) -> vec4f {
   let px = vec2i(in.clip.xy);
-  let centre = graded(px, identity);
+  let centre_tap = graded(px, identity);
+  let centre = centre_tap.rgb;
   var col = centre;
-  let d = depth_px(px);
-  let sharpen = pc.d.x * select(1.0 - smoothstep(6.0, 18.0, linear_depth(d)), 0.0, d <= 0.0);
+  let sharpen = pc.d.x * centre_tap.a;
   let smoothing = pc.d.y > 0.5;
   if (sharpen > 0.0 || smoothing) {
-    let n = graded(px + vec2i(0, -1), identity);
-    let s = graded(px + vec2i(0, 1), identity);
-    let e = graded(px + vec2i(1, 0), identity);
-    let w = graded(px + vec2i(-1, 0), identity);
+    let n = graded(px + vec2i(0, -1), identity).rgb;
+    let s = graded(px + vec2i(0, 1), identity).rgb;
+    let e = graded(px + vec2i(1, 0), identity).rgb;
+    let w = graded(px + vec2i(-1, 0), identity).rgb;
     if (sharpen > 0.0) {
       let detail = col - (n + s + e + w) * 0.25;
       col = max(col + clamp(detail * sharpen, vec3f(-0.08), vec3f(0.08)), vec3f(0.0));
@@ -856,9 +859,9 @@ fn sample_lut(hdr: vec3f) -> vec3f {
   let px = vec2i(in.clip.xy);
   let size = vec2i(frame.viewport.xy);
   let bloom = textureSampleLevel(extra_tex, lin_sampler, in.uv, 0.0).rgb * pc.a.y;
-  var hdr = (textureLoad(src_tex, px, 0).rgb + bloom) * pc.a.x;
-  let d = depth_px(px);
-  let sharpen = pc.a.w * select(1.0 - smoothstep(6.0, 18.0, linear_depth(d)), 0.0, d <= 0.0);
+  let src = textureLoad(src_tex, px, 0);
+  var hdr = (src.rgb + bloom) * pc.a.x;
+  let sharpen = pc.a.w * src.a;
   if (sharpen > 0.0 || pc.b.y > 0.5) {
     let n0 = (textureLoad(src_tex, clamp(px + vec2i(0, -1), vec2i(0), size - vec2i(1)), 0).rgb + bloom) * pc.a.x;
     let s0 = (textureLoad(src_tex, clamp(px + vec2i(0, 1), vec2i(0), size - vec2i(1)), 0).rgb + bloom) * pc.a.x;
