@@ -92,8 +92,11 @@ fn grass_aux(a: vec4f) -> bool {
   return a.y > 0.5 && a.w <= 0.0;
 }
 
-// 1/2-scale visible grass and flowers (`ao_grass_half`): exclusively `fs_grass` and `fs_flower`
-// write `aux = (0, 1, 0, 0)`.
+fn water_aux(a: vec4f) -> bool {
+  return abs(a.w - WATER_AUX) < 0.05;
+}
+
+// 1/2-scale visible grass/flowers (`.r`) and water (`.g`) (`ao_grass_half`).
 @fragment fn fs_ao_grass_half(in: Screen) -> @location(0) vec4f {
   let b = vec2i(in.clip.xy) * 2;
   let hi = vec2i(frame.viewport.xy) - vec2i(1);
@@ -102,52 +105,63 @@ fn grass_aux(a: vec4f) -> bool {
   let a2 = textureLoad(aux_tex, min(b + vec2i(0, 1), hi), 0);
   let a3 = textureLoad(aux_tex, min(b + vec2i(1, 1), hi), 0);
   let any_grass = grass_aux(a0) || grass_aux(a1) || grass_aux(a2) || grass_aux(a3);
-  return vec4f(select(0.0, 1.0, any_grass));
+  let any_water = water_aux(a0) || water_aux(a1) || water_aux(a2) || water_aux(a3);
+  return vec4f(select(0.0, 1.0, any_grass), select(0.0, 1.0, any_water), 0.0, 1.0);
 }
 
-// 1/8-scale grass tile mask (`ao_grass`, `pc.a.xy = 1 / half_size`): 4 bilinear quad taps over
-// `ao_grass_half`.
+// 1/8-scale grass/water tile mask (`ao_grass`, `pc.a.xy = 1 / half_size`): 4 bilinear quad taps
+// over `ao_grass_half`.
 @fragment fn fs_ao_grass_tile(in: Screen) -> @location(0) vec4f {
   let b = floor(in.clip.xy) * 4.0;
   let inv = pc.a.xy;
-  let s = textureSampleLevel(src_tex, lin_sampler, (b + vec2f(1.0, 1.0)) * inv, 0.0).r
-    + textureSampleLevel(src_tex, lin_sampler, (b + vec2f(3.0, 1.0)) * inv, 0.0).r
-    + textureSampleLevel(src_tex, lin_sampler, (b + vec2f(1.0, 3.0)) * inv, 0.0).r
-    + textureSampleLevel(src_tex, lin_sampler, (b + vec2f(3.0, 3.0)) * inv, 0.0).r;
-  return vec4f(select(0.0, 1.0, s > 0.1));
+  let s = textureSampleLevel(src_tex, lin_sampler, (b + vec2f(1.0, 1.0)) * inv, 0.0).rg
+    + textureSampleLevel(src_tex, lin_sampler, (b + vec2f(3.0, 1.0)) * inv, 0.0).rg
+    + textureSampleLevel(src_tex, lin_sampler, (b + vec2f(1.0, 3.0)) * inv, 0.0).rg
+    + textureSampleLevel(src_tex, lin_sampler, (b + vec2f(3.0, 3.0)) * inv, 0.0).rg;
+  return vec4f(select(vec2f(0.0), vec2f(1.0), s > vec2f(0.1)), 0.0, 1.0);
 }
 
-// Union of last frame's and this frame's 1/8-scale grass tile masks (`pc.a.xy = (use_0, use_1)`).
+// Union of last frame's and this frame's 1/8-scale grass tile masks (`.r`, `pc.a.xy`) and this
+// frame's 1/8-scale visible-water tile mask (`.g`, `pc.a.zw`).
 @fragment fn fs_ao_grass_union(in: Screen) -> @location(0) vec4f {
   let p = vec2i(in.clip.xy);
-  if (pc.a.x > 0.5) {
-    if (textureLoad(src_tex, p, 0).r > 0.5) {
-      return vec4f(1.0);
+  var out = vec2f(0.0);
+  if (pc.a.x > 0.5 || pc.a.z > 0.5) {
+    let a = textureLoad(src_tex, p, 0).rg;
+    if (pc.a.x > 0.5 && a.r > 0.5) {
+      out.x = 1.0;
+    }
+    if (pc.a.z > 0.5 && a.g > 0.5) {
+      out.y = 1.0;
     }
   }
-  if (pc.a.y > 0.5) {
-    if (textureLoad(extra_tex, p, 0).r > 0.5) {
-      return vec4f(1.0);
+  if (pc.a.y > 0.5 || pc.a.w > 0.5) {
+    let b = textureLoad(extra_tex, p, 0).rg;
+    if (pc.a.y > 0.5 && b.r > 0.5) {
+      out.x = 1.0;
+    }
+    if (pc.a.w > 0.5 && b.g > 0.5) {
+      out.y = 1.0;
     }
   }
-  return vec4f(0.0);
+  return vec4f(out, 0.0, 1.0);
 }
 
-fn grass_coarse_row(b: vec2f, y: f32, inv: vec2f) -> f32 {
-  return textureSampleLevel(src_tex, lin_sampler, (b + vec2f(1.0, y)) * inv, 0.0).r
-    + textureSampleLevel(src_tex, lin_sampler, (b + vec2f(3.0, y)) * inv, 0.0).r
-    + textureSampleLevel(src_tex, lin_sampler, (b + vec2f(5.0, y)) * inv, 0.0).r
-    + textureSampleLevel(src_tex, lin_sampler, (b + vec2f(7.0, y)) * inv, 0.0).r;
+fn grass_coarse_row(b: vec2f, y: f32, inv: vec2f) -> vec2f {
+  return textureSampleLevel(src_tex, lin_sampler, (b + vec2f(1.0, y)) * inv, 0.0).rg
+    + textureSampleLevel(src_tex, lin_sampler, (b + vec2f(3.0, y)) * inv, 0.0).rg
+    + textureSampleLevel(src_tex, lin_sampler, (b + vec2f(5.0, y)) * inv, 0.0).rg
+    + textureSampleLevel(src_tex, lin_sampler, (b + vec2f(7.0, y)) * inv, 0.0).rg;
 }
 
-// 1/64-scale coarse grass mask (`ao_grass_coarse`, `pc.a.xy = 1 / fine_size`): 16 bilinear quad
-// taps over an 8 x 8 block of fine tiles.
+// 1/64-scale coarse grass/water mask (`ao_grass_coarse`, `pc.a.xy = 1 / fine_size`): 16 bilinear
+// quad taps over an 8 x 8 block of fine tiles.
 @fragment fn fs_ao_grass_coarse(in: Screen) -> @location(0) vec4f {
   let b = floor(in.clip.xy) * 8.0;
   let inv = pc.a.xy;
   let s = grass_coarse_row(b, 1.0, inv) + grass_coarse_row(b, 3.0, inv)
     + grass_coarse_row(b, 5.0, inv) + grass_coarse_row(b, 7.0, inv);
-  return vec4f(select(0.0, 1.0, s > 0.05));
+  return vec4f(select(vec2f(0.0), vec2f(1.0), s > vec2f(0.05)), 0.0, 1.0);
 }
 
 // The regions of the picture whose depth or aux may differ from those the AO kept in its target
@@ -156,7 +170,6 @@ struct AoChanged {
   head: vec4f,              // regions, the farthest a kernel point lies from its surface point
                             // (in radii), unused, unused
   rows: vec4f,              // the lengths of the xyz of view_proj's x, y and w rows, unused
-  water: vec4f,             // conservative screen box [x0, y0, x1, y1] of visible water
   rects: array<vec4f, 16>,
 };
 @group(0) @binding(7) var<uniform> ao_changed: AoChanged;
@@ -284,39 +297,46 @@ fn ao_reads_changed(
   return false;
 }
 
-// pc.a = (radius metres, samples, ao width, ao height), pc.b = (kept, grass_active, 0, 0):
+// pc.a = (radius metres, samples, ao width, ao height),
+// pc.b = (kept, grass_active, water_active, 0):
 // when `kept` (`pc.b.x > 0.5`), the target keeps last frame's AO and computes again only where
 // what a texel reads changed (`AoChanged` and, when `grass_active`, the hierarchical grass masks)
-// or on the water.
+// or on visible water (`water_active`, `.g` of the masks).
 @fragment fn fs_ssao(in: Screen) -> @location(0) vec4f {
   let full = frame.viewport.xy;
   let size = vec2i(full);
   let px = clamp(vec2i(in.uv * full), vec2i(0), size - vec2i(1));
-  let d = textureLoad(depth_tex, px, 0);
   let kept = pc.b.x > 0.5;
+  let grass_active = pc.b.y > 0.5;
+  let water_active = pc.b.z > 0.5;
   let px_changed = kept && ao_changed_at(px, ao_all_regions());
+  var own_coarse = vec2f(0.0);
+  if (kept && (grass_active || water_active)) {
+    own_coarse = textureLoad(src_tex, px >> vec2u(6u), 0).rg;
+  }
+  let coarse_water = water_active && own_coarse.g > 0.5;
+  if (kept && !px_changed && !coarse_water && !grass_active && ao_changed.head.x < 0.5) {
+    discard;
+  }
+  let maybe_water = coarse_water && textureLoad(extra_tex, px >> vec2u(3u), 0).g > 0.5;
+  if (kept && !px_changed && !maybe_water && !grass_active && ao_changed.head.x < 0.5) {
+    discard;
+  }
+  let d = textureLoad(depth_tex, px, 0);
   if (d <= 0.0) {
     if (kept && !px_changed) {
       discard;
     }
     return vec4f(1.0);
   }
-  let grass_active = pc.b.y > 0.5;
-  let pxf = vec2f(px);
-  let in_water_rect = kept
-    && all(pxf >= ao_changed.water.xy)
-    && all(pxf < ao_changed.water.zw);
-  if (kept && !in_water_rect && !grass_active && ao_changed.head.x < 0.5) {
-    discard;
-  }
   let p = world_at(in.uv, d);
   let radius = pc.a.x * clamp(linear_depth(d) * 0.04, 0.6, 3.0);
   var reg_met = 0u;
   var grs_hit = false;
-  if (kept && !in_water_rect && !px_changed) {
+  if (kept && !maybe_water && !px_changed) {
     let reach = ao_reach(p, radius);
     reg_met = ao_regions_met(reach);
-    grs_hit = grass_active && grass_coarse_met(reach, px);
+    grs_hit = grass_active && (own_coarse.r > 0.5 || grass_coarse_met(reach, px));
     if (reg_met == 0u && !grs_hit) {
       discard;
     }
@@ -329,13 +349,13 @@ fn ao_reads_changed(
     return vec4f(1.0);
   }
   let water = abs(aux.w - WATER_AUX) < 0.05;
-  if (in_water_rect && !water && !px_changed) {
+  if (maybe_water && !water && !px_changed) {
     if (!grass_active && ao_changed.head.x < 0.5) {
       discard;
     }
     let reach = ao_reach(p, radius);
     reg_met = ao_regions_met(reach);
-    grs_hit = grass_active && grass_coarse_met(reach, px);
+    grs_hit = grass_active && (own_coarse.r > 0.5 || grass_coarse_met(reach, px));
     if (reg_met == 0u && !grs_hit) {
       discard;
     }
@@ -416,18 +436,19 @@ fn light_shafts(uv: vec2f, frag: vec2f) -> vec3f {
   return frame.glow.rgb * (sum / total * falloff * low * haze * strength);
 }
 
-fn outline_tap(q: vec2i, lin: f32, use_norm: bool, aux_n: vec3f) -> f32 {
-  let dq = depth_px(q);
+fn aux_px(p: vec2i) -> vec4f {
+  let size = vec2i(frame.viewport.xy);
+  return textureLoad(aux_tex, clamp(p, vec2i(0), size - vec2i(1)), 0);
+}
+
+fn outline_depth(dq: f32, lin: f32) -> f32 {
   let lq = select(linear_depth(dq), 1e6, dq <= 0.0);
-  let rel = (lq - lin) / lin;
-  var tap = smoothstep(0.04, 0.15, rel);
-  if (use_norm) {
-    let nq = textureLoad(aux_tex, clamp(q, vec2i(0), vec2i(frame.viewport.xy) - vec2i(1)), 0);
-    if (nq.w > 0.0) {
-      tap = max(tap, smoothstep(0.75, 0.35, dot(normalize(nq.xyz), aux_n)) * 0.6);
-    }
-  }
-  return tap;
+  return smoothstep(0.04, 0.15, (lq - lin) / lin);
+}
+
+fn outline_norm(nq: vec4f, aux_n: vec3f) -> f32 {
+  let safe = select(vec3f(0.0, 1.0, 0.0), nq.xyz, nq.w > 0.0);
+  return select(0.0, smoothstep(0.75, 0.35, dot(normalize(safe), aux_n)) * 0.6, nq.w > 0.0);
 }
 
 // Air: occlusion, outlines, aerial perspective, mist and light shafts.
@@ -436,10 +457,6 @@ fn outline_tap(q: vec2i, lin: f32, use_norm: bool, aux_n: vec3f) -> f32 {
 @fragment fn fs_air(in: Screen) -> @location(0) vec4f {
   let px = vec2i(in.clip.xy);
   let d = depth_px(px);
-  let cam = frame.camera.xyz;
-  let world = world_at(in.uv, d);
-  let to = world - cam;
-  let dist = length(to);
   var edge = 0.0;
   var aux_w = 0.0;
   if (d > 0.0) {
@@ -447,23 +464,33 @@ fn outline_tap(q: vec2i, lin: f32, use_norm: bool, aux_n: vec3f) -> f32 {
     aux_w = aux.w;
     // Grass and flowers (aux.w = 0) get no outlines, and leaves and petals (aux.w = 0.5) only a
     // trace: a line round every leaf cluster of a canopy speckles it.
-    let edge_weight = pc.a.y * smoothstep(90.0, 15.0, dist) * select(1.0, 0.15, aux_w < 0.6) * step(0.01, aux_w);
-    if (edge_weight > 0.0) {
-      // Soft illustrated outlines on depth and normal breaks, fading with distance.
-      let w = i32(max(pc.a.z, 1.0));
-      let lin = linear_depth(d);
-      let use_norm = aux_w > 0.6;
-      var aux_n = vec3f(0.0);
-      if (use_norm) {
-        aux_n = normalize(aux.xyz);
+    if (pc.a.y > 0.0 && aux_w >= 0.01) {
+      let edge_dist = length(world_at(in.uv, d) - frame.camera.xyz);
+      let edge_weight = pc.a.y * smoothstep(90.0, 15.0, edge_dist) * select(1.0, 0.15, aux_w < 0.6);
+      if (edge_weight > 0.0) {
+        // Soft illustrated outlines on depth and normal breaks, fading with distance.
+        let w = i32(max(pc.a.z, 1.0));
+        let lin = linear_depth(d);
+        edge = max(edge, outline_depth(depth_px(px + vec2i(w, 0)), lin));
+        edge = max(edge, outline_depth(depth_px(px + vec2i(-w, 0)), lin));
+        edge = max(edge, outline_depth(depth_px(px + vec2i(0, w)), lin));
+        edge = max(edge, outline_depth(depth_px(px + vec2i(0, -w)), lin));
+        if (aux_w > 0.6) {
+          let aux_n = normalize(aux.xyz);
+          let nw = i32(max(pc.a.z, 1.0));
+          edge = max(edge, outline_norm(aux_px(px + vec2i(nw, 0)), aux_n));
+          edge = max(edge, outline_norm(aux_px(px + vec2i(-nw, 0)), aux_n));
+          edge = max(edge, outline_norm(aux_px(px + vec2i(0, nw)), aux_n));
+          edge = max(edge, outline_norm(aux_px(px + vec2i(0, -nw)), aux_n));
+        }
+        edge *= edge_weight;
       }
-      edge = max(edge, outline_tap(px + vec2i(w, 0), lin, use_norm, aux_n));
-      edge = max(edge, outline_tap(px + vec2i(-w, 0), lin, use_norm, aux_n));
-      edge = max(edge, outline_tap(px + vec2i(0, w), lin, use_norm, aux_n));
-      edge = max(edge, outline_tap(px + vec2i(0, -w), lin, use_norm, aux_n));
-      edge *= edge_weight;
     }
   }
+  let cam = frame.camera.xyz;
+  let world = world_at(in.uv, d);
+  let to = world - cam;
+  let dist = length(to);
   var col = textureLoad(src_tex, px, 0).rgb;
   let dir = to / max(dist, 1e-4);
   let fc = fog_color(dir);

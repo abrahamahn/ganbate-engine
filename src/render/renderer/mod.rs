@@ -382,11 +382,14 @@ pub(in crate::render) struct Targets {
     ao_tex: TextureId,
     ao_for: Option<u64>,
     ao_cleared: bool,
-    /// Hierarchical 1/2-, 1/8- and 1/64-scale visible-grass coverage masks (`Format::R8Unorm`).
+    /// Hierarchical 1/2-, 1/8- and 1/64-scale visible-grass (`.r`) and visible-water (`.g`)
+    /// coverage masks (`Format::Rgba8Unorm`).
     ao_grass_half: TextureId,
     ao_grass: [TextureId; 2],
     ao_grass_cur: usize,
     ao_grass_valid: [bool; 2],
+    ao_grass_water: [bool; 2],
+    ao_union_water: bool,
     ao_grass_time: u32,
     ao_grass_sway: u32,
     ao_grass_union: TextureId,

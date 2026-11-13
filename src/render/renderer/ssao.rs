@@ -5,9 +5,8 @@ use super::*;
 pub(super) const MAX_AO_REGIONS: usize = 16;
 const _: () = assert!(MAX_AO_REGIONS <= 16);
 
-/// Bytes of the AO's changed regions block: its head, view_proj's row lengths, visible water rect,
-/// then the regions.
-pub(super) const AO_CHANGED_BYTES: u64 = 48 + MAX_AO_REGIONS as u64 * 16;
+/// Bytes of the AO's changed regions block: its head, view_proj's row lengths, then the regions.
+pub(super) const AO_CHANGED_BYTES: u64 = 32 + MAX_AO_REGIONS as u64 * 16;
 
 /// Pixels the AO's changed regions are widened by, against the rounding of a kernel point's pixel
 /// apart where `fs_ssao` tests it and where it reads it.
@@ -106,17 +105,12 @@ pub(super) fn union_area(regions: &[Rect]) -> u32 {
         .sum()
 }
 
-/// The AO's changed regions block (`AoChanged` in post.wgsl) for `regions` and `water_rect` of a
-/// picture seen through `view_proj`.
-pub(super) fn ao_changed_block(
-    regions: &[Rect],
-    water_rect: Option<Rect>,
-    view_proj: &M4,
-) -> Vec<u8> {
+/// The AO's changed regions block (`AoChanged` in post.wgsl) for `regions` of a picture seen
+/// through `view_proj`.
+pub(super) fn ao_changed_block(regions: &[Rect], view_proj: &M4) -> Vec<u8> {
     let row = |k: usize| math::length([view_proj[k], view_proj[4 + k], view_proj[8 + k]]);
     let mut block = vec![regions.len() as f32, AO_KERNEL_REACH, 0.0, 0.0];
     block.extend([row(0), row(1), row(3), 0.0]);
-    block.extend(water_rect.unwrap_or([0; 4]).map(|v| v as f32));
     block.extend(regions.iter().flat_map(|r| r.map(|v| v as f32)));
     f32_bytes(&block)
 }
@@ -166,6 +160,8 @@ pub(super) struct AoPrevState {
     ao_for: Option<u64>,
     grass_cur: usize,
     grass_valid: [bool; 2],
+    slot_has_water: [bool; 2],
+    union_has_water: bool,
     grass_time: u32,
     grass_sway: u32,
 }
@@ -176,6 +172,8 @@ pub(super) struct AoNextState {
     ao_cleared: bool,
     grass_cur: usize,
     grass_valid: [bool; 2],
+    slot_has_water: [bool; 2],
+    union_has_water: bool,
     grass_time: u32,
     grass_sway: u32,
 }
@@ -192,27 +190,34 @@ pub(super) struct AoEncodeInput<'a> {
     pub(super) cache_regions: &'a [Rect],
     pub(super) live_regions: &'a [Rect],
     pub(super) water_rect: Option<Rect>,
+    pub(super) has_water_props: bool,
     pub(super) grass_rect: Option<Rect>,
 }
 
 impl Renderer {
-    /// Invalidates the kept AO target and its visible-grass coverage masks.
+    /// Invalidates the kept AO target and its visible-grass/water coverage masks.
     pub(in crate::render) fn forget_ao(&mut self) {
         self.targets.ao_for = None;
         self.targets.ao_grass_valid = [false; 2];
+        self.targets.ao_grass_water = [false; 2];
+        self.targets.ao_union_water = false;
     }
 
     /// Takes the kept AO state before `track_cached_props` consumes prop rects, leaving `ao_for`
-    /// and `ao_grass_valid` cleared if `encode` returns early on an error.
+    /// and the mask validity flags cleared if `encode` returns early on an error.
     pub(super) fn take_ao_state(&mut self) -> AoPrevState {
         let prev = AoPrevState {
             ao_for: self.targets.ao_for.take(),
             grass_cur: self.targets.ao_grass_cur,
             grass_valid: self.targets.ao_grass_valid,
+            slot_has_water: self.targets.ao_grass_water,
+            union_has_water: self.targets.ao_union_water,
             grass_time: self.targets.ao_grass_time,
             grass_sway: self.targets.ao_grass_sway,
         };
         self.targets.ao_grass_valid = [false; 2];
+        self.targets.ao_grass_water = [false; 2];
+        self.targets.ao_union_water = false;
         prev
     }
 
@@ -222,6 +227,8 @@ impl Renderer {
         self.targets.ao_cleared = next.ao_cleared;
         self.targets.ao_grass_cur = next.grass_cur;
         self.targets.ao_grass_valid = next.grass_valid;
+        self.targets.ao_grass_water = next.slot_has_water;
+        self.targets.ao_union_water = next.union_has_water;
         self.targets.ao_grass_time = next.grass_time;
         self.targets.ao_grass_sway = next.grass_sway;
     }
@@ -350,6 +357,7 @@ impl Renderer {
         };
 
         let grass_drawn = inp.grass_rect.is_some();
+        let water_drawn = inp.water_rect.is_some();
         let sway_bits = self.look.grass.sway.to_bits();
         let time_bits = inp.seconds.to_bits();
         let prev_idx = inp.prev.grass_cur;
@@ -362,62 +370,97 @@ impl Renderer {
                 || (self.look.grass.sway != 0.0 && time_bits != inp.prev.grass_time)
         };
 
+        let union_opt = |a: Option<Rect>, b: Option<Rect>| match (a, b) {
+            (Some(a), Some(b)) => Some(union(a, b)),
+            (a, b) => a.or(b),
+        };
         let ((hw, hh), (gw, gh), _) = ao_grass_sizes(inp.size);
         let next = if !inp.cached {
             AoNextState::default()
-        } else if keep_ao && regions.is_empty() && !grass_changed {
+        } else if keep_ao && !water_drawn && regions.is_empty() && !grass_changed {
             AoNextState {
                 ao_for: Some(ao_key),
                 ao_cleared: false,
                 grass_cur: prev_idx,
                 grass_valid: inp.prev.grass_valid,
+                slot_has_water: [false; 2],
+                union_has_water: false,
                 grass_time: inp.prev.grass_time,
                 grass_sway: inp.prev.grass_sway,
             }
         } else {
-            let cur_idx = 1 - prev_idx;
-            let mut valid = [false; 2];
-            valid[prev_idx] = prev_has_grass;
-            valid[cur_idx] = grass_drawn;
-            if let Some([gx0, gy0, gx1, gy1]) = inp.grass_rect {
-                let h_rect = [
-                    gx0 / 2,
-                    gy0 / 2,
-                    gx1.div_ceil(2).min(hw),
-                    gy1.div_ceil(2).min(hh),
-                ];
-                scissored_post_pass(
-                    enc,
-                    t.ao_grass_half,
-                    (hw, hh),
-                    h_rect,
-                    p.ao_grass_half,
-                    slot.ao_grass_half,
-                    [0.0; 16],
-                );
-                let g_rect = [
-                    gx0 / 8,
-                    gy0 / 8,
-                    gx1.div_ceil(8).min(gw),
-                    gy1.div_ceil(8).min(gh),
-                ];
-                let mut tpc = [0.0f32; 16];
-                tpc[0] = 1.0 / hw as f32;
-                tpc[1] = 1.0 / hh as f32;
-                scissored_post_pass(
-                    enc,
-                    t.ao_grass[cur_idx],
-                    (gw, gh),
-                    g_rect,
-                    p.ao_grass_tile,
-                    slot.ao_grass_tile,
-                    tpc,
-                );
-            }
-            if keep_ao && grass_changed {
+            let capture_slot = !keep_ao
+                || grass_changed
+                || (grass_drawn && self.look.grass.sway != 0.0 && !regions.is_empty())
+                || (water_drawn
+                    && (!inp.prev.slot_has_water[prev_idx]
+                        || !regions.is_empty()
+                        || inp.has_water_props));
+            let (active_idx, valid, slot_has_water, grass_time, grass_sway) = if capture_slot {
+                let cur_idx = 1 - prev_idx;
+                let mut valid = [false; 2];
+                valid[prev_idx] = keep_ao && prev_has_grass;
+                valid[cur_idx] = grass_drawn;
+                let mut slot_water = [false; 2];
+                slot_water[cur_idx] = water_drawn;
+                if let Some([mx0, my0, mx1, my1]) = union_opt(inp.grass_rect, inp.water_rect) {
+                    let h_rect = [
+                        mx0 / 2,
+                        my0 / 2,
+                        mx1.div_ceil(2).min(hw),
+                        my1.div_ceil(2).min(hh),
+                    ];
+                    scissored_post_pass(
+                        enc,
+                        t.ao_grass_half,
+                        (hw, hh),
+                        h_rect,
+                        p.ao_grass_half,
+                        slot.ao_grass_half,
+                        [0.0; 16],
+                    );
+                    let g_rect = [
+                        mx0 / 8,
+                        my0 / 8,
+                        mx1.div_ceil(8).min(gw),
+                        my1.div_ceil(8).min(gh),
+                    ];
+                    let mut tpc = [0.0f32; 16];
+                    tpc[0] = 1.0 / hw as f32;
+                    tpc[1] = 1.0 / hh as f32;
+                    scissored_post_pass(
+                        enc,
+                        t.ao_grass[cur_idx],
+                        (gw, gh),
+                        g_rect,
+                        p.ao_grass_tile,
+                        slot.ao_grass_tile,
+                        tpc,
+                    );
+                }
+                (cur_idx, valid, slot_water, time_bits, sway_bits)
+            } else {
+                let slot_water = if water_drawn {
+                    inp.prev.slot_has_water
+                } else {
+                    [false; 2]
+                };
+                (
+                    prev_idx,
+                    inp.prev.grass_valid,
+                    slot_water,
+                    inp.prev.grass_time,
+                    inp.prev.grass_sway,
+                )
+            };
+            let run_union_coarse = keep_ao
+                && (grass_changed || (water_drawn && (capture_slot || !inp.prev.union_has_water)));
+            if run_union_coarse {
                 let mut gpc = [0.0f32; 16];
-                gpc[0] = f32::from(u8::from(valid[0]));
-                gpc[1] = f32::from(u8::from(valid[1]));
+                gpc[0] = f32::from(u8::from(grass_changed && valid[0]));
+                gpc[1] = f32::from(u8::from(grass_changed && valid[1]));
+                gpc[2] = f32::from(u8::from(water_drawn && active_idx == 0));
+                gpc[3] = f32::from(u8::from(water_drawn && active_idx == 1));
                 Self::post_pass(
                     enc,
                     t.ao_grass_union,
@@ -440,13 +483,17 @@ impl Renderer {
                     cpc,
                 );
             }
+            let union_has_water = water_drawn
+                && (run_union_coarse || (keep_ao && !capture_slot && inp.prev.union_has_water));
             AoNextState {
                 ao_for: Some(ao_key),
                 ao_cleared: false,
-                grass_cur: cur_idx,
+                grass_cur: active_idx,
                 grass_valid: valid,
-                grass_time: time_bits,
-                grass_sway: sway_bits,
+                slot_has_water,
+                union_has_water,
+                grass_time,
+                grass_sway,
             }
         };
 
@@ -460,11 +507,12 @@ impl Renderer {
         if keep_ao {
             stats.ao_kept = true;
             stats.ao_changed_pixels = changed_pixels;
-            if inp.water_rect.is_some() || !regions.is_empty() || grass_changed {
-                let block = ao_changed_block(&regions, inp.water_rect, &inp.eye.view_proj);
+            if water_drawn || !regions.is_empty() || grass_changed {
+                let block = ao_changed_block(&regions, &inp.eye.view_proj);
                 device.write_buffer(slot.ao_changed, 0, &block)?;
                 pc[4] = 1.0;
                 pc[5] = f32::from(u8::from(grass_changed));
+                pc[6] = f32::from(u8::from(water_drawn));
                 stats.ssao_drawn = true;
                 Self::post_pass(enc, t.ao_tex, 0, Load::Load, p.ssao, slot.ssao, pc);
             }

@@ -1092,11 +1092,7 @@ impl Renderer {
             enc.end_pass();
             enc.begin_pass(PassDesc {
                 colors: vec![keep(t.cache_hdr), keep(t.cache_aux), keep(t.cache_shadow)],
-                depth: Some(Attachment {
-                    load: Load::Load,
-                    store: false,
-                    ..Attachment::clear(t.reshade_depth, clear)
-                }),
+                depth: Some(keep(t.reshade_depth)),
             });
             enc.set_scissor(x0, y0, x1 - x0, y1 - y0);
             let within = eye.within(&plan.region, size);
@@ -1245,7 +1241,8 @@ impl Renderer {
         let masked_water_draws =
             self.draw_world(enc, &mut push, &eye, true, WorldPart::MaskedWater, None);
         count(masked_water_draws);
-        let water_drawn = water_draws.1 > 0 || masked_water_draws.1 > 0 || self.has_water_props();
+        let has_water_props = self.has_opaque_water_props();
+        let water_drawn = water_draws.1 > 0 || masked_water_draws.1 > 0 || has_water_props;
 
         stats.world_cached = cached && !rebuild;
         stats.world_draws_total = total_draws;
@@ -1327,6 +1324,7 @@ impl Renderer {
                 cache_regions: &regions,
                 live_regions: &live,
                 water_rect,
+                has_water_props,
                 grass_rect,
             },
             &mut stats,

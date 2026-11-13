@@ -579,10 +579,8 @@ struct DrawnShadow {
 /// its skin's, so they are set, compared and written to the frame's joint buffer once.
 struct JointSet {
     matrices: Vec<M4>,
-    /// Counts changes to the matrices; `digest` hashes them as of revision `digested`.
+    /// Counts changes to the matrices.
     revision: u32,
-    digest: u64,
-    digested: Option<u32>,
     /// Instances that follow it (it goes with the last).
     users: u32,
     /// Its first row in the joint rows of frame `placed` ([`Renderer::prepare_props`]).
@@ -595,17 +593,6 @@ fn joints_of<'a>(sets: &'a Pool<JointSet>, inst: &InstanceEntry) -> &'a [M4] {
     inst.joints
         .and_then(|id| sets.get(id))
         .map_or(&[], |s| &s.matrices[..])
-}
-
-/// A hash of joint matrices, a number at a time (bijective in each, so one changed number
-/// always changes it).
-fn digest_matrices(matrices: &[M4]) -> u64 {
-    matrices
-        .as_flattened()
-        .iter()
-        .fold(0xcbf2_9ce4_8422_2325 ^ matrices.len() as u64, |h, x| {
-            (h ^ u64::from(x.to_bits())).wrapping_mul(0x0100_0000_01b3)
-        })
 }
 
 /// One instanced draw of this frame: instances `first..first + count` of the buffer.

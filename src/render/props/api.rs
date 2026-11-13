@@ -1109,7 +1109,20 @@ impl Renderer {
         })
     }
 
-    /// Conservative screen rectangle covering all visible water-shaded scene props.
+    /// Whether this frame has opaque scene prop batches using water shading (writing `WATER_AUX`).
+    pub(in crate::render) fn has_opaque_water_props(&self) -> bool {
+        self.props.batches.iter().any(|b| {
+            b.layer == Layer::Opaque
+                && b.count > 0
+                && self
+                    .props
+                    .materials
+                    .get(b.material)
+                    .is_some_and(|m| m.desc.shading == Shading::Water)
+        })
+    }
+
+    /// Conservative screen rectangle covering all visible opaque water-shaded scene props.
     pub(in crate::render) fn water_props_rect(
         &self,
         view_proj: &M4,
@@ -1117,7 +1130,7 @@ impl Renderer {
     ) -> Option<Rect> {
         let mut out: Option<Rect> = None;
         for b in &self.props.batches {
-            if b.layer == Layer::Overlay
+            if b.layer != Layer::Opaque
                 || !self
                     .props
                     .materials

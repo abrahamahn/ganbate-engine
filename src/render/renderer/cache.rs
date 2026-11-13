@@ -317,10 +317,7 @@ impl ReceiverBounds {
                 if d.water || !seen(&d) {
                     return ([OUT_OF_REACH; 4], None);
                 }
-                (
-                    in_maps(d),
-                    screen_rect(&corners(d.bounds), view_proj, size, 2.0),
-                )
+                (in_maps(d), box_rect(d.bounds, view_proj, size, 2.0))
             })
             .unzip();
         Self {

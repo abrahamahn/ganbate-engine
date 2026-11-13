@@ -44,8 +44,8 @@ pub(super) fn hash_f32s(h: &mut Fnv, values: &[f32]) {
 }
 
 /// What an instance's picture depends on besides the frame: where and how it is drawn, its
-/// joints (`joints`, their [`digest_matrices`]; 0 without), and its mesh, material and textures
-/// as they stand.
+/// influencing joints (`joints`, their [`mesh_joint_digest`]; 0 without), and its mesh, material
+/// and textures as they stand.
 pub(super) fn signature(
     inst: &InstanceEntry,
     joints: u64,
@@ -91,6 +91,21 @@ pub(super) fn casts(inst: &InstanceEntry, mat: &MaterialEntry) -> bool {
 pub(super) fn skinned(joints: &[M4], mesh: &MeshEntry) -> bool {
     mesh.skin
         .is_some_and(|s| joints.len() > usize::from(s.max_joint))
+}
+
+/// Hash of the joint matrices in `joints` that `m`'s vertices actually use (`0` when unskinned).
+pub(super) fn mesh_joint_digest(joints: &[M4], m: &MeshEntry) -> u64 {
+    if !skinned(joints, m) {
+        return 0;
+    }
+    let mut h = Fnv::new();
+    for (j, (joint, b)) in joints.iter().zip(&m.joint_boxes).enumerate() {
+        if b.is_some() {
+            h.write(&(j as u32).to_le_bytes());
+            hash_f32s(&mut h, joint);
+        }
+    }
+    h.finish()
 }
 
 /// What decides a caster's shadow as a whole rather than by how far it moved: its mesh and the
@@ -354,7 +369,7 @@ pub(in crate::render) fn track_cached_props(
             if full || inst.cached.is_none() {
                 let image = inst
                     .world_bounds
-                    .and_then(|b| screen_rect(&corners(b), view.view_proj, view.size, 2.0));
+                    .and_then(|b| box_rect(b, view.view_proj, view.size, 2.0));
                 regions.extend(image);
                 inst.cached = Some(image.unwrap_or_default());
             }
@@ -722,12 +737,6 @@ impl Props {
             texture_epoch,
             ..
         } = self;
-        for (_, set) in joint_sets.iter_mut() {
-            if set.digested != Some(set.revision) {
-                set.digest = digest_matrices(&set.matrices);
-                set.digested = Some(set.revision);
-            }
-        }
         for (_, inst) in instances.iter_mut() {
             let (Some(m), Some(mat)) = (meshes.get(inst.mesh.0), materials.get(inst.material.0))
             else {
@@ -745,7 +754,7 @@ impl Props {
             inst.dirty = false;
             inst.stamp = stamp;
             let joints = set.map_or(&[][..], |s| &s.matrices[..]);
-            let sig = signature(inst, set.map_or(0, |s| s.digest), m, mat, texture_edits);
+            let sig = signature(inst, mesh_joint_digest(joints, m), m, mat, texture_edits);
             inst.still = if sig == inst.sig {
                 inst.still.saturating_add(1)
             } else {
@@ -869,8 +878,6 @@ impl Props {
             Some(self.joint_sets.insert(JointSet {
                 matrices: joints.to_vec(),
                 revision: 0,
-                digest: 0,
-                digested: None,
                 users: 0,
                 first: 0,
                 placed: 0,

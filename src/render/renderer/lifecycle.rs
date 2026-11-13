@@ -333,17 +333,19 @@ impl Renderer {
             ao_tex: tex(device, ao.0, ao.1, Format::R16Float, rt)?,
             ao_for: None,
             ao_cleared: false,
-            ao_grass_half: tex(device, hw, hh, Format::R8Unorm, rt)?,
+            ao_grass_half: tex(device, hw, hh, Format::Rgba8Unorm, rt)?,
             ao_grass: [
-                tex(device, gw, gh, Format::R8Unorm, rt)?,
-                tex(device, gw, gh, Format::R8Unorm, rt)?,
+                tex(device, gw, gh, Format::Rgba8Unorm, rt)?,
+                tex(device, gw, gh, Format::Rgba8Unorm, rt)?,
             ],
             ao_grass_cur: 0,
             ao_grass_valid: [false; 2],
+            ao_grass_water: [false; 2],
+            ao_union_water: false,
             ao_grass_time: 0,
             ao_grass_sway: 0,
-            ao_grass_union: tex(device, gw, gh, Format::R8Unorm, rt)?,
-            ao_grass_coarse: tex(device, cw, ch, Format::R8Unorm, rt)?,
+            ao_grass_union: tex(device, gw, gh, Format::Rgba8Unorm, rt)?,
+            ao_grass_coarse: tex(device, cw, ch, Format::Rgba8Unorm, rt)?,
             lit: tex(device, width, height, HDR, rt)?,
             bloom: device.create_texture(&TextureDesc {
                 width: bloom_size.0,
@@ -459,7 +461,7 @@ impl Renderer {
         let (scene, sky) = (pair(scene), pair(sky));
         let (grass, flower, particle) = (blades[0], blades[1], blades[2]);
         let ao_changed = upload(device, AO_CHANGED_BYTES, BufferUsage::UNIFORM)?;
-        device.write_buffer(ao_changed, 0, &[0; 48])?;
+        device.write_buffer(ao_changed, 0, &[0; 32])?;
         let post = |d: &mut Device<'_>, pipe, src: Resource, extra: Resource| {
             d.create_bind_group(
                 pipe,
@@ -1341,7 +1343,7 @@ impl Renderer {
             if !reached(footprints, &bounds) {
                 continue;
             }
-            if let Some(screen) = screen_rect(&corners(*b), &eye.view_proj, size, 2.0) {
+            if let Some(screen) = box_rect(*b, &eye.view_proj, size, 2.0) {
                 add(&mut region, *b, &bounds, screen);
             }
         }

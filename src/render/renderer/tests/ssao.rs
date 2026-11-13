@@ -1416,3 +1416,557 @@ fn odd_viewport_grass_boundaries_and_water_props_match_whole_ao() {
         r.destroy_props(&mut device);
     }
 }
+
+/// Regression for Yozakura Harbor `/test`: when a world ocean mesh extends underneath an opaque
+/// deck so `Renderer::water_rect` spans the whole viewport, the `.g` visible-water channel in the
+/// `Rgba8Unorm` AO pyramid skips dry deck pixels in `fs_ssao`, reuses the water mask with zero
+/// pyramid passes on quiet water-only frames, recaptures when props move or opaque water props
+/// draw, and matches whole-frame SSAO byte-for-byte throughout.
+#[test]
+fn occluded_ocean_under_opaque_deck_skips_dry_pixels_and_reuses_water_mask() {
+    assert_eq!(crate::render::renderer::ssao::AO_CHANGED_BYTES, 288);
+
+    let Ok(mut device) = Device::headless() else {
+        return;
+    };
+    let mut world = World::default();
+    world.materials.push(Material {
+        name: "deck".into(),
+        base_color: [0.58, 0.48, 0.38, 1.0],
+        roughness: 0.75,
+        shading: Shading::Standard,
+        ..Material::default()
+    });
+    world.materials.push(Material {
+        name: "ocean".into(),
+        base_color: [0.08, 0.28, 0.38, 0.88],
+        shading: Shading::Water,
+        alpha: AlphaMode::Blend,
+        ..Material::default()
+    });
+    world.meshes.push(Mesh {
+        material: Some(0),
+        ..make_quad_mesh(0.35, 7.0)
+    });
+    let mut deck_xf = math::IDENTITY;
+    deck_xf[14] = 5.2;
+    world.instances.push(Instance {
+        mesh: 0,
+        transform: Transform(deck_xf),
+    });
+    world.meshes.push(Mesh {
+        material: Some(1),
+        ..make_quad_mesh(0.0, 12.0)
+    });
+    world.instances.push(Instance {
+        mesh: 1,
+        transform: Transform(math::IDENTITY),
+    });
+
+    let size = (256, 192);
+    let look = Look {
+        painterly: 0.0,
+        ..Look::default()
+    };
+    let quality = Quality {
+        ao_scale: 0.5,
+        ..Quality::realtime()
+    };
+    let view = View {
+        name: "harbor_deck".into(),
+        eye: [0.0, 2.4, 3.6],
+        target: [0.0, 0.35, -1.2],
+        fov: 52.0,
+        ..View::default()
+    };
+    let make_env = |seconds: f32| {
+        Environment::resolve(
+            &TimeOfDay {
+                hours: 16.0,
+                ..TimeOfDay::default()
+            },
+            &Weather::default(),
+            &look.palette,
+            seconds,
+        )
+    };
+
+    let (sp, sn, suv, sidx) = sphere_prop_data();
+    let setup = |device: &mut Device<'_>| {
+        let mut r = Renderer::new(
+            device,
+            &world,
+            look.clone(),
+            quality,
+            size,
+            Output::Surface(Format::Rgba8Unorm),
+        )
+        .expect("renderer");
+        r.finish_ao(device).expect("ao");
+        for id in [
+            r.targets.ao_grass_half,
+            r.targets.ao_grass[0],
+            r.targets.ao_grass[1],
+            r.targets.ao_grass_union,
+            r.targets.ao_grass_coarse,
+        ] {
+            assert_eq!(
+                device.texture_desc(id).expect("mask desc").format,
+                Format::Rgba8Unorm
+            );
+        }
+        let mesh = r
+            .create_prop_mesh(
+                device,
+                &MeshData {
+                    positions: &sp,
+                    normals: &sn,
+                    uvs: &suv,
+                    indices: &sidx,
+                },
+            )
+            .expect("mesh");
+        let prop_mat = r
+            .create_prop_material(
+                device,
+                &MaterialDesc {
+                    name: "crate".into(),
+                    base_color: [0.75, 0.52, 0.34, 1.0],
+                    ..MaterialDesc::default()
+                },
+            )
+            .expect("prop mat");
+        let water_mat = r
+            .create_prop_material(
+                device,
+                &MaterialDesc {
+                    name: "fountain".into(),
+                    base_color: [0.15, 0.42, 0.52, 1.0],
+                    shading: Shading::Water,
+                    ..MaterialDesc::default()
+                },
+            )
+            .expect("water mat");
+        r.create_prop_instance(
+            mesh,
+            prop_mat,
+            &AoGarden::placed([-0.7, 0.6, 0.6], [0.25; 3]),
+        )
+        .expect("pillar");
+        let mover = r
+            .create_prop_instance(
+                mesh,
+                prop_mat,
+                &AoGarden::placed([0.6, 0.6, 0.8], [0.22; 3]),
+            )
+            .expect("mover");
+        r.set_prop_instance(mover, &math::IDENTITY, false)
+            .expect("hide mover");
+        let fountain = r
+            .create_prop_instance(mesh, water_mat, &math::IDENTITY)
+            .expect("fountain");
+        r.set_prop_instance(fountain, &math::IDENTITY, false)
+            .expect("hide fountain");
+        let ao = readable_ao(device, &mut r);
+        let out = canvas(device, size);
+        (r, mover, fountain, out, ao)
+    };
+
+    let (mut kept, k_mover, k_fountain, k_out, k_ao) = setup(&mut device);
+    let (mut whole, w_mover, w_fountain, w_out, w_ao) = setup(&mut device);
+
+    let eye = kept.eye(&view, [0.0; 2], size);
+    let frustum = Frustum::from_view_proj(&eye.view_proj);
+    let w_rect = kept
+        .water_rect(&eye, &frustum, size, true)
+        .expect("water rect");
+    let w_area = (w_rect[2] - w_rect[0]) * (w_rect[3] - w_rect[1]);
+    assert!(
+        w_area * 4 >= size.0 * size.1 * 3,
+        "expected unoccluded ocean rect to cover >=75% of viewport, got {w_rect:?}"
+    );
+
+    let env0 = make_env(0.1);
+    for _ in 0..10 {
+        let _ = present_with_ao(&mut device, &mut kept, (&view, &env0), k_out, k_ao, None);
+        let _ = present_with_ao(&mut device, &mut whole, (&view, &env0), w_out, w_ao, None);
+    }
+    assert!(kept.last_frame_stats().world_cached);
+    kept.forget_ao();
+
+    // Frame 0 (`!ao_kept`): captures water into slot 1; union/coarse deferred to first kept frame.
+    let (a, a_ao) = present_with_ao(&mut device, &mut kept, (&view, &env0), k_out, k_ao, None);
+    assert!(!kept.last_frame_stats().ao_kept);
+    assert_eq!(kept.targets.ao_grass_cur, 1);
+    assert_eq!(kept.targets.ao_grass_water, [false, true]);
+    assert!(!kept.targets.ao_union_water);
+    whole.forget_ao();
+    let (b, b_ao) = present_with_ao(&mut device, &mut whole, (&view, &env0), w_out, w_ao, None);
+    assert_same_ao(&device, &a_ao, &b_ao, "occluded ocean frame 0");
+    assert_same_frame(&device, &a, &b, "occluded ocean frame 0");
+
+    // Frame 1 (`ao_kept`): reuses slot 1 without recapturing half/tile, builds union + coarse once.
+    let env1 = make_env(0.55);
+    let (a, a_ao) = present_with_ao(&mut device, &mut kept, (&view, &env1), k_out, k_ao, None);
+    assert!(kept.last_frame_stats().ao_kept);
+    assert_eq!(kept.targets.ao_grass_cur, 1);
+    assert_eq!(kept.targets.ao_grass_water, [false, true]);
+    assert!(kept.targets.ao_union_water);
+    whole.forget_ao();
+    let (b, b_ao) = present_with_ao(&mut device, &mut whole, (&view, &env1), w_out, w_ao, None);
+    assert_same_ao(&device, &a_ao, &b_ao, "occluded ocean frame 1");
+    assert_same_frame(&device, &a, &b, "occluded ocean frame 1");
+
+    // Frame 2 (`ao_kept`, quiet water-only): 0 pyramid passes run (`ao_grass_cur` stays 1).
+    let env2 = make_env(1.05);
+    let (a, a_ao) = present_with_ao(&mut device, &mut kept, (&view, &env2), k_out, k_ao, None);
+    assert!(kept.last_frame_stats().ao_kept);
+    assert_eq!(kept.targets.ao_grass_cur, 1);
+    assert!(kept.targets.ao_union_water);
+    whole.forget_ao();
+    let (b, b_ao) = present_with_ao(&mut device, &mut whole, (&view, &env2), w_out, w_ao, None);
+    assert_same_ao(&device, &a_ao, &b_ao, "occluded ocean frame 2");
+    assert_same_frame(&device, &a, &b, "occluded ocean frame 2");
+
+    // Verify `fs_ssao` discards the ~80% dry deck pixels over the occluded ocean!
+    let (computed, total) =
+        recomputed_texels(&mut device, &mut kept, (&view, &make_env(1.4)), k_out, k_ao);
+    assert!(
+        computed > 0 && computed * 3 < total,
+        "expected fs_ssao to skip occluded deck pixels, got {computed}/{total}"
+    );
+
+    // Re-warm `kept`, then exercise moving deck props, opaque water props, and >50% `!keep_ao`.
+    let _ = present_with_ao(
+        &mut device,
+        &mut kept,
+        (&view, &make_env(1.6)),
+        k_out,
+        k_ao,
+        None,
+    );
+    for (step, (mx, show_water, huge, t)) in [
+        (Some(0.45), false, false, 1.9),
+        (Some(-0.15), true, false, 2.3),
+        (Some(-0.15), true, false, 2.7),
+        (None, false, true, 3.1),
+        (None, false, false, 3.5),
+        (None, false, false, 3.9),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for (r, m_id, f_id) in [
+            (&mut kept, k_mover, k_fountain),
+            (&mut whole, w_mover, w_fountain),
+        ] {
+            if huge {
+                r.set_prop_instance(m_id, &AoGarden::placed([0.0, 1.6, 1.9], [1.6; 3]), true)
+                    .expect("huge mover");
+            } else if let Some(x) = mx {
+                r.set_prop_instance(m_id, &AoGarden::placed([x, 0.6, 0.8], [0.22; 3]), true)
+                    .expect("mover");
+            } else {
+                r.set_prop_instance(m_id, &math::IDENTITY, false)
+                    .expect("hide mover");
+            }
+            if show_water {
+                r.set_prop_instance(f_id, &AoGarden::placed([0.55, 0.58, 1.3], [0.2; 3]), true)
+                    .expect("show fountain");
+            } else {
+                r.set_prop_instance(f_id, &math::IDENTITY, false)
+                    .expect("hide fountain");
+            }
+        }
+        let env = make_env(t);
+        let (a, a_ao) = present_with_ao(&mut device, &mut kept, (&view, &env), k_out, k_ao, None);
+        if huge {
+            assert!(
+                !kept.last_frame_stats().ao_kept,
+                "huge fallback step {step}"
+            );
+        }
+        whole.forget_ao();
+        let (b, b_ao) = present_with_ao(&mut device, &mut whole, (&view, &env), w_out, w_ao, None);
+        let what = format!("occluded ocean dynamic step {step}");
+        assert_same_ao(&device, &a_ao, &b_ao, &what);
+        assert_same_frame(&device, &a, &b, &what);
+    }
+
+    for (tex, buf) in [k_out, w_out] {
+        device.destroy_texture(tex);
+        device.destroy_buffer(buf);
+    }
+    device.destroy_buffer(k_ao);
+    device.destroy_buffer(w_ao);
+    let errs = device.validation_errors();
+    assert!(errs.is_empty(), "validation errors: {errs:?}");
+    for r in [&mut kept, &mut whole] {
+        r.destroy_props(&mut device);
+    }
+}
+
+/// In a dry scene (`!water_drawn`) with swaying grass (`sway > 0`), hiding or moving an opaque
+/// prop while `env.seconds` is paused (`!grass_changed`) uncovers grass blades and must recapture
+/// `ao_grass[cur_idx]` so that when the clock unpauses on a subsequent frame and those blades sway
+/// out of their uncovered tiles, `ao_grass_union` includes the uncovered tiles and matches
+/// whole-frame SSAO byte-for-byte.
+#[test]
+fn unpausing_after_prop_uncovers_swaying_grass_matches_whole_ao() {
+    let Ok(mut device) = Device::headless() else {
+        return;
+    };
+    let mut world = World::default();
+    world.materials.push(Material {
+        name: "stone_floor".into(),
+        base_color: [0.48, 0.46, 0.44, 1.0],
+        ..Material::default()
+    });
+    world.materials.push(Material {
+        name: "tuft".into(),
+        base_color: [0.3, 0.5, 0.22, 1.0],
+        ..Material::default()
+    });
+    world.meshes.push(Mesh {
+        material: Some(0),
+        ..make_quad_mesh(0.0, 4.0)
+    });
+    world.instances.push(Instance {
+        mesh: 0,
+        transform: Transform(math::IDENTITY),
+    });
+    // High corner canopy so `scene.land_max.y` (`2.0`) already encloses `blocker` (`y < 1.0`),
+    // keeping `cascades()` and `world_key` invariant when `blocker` hides or moves.
+    world.meshes.push(Mesh {
+        material: Some(0),
+        ..make_quad_mesh(2.0, 0.1)
+    });
+    let mut post_xf = math::IDENTITY;
+    post_xf[12] = -3.5;
+    post_xf[14] = -3.5;
+    world.instances.push(Instance {
+        mesh: 1,
+        transform: Transform(post_xf),
+    });
+    // Small grass planter so blade roots stay on the left while peak gusts (`dir = (0.8, 0.6)`) bend
+    // tips across the ray toward the boulder's dark contact crease, then retract out on trough gusts.
+    world.meshes.push(Mesh {
+        material: Some(1),
+        ..make_quad_mesh(0.002, 0.14)
+    });
+    let mut tuft_xf = math::IDENTITY;
+    tuft_xf[12] = -0.22;
+    tuft_xf[14] = -0.15;
+    world.instances.push(Instance {
+        mesh: 2,
+        transform: Transform(tuft_xf),
+    });
+
+    let mut look = Look {
+        painterly: 0.0,
+        ..Look::default()
+    };
+    look.details.push(DetailRule {
+        patterns: vec!["tuft".into()],
+        preset: DetailPreset::Grass,
+        scale: [1.0, 1.0],
+        strength: 1.0,
+        variation: 0.0,
+        color: None,
+        gloss: 0.0,
+    });
+    look.grass.density = 1.0;
+    look.grass.height = 0.65;
+    look.grass.width = 0.08;
+    look.grass.sway = 1.4;
+    look.grass.flowers = 0.0;
+
+    let size = (240, 180);
+    let quality = Quality {
+        reflection_scale: 0.0,
+        ao_scale: 1.0,
+        ao_samples: 12,
+        ..Quality::realtime()
+    };
+    let view = View {
+        name: "paused_uncover".into(),
+        eye: [0.0, 1.6, 3.2],
+        target: [0.0, 0.1, 0.0],
+        fov: 50.0,
+        ..View::default()
+    };
+    let make_env = |seconds: f32| {
+        let w = Weather {
+            wind: 6.0,
+            ..Weather::default()
+        };
+        Environment::resolve(
+            &TimeOfDay {
+                hours: 15.0,
+                ..TimeOfDay::default()
+            },
+            &w,
+            &look.palette,
+            seconds,
+        )
+    };
+
+    let (sp, sn, suv, sidx) = sphere_prop_data();
+    let setup = |device: &mut Device<'_>| {
+        let mut r = Renderer::new(
+            device,
+            &world,
+            look.clone(),
+            quality,
+            size,
+            Output::Surface(Format::Rgba8Unorm),
+        )
+        .expect("renderer");
+        r.finish_ao(device).expect("baked ao");
+        let ao = readable_ao(device, &mut r);
+        let mesh = r
+            .create_prop_mesh(
+                device,
+                &MeshData {
+                    positions: &sp,
+                    normals: &sn,
+                    uvs: &suv,
+                    indices: &sidx,
+                },
+            )
+            .expect("mesh");
+        let mat = r
+            .create_prop_material(
+                device,
+                &MaterialDesc {
+                    name: "stone".into(),
+                    base_color: [0.55, 0.52, 0.5, 1.0],
+                    ..MaterialDesc::default()
+                },
+            )
+            .expect("mat");
+        // Stationary boulder on the camera ray behind the bent blade tips (`[0.23, 0.50, 0.19]`) so
+        // its floor contact crease (`z ~ -0.80..-1.35`) has dark screen-space AO `< 1.0`.
+        r.create_prop_instance(
+            mesh,
+            mat,
+            &AoGarden::placed([0.35, 0.25, -1.1], [0.45, 0.3, 0.3]),
+        )
+        .expect("boulder");
+        let blocker = r
+            .create_prop_instance(mesh, mat, &math::IDENTITY)
+            .expect("blocker");
+        r.set_prop_instance(blocker, &math::IDENTITY, false)
+            .expect("hide blocker");
+        let out = canvas(device, size);
+        (r, blocker, out, ao)
+    };
+
+    let (mut kept, k_blocker, k_out, k_ao) = setup(&mut device);
+    let (mut whole, w_blocker, w_out, w_ao) = setup(&mut device);
+
+    // Warm up so the stationary boulder settles into `world_cache`.
+    let env0 = make_env(0.2);
+    for _ in 0..10 {
+        let _ = present_with_ao(&mut device, &mut kept, (&view, &env0), k_out, k_ao, None);
+        let _ = present_with_ao(&mut device, &mut whole, (&view, &env0), w_out, w_ao, None);
+    }
+    assert!(kept.last_frame_stats().world_cached);
+
+    // Case 1: Peak gust (`t = 1.8`) bends blade tips right onto the camera ray in front of the
+    // boulder's dark floor crease; `blocker` sits closer on that same ray so it occludes ONLY the
+    // bent tip tiles on Frame 1, hides on Frame 2 at constant `t = 1.8`, and Frame 3 unpauses to
+    // trough gust (`t = 4.2`) where the tips retract out of those tiles!
+    let cover_xf = AoGarden::placed([0.2, 0.66, 0.64], [0.16, 0.16, 0.1]);
+    for (r, b) in [(&mut kept, k_blocker), (&mut whole, w_blocker)] {
+        r.set_prop_instance(b, &cover_xf, true)
+            .expect("show blocker");
+    }
+    let env_t1 = make_env(1.8);
+    let (a, a_ao) = present_with_ao(&mut device, &mut kept, (&view, &env_t1), k_out, k_ao, None);
+    let slot_f1 = kept.targets.ao_grass_cur;
+    whole.forget_ao();
+    let (b, b_ao) = present_with_ao(&mut device, &mut whole, (&view, &env_t1), w_out, w_ao, None);
+    assert_same_ao(&device, &a_ao, &b_ao, "paused grass frame 1 (covered)");
+    assert_same_frame(&device, &a, &b, "paused grass frame 1 (covered)");
+
+    // Frame 2: hide blocker at constant `t = 1.8` (`!grass_changed`, `!regions.is_empty()`).
+    for (r, b) in [(&mut kept, k_blocker), (&mut whole, w_blocker)] {
+        r.set_prop_instance(b, &math::IDENTITY, false)
+            .expect("hide blocker");
+    }
+    let (a, a_ao) = present_with_ao(&mut device, &mut kept, (&view, &env_t1), k_out, k_ao, None);
+    let stats_f2 = kept.last_frame_stats();
+    assert!(
+        stats_f2.ao_kept && stats_f2.ssao_drawn && stats_f2.ao_changed_pixels > 0,
+        "f2 stats: {stats_f2:?}"
+    );
+    assert_eq!(
+        kept.targets.ao_grass_cur,
+        1 - slot_f1,
+        "uncovering swaying grass at constant seconds must recapture active grass slot"
+    );
+    whole.forget_ao();
+    let (b, b_ao) = present_with_ao(&mut device, &mut whole, (&view, &env_t1), w_out, w_ao, None);
+    assert_same_ao(&device, &a_ao, &b_ao, "paused grass frame 2 (uncovered)");
+    assert_same_frame(&device, &a, &b, "paused grass frame 2 (uncovered)");
+
+    // Frame 3: unpause clock (`t = 4.2`, grass retracts out of uncovered tip tiles, 0 CPU regions).
+    let env_t3 = make_env(4.2);
+    let (a, a_ao) = present_with_ao(&mut device, &mut kept, (&view, &env_t3), k_out, k_ao, None);
+    let stats_f3 = kept.last_frame_stats();
+    assert!(stats_f3.ao_kept && stats_f3.ssao_drawn && stats_f3.ao_changed_pixels == 0);
+    whole.forget_ao();
+    let (b, b_ao) = present_with_ao(&mut device, &mut whole, (&view, &env_t3), w_out, w_ao, None);
+    assert_same_ao(&device, &a_ao, &b_ao, "unpaused grass frame 3");
+    assert_same_frame(&device, &a, &b, "unpaused grass frame 3");
+
+    // Case 2: Move blocker aside at constant `t = 1.8`, hold one completely quiet frame at `t = 1.8`,
+    // then unpause to `t = 4.2`.
+    for (r, b) in [(&mut kept, k_blocker), (&mut whole, w_blocker)] {
+        r.set_prop_instance(b, &cover_xf, true)
+            .expect("show blocker 2");
+    }
+    let env_t4 = make_env(1.8);
+    let _ = present_with_ao(&mut device, &mut kept, (&view, &env_t4), k_out, k_ao, None);
+    whole.forget_ao();
+    let _ = present_with_ao(&mut device, &mut whole, (&view, &env_t4), w_out, w_ao, None);
+
+    let aside_xf = AoGarden::placed([-0.85, 0.25, 0.6], [0.16, 0.2, 0.16]);
+    for (r, b) in [(&mut kept, k_blocker), (&mut whole, w_blocker)] {
+        r.set_prop_instance(b, &aside_xf, true)
+            .expect("move blocker aside");
+    }
+    let (a, a_ao) = present_with_ao(&mut device, &mut kept, (&view, &env_t4), k_out, k_ao, None);
+    whole.forget_ao();
+    let (b, b_ao) = present_with_ao(&mut device, &mut whole, (&view, &env_t4), w_out, w_ao, None);
+    assert_same_ao(&device, &a_ao, &b_ao, "moved aside at paused t=1.8");
+    assert_same_frame(&device, &a, &b, "moved aside at paused t=1.8");
+
+    // Quiet paused frame (`0` pyramid passes, `0` ssao pass) before unpausing.
+    let (a, a_ao) = present_with_ao(&mut device, &mut kept, (&view, &env_t4), k_out, k_ao, None);
+    assert!(kept.last_frame_stats().ao_kept && !kept.last_frame_stats().ssao_drawn);
+    whole.forget_ao();
+    let (b, b_ao) = present_with_ao(&mut device, &mut whole, (&view, &env_t4), w_out, w_ao, None);
+    assert_same_ao(&device, &a_ao, &b_ao, "quiet paused frame before unpause");
+    assert_same_frame(&device, &a, &b, "quiet paused frame before unpause");
+
+    let env_t5 = make_env(4.2);
+    let (a, a_ao) = present_with_ao(&mut device, &mut kept, (&view, &env_t5), k_out, k_ao, None);
+    whole.forget_ao();
+    let (b, b_ao) = present_with_ao(&mut device, &mut whole, (&view, &env_t5), w_out, w_ao, None);
+    assert_same_ao(&device, &a_ao, &b_ao, "unpaused after quiet frame");
+    assert_same_frame(&device, &a, &b, "unpaused after quiet frame");
+
+    for (tex, buf) in [k_out, w_out] {
+        device.destroy_texture(tex);
+        device.destroy_buffer(buf);
+    }
+    device.destroy_buffer(k_ao);
+    device.destroy_buffer(w_ao);
+    let errs = device.validation_errors();
+    assert!(errs.is_empty(), "validation errors: {errs:?}");
+    for r in [&mut kept, &mut whole] {
+        r.destroy_props(&mut device);
+    }
+}

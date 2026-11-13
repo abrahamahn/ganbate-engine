@@ -994,3 +994,376 @@ fn cleared_prop_textures_hold_the_canvas_bytes_in_every_mip_and_take_updates() {
 
     r.destroy_props(&mut device);
 }
+
+#[test]
+fn shared_joint_set_settles_still_submeshes_and_clips_near_boxes() {
+    use crate::Vec3;
+    use crate::render::{Environment, Look, Output, Quality, TimeOfDay, View, Weather};
+    use crate::world::{Instance, Material, Mesh, Transform, World};
+
+    // 1. A settled prop AABB crossing behind the eye on the right half of the viewport clips its
+    // 12 edges via `box_rect` instead of blowing up to the full viewport.
+    let size = (128, 96);
+    let vp = math::mul(
+        &math::perspective(50f32.to_radians(), 128.0 / 96.0, 0.1),
+        &math::look_at([0.0, 0.0, 2.0], [0.0, 0.0, 0.0], [0.0, 1.0, 0.0]),
+    );
+    let mut props = Props::default();
+    let mut near_mesh = z_quad_mesh_entry(0.2);
+    near_mesh.min = [0.6, -0.2, 0.5];
+    near_mesh.max = [1.0, 0.2, 2.5];
+    let nm = PropMesh(props.meshes.insert(near_mesh).unwrap());
+    let nmat = PropMaterial(
+        props
+            .materials
+            .insert(dummy_material_entry(MaterialDesc::default()))
+            .unwrap(),
+    );
+    let _nid = props.instances.insert(instance_entry(nm, nmat)).unwrap();
+    for _ in 0..=SETTLE_FRAMES {
+        props.pose_instances();
+    }
+    let tracked = track_cached_props(
+        &mut props,
+        false,
+        &CacheView {
+            view_proj: &vp,
+            size,
+        },
+        &[],
+        SHADOW_DRIFT_TEXELS,
+    );
+    assert_eq!(tracked.regions.len(), 1);
+    let r = tracked.regions[0];
+    assert!(
+        r[0] >= size.0 / 2 && r[2] <= size.0,
+        "expected near-plane straddling box rect on right half, got {r:?}"
+    );
+
+    // 2. Shared `JointSet` on lavapipe: upper-body joints animate every frame while lower-body
+    // influencing joints and an unskinned attachment stay still -> lower-body and unskinned
+    // sub-meshes settle into `world_cache` after `SETTLE_FRAMES` and match uncached rendering
+    // byte-for-byte on every frame (and wake cleanly when a lower joint moves).
+    let Ok(mut device) = Device::headless() else {
+        return;
+    };
+    let mut world = World::default();
+    world.materials.push(Material {
+        name: "floor".into(),
+        base_color: [0.58, 0.55, 0.5, 1.0],
+        roughness: 0.8,
+        ..Material::default()
+    });
+    world.meshes.push(Mesh {
+        positions: vec![
+            Vec3(-3.0, 0.0, -3.0),
+            Vec3(3.0, 0.0, -3.0),
+            Vec3(3.0, 0.0, 3.0),
+            Vec3(-3.0, 0.0, 3.0),
+            Vec3(-3.0, 0.0, -3.0),
+            Vec3(3.0, 0.0, -3.0),
+            Vec3(3.0, 2.0, -3.0),
+            Vec3(-3.0, 2.0, -3.0),
+        ],
+        normals: vec![
+            Vec3(0.0, 1.0, 0.0),
+            Vec3(0.0, 1.0, 0.0),
+            Vec3(0.0, 1.0, 0.0),
+            Vec3(0.0, 1.0, 0.0),
+            Vec3(0.0, 0.0, 1.0),
+            Vec3(0.0, 0.0, 1.0),
+            Vec3(0.0, 0.0, 1.0),
+            Vec3(0.0, 0.0, 1.0),
+        ],
+        uvs: vec![[0.0, 0.0]; 8],
+        color: [1.0, 1.0, 1.0],
+        indices: vec![0, 2, 1, 0, 3, 2, 4, 5, 6, 4, 6, 7],
+        material: Some(0),
+    });
+    world.instances.push(Instance {
+        mesh: 0,
+        transform: Transform(math::IDENTITY),
+    });
+
+    let look = Look {
+        painterly: 0.0,
+        ..Look::default()
+    };
+    let view = View {
+        name: "rig".into(),
+        eye: [0.0, 1.35, 2.7],
+        target: [0.0, 0.65, 0.0],
+        fov: 46.0,
+        ..View::default()
+    };
+    let env = Environment::resolve(
+        &TimeOfDay {
+            hours: 15.5,
+            ..TimeOfDay::default()
+        },
+        &Weather::default(),
+        &look.palette,
+        1.0,
+    );
+
+    let box_data = |y0: f32, y1: f32| {
+        let x = 0.22;
+        let z = 0.18;
+        let positions = vec![
+            [-x, y0, z],
+            [x, y0, z],
+            [x, y1, z],
+            [-x, y1, z],
+            [x, y0, -z],
+            [-x, y0, -z],
+            [-x, y1, -z],
+            [x, y1, -z],
+            [-x, y1, z],
+            [x, y1, z],
+            [x, y1, -z],
+            [-x, y1, -z],
+        ];
+        let normals = vec![
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+            [0.0, 0.0, -1.0],
+            [0.0, 0.0, -1.0],
+            [0.0, 0.0, -1.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ];
+        let uvs = vec![[0.0, 0.0]; 12];
+        let indices = vec![0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7, 8, 9, 10, 8, 10, 11];
+        (positions, normals, uvs, indices)
+    };
+
+    let setup = |device: &mut Device<'_>| {
+        let mut r = Renderer::new(
+            device,
+            &world,
+            look.clone(),
+            Quality::realtime(),
+            size,
+            Output::Surface(Format::Rgba8Unorm),
+        )
+        .expect("renderer");
+        r.finish_ao(device).expect("ao");
+
+        let (lp, ln, luv, lidx) = box_data(0.05, 0.55);
+        let lower_mesh = r
+            .create_prop_mesh(
+                device,
+                &MeshData {
+                    positions: &lp,
+                    normals: &ln,
+                    uvs: &luv,
+                    indices: &lidx,
+                },
+            )
+            .expect("lower mesh");
+        r.set_prop_mesh_skin(lower_mesh, &[[0, 1, 0, 0]; 12], &[[0.6, 0.4, 0.0, 0.0]; 12])
+            .expect("lower skin");
+
+        let (up, un, uuv, uidx) = box_data(0.6, 1.1);
+        let upper_mesh = r
+            .create_prop_mesh(
+                device,
+                &MeshData {
+                    positions: &up,
+                    normals: &un,
+                    uvs: &uuv,
+                    indices: &uidx,
+                },
+            )
+            .expect("upper mesh");
+        r.set_prop_mesh_skin(upper_mesh, &[[2, 3, 0, 0]; 12], &[[0.5, 0.5, 0.0, 0.0]; 12])
+            .expect("upper skin");
+
+        let (hp, hn, huv, hidx) = box_data(0.1, 0.35);
+        let stand_mesh = r
+            .create_prop_mesh(
+                device,
+                &MeshData {
+                    positions: &hp,
+                    normals: &hn,
+                    uvs: &huv,
+                    indices: &hidx,
+                },
+            )
+            .expect("stand mesh");
+
+        let lower_mat = r
+            .create_prop_material(
+                device,
+                &MaterialDesc {
+                    name: "lower".into(),
+                    base_color: [0.25, 0.52, 0.78, 1.0],
+                    casts_shadow: true,
+                    ..MaterialDesc::default()
+                },
+            )
+            .expect("lower mat");
+        let upper_mat = r
+            .create_prop_material(
+                device,
+                &MaterialDesc {
+                    name: "upper".into(),
+                    base_color: [0.85, 0.42, 0.28, 1.0],
+                    casts_shadow: true,
+                    ..MaterialDesc::default()
+                },
+            )
+            .expect("upper mat");
+        let stand_mat = r
+            .create_prop_material(
+                device,
+                &MaterialDesc {
+                    name: "stand".into(),
+                    base_color: [0.35, 0.72, 0.42, 1.0],
+                    casts_shadow: true,
+                    ..MaterialDesc::default()
+                },
+            )
+            .expect("stand mat");
+
+        let lower = r
+            .create_prop_instance(lower_mesh, lower_mat, &translation_matrix(-0.28, 0.0, 0.15))
+            .expect("lower inst");
+        let upper = r
+            .create_prop_instance(upper_mesh, upper_mat, &translation_matrix(-0.28, 0.0, 0.15))
+            .expect("upper inst");
+        let stand = r
+            .create_prop_instance(stand_mesh, stand_mat, &translation_matrix(0.42, 0.0, 0.2))
+            .expect("stand inst");
+
+        let tex = device
+            .create_texture(&TextureDesc::new(
+                size.0,
+                size.1,
+                Format::Rgba8Unorm,
+                TextureUsage::COLOR_TARGET | TextureUsage::COPY_SRC,
+            ))
+            .expect("canvas");
+        let rb = device
+            .create_buffer(&BufferDesc {
+                size: u64::from(size.0 * size.1 * 4),
+                usage: BufferUsage::COPY_DST,
+                memory: Memory::Readback,
+            })
+            .expect("readback");
+        (
+            r,
+            [lower, upper, stand],
+            [lower_mat, upper_mat, stand_mat],
+            (tex, rb),
+        )
+    };
+
+    let (mut cached, c_parts, c_mats, c_out) = setup(&mut device);
+    let (mut whole, w_parts, _, w_out) = setup(&mut device);
+
+    let draw = |device: &mut Device<'_>, r: &mut Renderer, (tex, rb): (TextureId, BufferId)| {
+        let mut enc = device.encoder();
+        r.encode(device, &mut enc, &view, &env, [0.0; 2], 0, Some(tex))
+            .expect("encode");
+        enc.copy_texture_to_buffer(tex, 0, 0, rb, 0);
+        device.submit(enc).expect("submit");
+        device.read_buffer(rb).expect("read")
+    };
+    let mat_settled = |r: &Renderer, mat: PropMaterial| {
+        let batches: Vec<_> = r
+            .props
+            .batches
+            .iter()
+            .filter(|b| b.material == mat.0 && b.count > 0)
+            .collect();
+        assert_eq!(batches.len(), 1);
+        batches[0].settled
+    };
+
+    let total_steps = SETTLE_FRAMES as usize + 3;
+    for step in 0..=total_steps {
+        let side = if step % 2 == 0 { -1.0 } else { 1.0 };
+        let dx = side * 0.25;
+        let dy = side * 0.05;
+        let joints = [
+            math::IDENTITY,
+            translation_matrix(0.0, 0.04, 0.0),
+            translation_matrix(dx, dy, 0.0),
+            translation_matrix(dx * 0.6, -dy, 0.05),
+        ];
+        cached
+            .share_prop_instance_joints(&c_parts, &joints)
+            .expect("cached joints");
+        whole
+            .share_prop_instance_joints(&w_parts, &joints)
+            .expect("whole joints");
+
+        let a = draw(&mut device, &mut cached, c_out);
+        whole.forget_world_cache();
+        whole.forget_prop_shadows();
+        let b = draw(&mut device, &mut whole, w_out);
+        assert_eq!(a, b, "shared joint set parity at step {step}");
+
+        assert_eq!(cached.props.joint_sets.iter().count(), 1);
+        let settled_now = step >= SETTLE_FRAMES as usize;
+        assert_eq!(
+            mat_settled(&cached, c_mats[0]),
+            settled_now,
+            "lower sub-mesh settled at step {step}"
+        );
+        assert!(
+            !mat_settled(&cached, c_mats[1]),
+            "animating upper sub-mesh must stay live at step {step}"
+        );
+        assert_eq!(
+            mat_settled(&cached, c_mats[2]),
+            settled_now,
+            "unskinned stand sharing joint set settled at step {step}"
+        );
+    }
+
+    // Moving joint 1 wakes the lower sub-mesh immediately while the unskinned stand stays settled,
+    // and the rendered frame still matches uncached rendering byte-for-byte.
+    let wake_joints = [
+        math::IDENTITY,
+        translation_matrix(0.24, 0.04, -0.08),
+        translation_matrix(-0.15, 0.03, 0.0),
+        translation_matrix(-0.08, -0.02, 0.05),
+    ];
+    cached
+        .share_prop_instance_joints(&c_parts, &wake_joints)
+        .expect("wake cached");
+    whole
+        .share_prop_instance_joints(&w_parts, &wake_joints)
+        .expect("wake whole");
+    let a = draw(&mut device, &mut cached, c_out);
+    whole.forget_world_cache();
+    whole.forget_prop_shadows();
+    let b = draw(&mut device, &mut whole, w_out);
+    assert_eq!(a, b, "wake lower joint parity");
+    assert!(!mat_settled(&cached, c_mats[0]), "lower sub-mesh must wake");
+    assert!(
+        !mat_settled(&cached, c_mats[1]),
+        "upper sub-mesh stays live"
+    );
+    assert!(
+        mat_settled(&cached, c_mats[2]),
+        "unskinned stand stays settled"
+    );
+
+    for (tex, rb) in [c_out, w_out] {
+        device.destroy_texture(tex);
+        device.destroy_buffer(rb);
+    }
+    let errs = device.validation_errors();
+    assert!(errs.is_empty(), "validation errors: {errs:?}");
+    for r in [&mut cached, &mut whole] {
+        r.destroy_props(&mut device);
+    }
+}
