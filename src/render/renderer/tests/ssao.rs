@@ -1,6 +1,6 @@
 use super::*;
 use crate::render::look::DetailRule;
-use crate::render::props::{PropInstance, box_rect};
+use crate::render::props::PropInstance;
 
 /// Makes `r`'s AO target a copy source (and the frame slots that bind it anew), and a buffer to
 /// read it into.
@@ -100,12 +100,20 @@ fn the_ao_mask_and_ssao_shaders_compile_on_all_backends() {
     let composed = ganbate_shader::compose(POST, &shader_modules()).expect("compose");
     let opts = CompileOptions::default();
     for entry in [
+        "fs_ao_grass_half",
         "fs_ao_grass_tile",
         "fs_ao_grass_union",
         "fs_ao_grass_coarse",
         "fs_ssao",
     ] {
-        compile(POST, Stage::Fragment, entry).unwrap_or_else(|e| panic!("{entry} spirv: {e}"));
+        let spv =
+            compile(POST, Stage::Fragment, entry).unwrap_or_else(|e| panic!("{entry} spirv: {e}"));
+        if entry != "fs_ssao" {
+            assert!(
+                spv.bindings.iter().all(|b| b.binding != 1),
+                "{entry} must not bind depth_tex (binding 1)"
+            );
+        }
         let glsl = compile_glsl_with_options(&composed, Stage::Fragment, entry, &opts)
             .unwrap_or_else(|e| panic!("{entry} glsl: {e}"));
         let g = glsl.glsl.expect("glsl");
@@ -1149,6 +1157,258 @@ fn quiet_frame_skips_ssao_and_half_screen_change_falls_back_to_whole_ssao() {
     let (b, b_ao) = present_with_ao(&mut device, &mut whole, (&view, &env), w_out, w_ao, None);
     assert_same_ao(&device, &a_ao, &b_ao, "resume after fallback");
     assert_same_frame(&device, &a, &b, "resume after fallback");
+
+    let errs = device.validation_errors();
+    assert!(errs.is_empty(), "validation errors: {errs:?}");
+    for r in [&mut kept, &mut whole] {
+        r.destroy_props(&mut device);
+    }
+}
+
+/// Across odd/prime and `% 4` / `% 8` boundary viewport dimensions (`601x1309`..`604x1312` plus
+/// `133x101` and `135x103` covering all four `half_size % 4` remainders `{0, 1, 2, 3}`), with
+/// grass and flowers reaching the viewport edges, both world water and a `Shading::Water` prop
+/// (`water_props_rect`), a dry prop inside `water_rect`, and grass sway toggled on and off, kept
+/// `ao_tex` and output pixels match whole-frame SSAO byte-for-byte on lavapipe.
+#[test]
+fn odd_viewport_grass_boundaries_and_water_props_match_whole_ao() {
+    let Ok(mut device) = Device::headless() else {
+        return;
+    };
+    let mut world = World::default();
+    for (name, shading, base_color) in [
+        ("lawn", Shading::Standard, [0.28, 0.48, 0.2, 1.0]),
+        ("pond", Shading::Water, [0.1, 0.32, 0.42, 0.9]),
+    ] {
+        world.materials.push(Material {
+            name: name.into(),
+            base_color,
+            shading,
+            ..Material::default()
+        });
+    }
+    for (material, y, half, x, z) in [(0, 0.0, 5.0, 0.0, 0.0), (1, 0.02, 0.55, 0.45, -0.35)] {
+        world.meshes.push(Mesh {
+            material: Some(material),
+            ..make_quad_mesh(y, half)
+        });
+        let mut at = math::IDENTITY;
+        (at[12], at[14]) = (x, z);
+        world.instances.push(Instance {
+            mesh: material,
+            transform: Transform(at),
+        });
+    }
+    let make_look = |sway: f32| {
+        let mut look = Look {
+            painterly: 0.0,
+            ..Look::default()
+        };
+        look.details.push(DetailRule {
+            patterns: vec!["lawn".into()],
+            preset: DetailPreset::Grass,
+            scale: [1.0, 1.0],
+            strength: 1.0,
+            variation: 0.0,
+            color: None,
+            gloss: 0.0,
+        });
+        look.grass.density = 1.0;
+        look.grass.height = 0.36;
+        look.grass.width = 0.055;
+        look.grass.flowers = 0.25;
+        look.grass.sway = sway;
+        look
+    };
+    let sway_look = make_look(1.4);
+    let still_look = make_look(0.0);
+    let quality = Quality {
+        reflection_scale: 0.0,
+        ao_scale: 0.5,
+        ao_samples: 10,
+        ..Quality::realtime()
+    };
+    let init_size = (133, 101);
+    let (sp, sn, suv, sidx) = sphere_prop_data();
+    let mut build = || {
+        let mut r = Renderer::new(
+            &mut device,
+            &world,
+            sway_look.clone(),
+            quality,
+            init_size,
+            Output::Surface(Format::Rgba8Unorm),
+        )
+        .expect("renderer");
+        r.finish_ao(&mut device).expect("baked ao");
+        let mesh = r
+            .create_prop_mesh(
+                &mut device,
+                &MeshData {
+                    positions: &sp,
+                    normals: &sn,
+                    uvs: &suv,
+                    indices: &sidx,
+                },
+            )
+            .expect("mesh");
+        let stone = r
+            .create_prop_material(
+                &mut device,
+                &MaterialDesc {
+                    name: "stone".into(),
+                    base_color: [0.58, 0.55, 0.5, 1.0],
+                    ..MaterialDesc::default()
+                },
+            )
+            .expect("stone");
+        let basin_water = r
+            .create_prop_material(
+                &mut device,
+                &MaterialDesc {
+                    name: "basin_water".into(),
+                    base_color: [0.14, 0.38, 0.46, 1.0],
+                    shading: Shading::Water,
+                    casts_shadow: false,
+                    ..MaterialDesc::default()
+                },
+            )
+            .expect("basin_water");
+        // Dry boulder overlapping the world pond (`in_water_rect && !water`) and edge boulder.
+        r.create_prop_instance(
+            mesh,
+            stone,
+            &AoGarden::placed([0.45, 0.18, -0.35], [0.22, 0.18, 0.22]),
+        )
+        .expect("pond boulder");
+        r.create_prop_instance(
+            mesh,
+            stone,
+            &AoGarden::placed([0.52, 0.2, 0.55], [0.26, 0.2, 0.24]),
+        )
+        .expect("edge boulder");
+        // Scene prop using `Shading::Water` (`water_props_rect`) on the left side of the lawn.
+        r.create_prop_instance(
+            mesh,
+            basin_water,
+            &AoGarden::placed([-0.48, 0.08, 0.15], [0.3, 0.05, 0.3]),
+        )
+        .expect("water prop");
+        let mover = r
+            .create_prop_instance(
+                mesh,
+                stone,
+                &AoGarden::placed([-0.15, 0.16, 0.3], [0.16; 3]),
+            )
+            .expect("mover");
+        (r, mover)
+    };
+    let (mut kept, k_mover) = build();
+    let (mut whole, w_mover) = build();
+    let view = View {
+        name: "boundary_meadow".into(),
+        eye: [0.0, 1.15, 1.85],
+        target: [0.0, 0.08, 0.0],
+        fov: 52.0,
+        ..View::default()
+    };
+    let make_env = |look: &Look, seconds: f32| {
+        let w = Weather {
+            wind: 1.5,
+            ..Weather::default()
+        };
+        Environment::resolve(
+            &TimeOfDay {
+                hours: 15.0,
+                ..TimeOfDay::default()
+            },
+            &w,
+            &look.palette,
+            seconds,
+        )
+    };
+
+    let sizes = [
+        (133, 101),
+        (135, 103),
+        (601, 1309),
+        (602, 1310),
+        (603, 1311),
+        (604, 1312),
+    ];
+    for size in sizes {
+        let ao_scale = if size.0 < 200 { 1.0 } else { 0.5 };
+        let q = Quality {
+            ao_scale,
+            ..quality
+        };
+        kept.set_quality(&mut device, q).expect("kept quality");
+        whole.set_quality(&mut device, q).expect("whole quality");
+        kept.resize(&mut device, size).expect("kept resize");
+        whole.resize(&mut device, size).expect("whole resize");
+        kept.set_look(sway_look.clone());
+        whole.set_look(sway_look.clone());
+        let k_ao = readable_ao(&mut device, &mut kept);
+        let w_ao = readable_ao(&mut device, &mut whole);
+        let k_out = canvas(&mut device, size);
+        let w_out = canvas(&mut device, size);
+
+        for (step, (x, t)) in [(-0.15, 0.1), (-0.08, 0.45), (-0.08, 0.85)]
+            .into_iter()
+            .enumerate()
+        {
+            let m = AoGarden::placed([x, 0.16, 0.3], [0.16; 3]);
+            kept.set_prop_instance(k_mover, &m, true)
+                .expect("kept mover");
+            whole
+                .set_prop_instance(w_mover, &m, true)
+                .expect("whole mover");
+            let env = make_env(&sway_look, t);
+            let (a, a_ao) =
+                present_with_ao(&mut device, &mut kept, (&view, &env), k_out, k_ao, None);
+            assert_eq!(
+                kept.last_frame_stats().ao_kept,
+                step > 0,
+                "{size:?} sway step {step}"
+            );
+            whole.forget_ao();
+            let (b, b_ao) =
+                present_with_ao(&mut device, &mut whole, (&view, &env), w_out, w_ao, None);
+            assert!(!whole.last_frame_stats().ao_kept);
+            let what = format!("odd grass/water {size:?} sway step {step}");
+            assert_same_ao(&device, &a_ao, &b_ao, &what);
+            assert_same_frame(&device, &a, &b, &what);
+        }
+
+        // Toggle grass sway off (`sway = 0.0`): water still ripples inside `water_rect`, while
+        // non-water grass & dry tiles skip grass union/coarse work and match whole AO.
+        kept.set_look(still_look.clone());
+        whole.set_look(still_look.clone());
+        for (step, t) in [1.1, 1.5].into_iter().enumerate() {
+            let env = make_env(&still_look, t);
+            let (a, a_ao) =
+                present_with_ao(&mut device, &mut kept, (&view, &env), k_out, k_ao, None);
+            assert_eq!(
+                kept.last_frame_stats().ao_kept,
+                step > 0,
+                "{size:?} still-grass step {step}"
+            );
+            whole.forget_ao();
+            let (b, b_ao) =
+                present_with_ao(&mut device, &mut whole, (&view, &env), w_out, w_ao, None);
+            assert!(!whole.last_frame_stats().ao_kept);
+            let what = format!("odd grass/water {size:?} still step {step}");
+            assert_same_ao(&device, &a_ao, &b_ao, &what);
+            assert_same_frame(&device, &a, &b, &what);
+        }
+
+        for (tex, buf) in [k_out, w_out] {
+            device.destroy_texture(tex);
+            device.destroy_buffer(buf);
+        }
+        device.destroy_buffer(k_ao);
+        device.destroy_buffer(w_ao);
+    }
 
     let errs = device.validation_errors();
     assert!(errs.is_empty(), "validation errors: {errs:?}");

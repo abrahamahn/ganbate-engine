@@ -659,6 +659,13 @@ impl Pipelines {
                 }),
                 colors: vec![],
             })?,
+            ao_grass_half: fullscreen(
+                device,
+                &fsvs,
+                "fs_ao_grass_half",
+                Format::R8Unorm,
+                Blend::Replace,
+            )?,
             ao_grass_tile: fullscreen(
                 device,
                 &fsvs,

@@ -1307,6 +1307,10 @@ impl Renderer {
         let l = &self.look;
         let px_scale = t.height as f32 / 1080.0;
         // Ambient occlusion (skipped when `ao_samples == 0`, relying on baked vertex AO).
+        let grass_rect = (blades > 0)
+            .then(|| self.grass_rect(&eye, &ground, size))
+            .flatten();
+        let water_rect = self.water_rect(&eye, &main_frustum, size, water_drawn);
         let ao_next = self.encode_ao(
             device,
             enc,
@@ -1322,8 +1326,8 @@ impl Renderer {
                 seconds: env.seconds,
                 cache_regions: &regions,
                 live_regions: &live,
-                water_drawn,
-                grass_drawn: blades > 0,
+                water_rect,
+                grass_rect,
             },
             &mut stats,
         )?;

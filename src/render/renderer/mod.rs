@@ -20,8 +20,8 @@ use super::math::{
     perspective, reflect_y, scale, sub, transform,
 };
 use super::props::{
-    CacheChanges, CacheView, PropSet, Rect, SHADOW_DRIFT_TEXELS, ShadowMap, commit_prop_shadows,
-    corners, merge_boxes, screen_rect, track_cached_props, union,
+    CacheChanges, CacheView, PropSet, Rect, SHADOW_DRIFT_TEXELS, ShadowMap, box_rect,
+    commit_prop_shadows, corners, merge_boxes, screen_rect, track_cached_props, union,
 };
 use super::scene::{DrawItem, GpuScene};
 use super::sky::Environment;
@@ -333,6 +333,7 @@ pub(in crate::render) struct Pipelines {
     flower: PipelineId,
     sky: PipelineId,
     particle: PipelineId,
+    ao_grass_half: PipelineId,
     ao_grass_tile: PipelineId,
     ao_grass_union: PipelineId,
     ao_grass_coarse: PipelineId,
@@ -381,7 +382,8 @@ pub(in crate::render) struct Targets {
     ao_tex: TextureId,
     ao_for: Option<u64>,
     ao_cleared: bool,
-    /// Hierarchical 1/8-scale and 1/64-scale visible-grass coverage masks (`Format::R8Unorm`).
+    /// Hierarchical 1/2-, 1/8- and 1/64-scale visible-grass coverage masks (`Format::R8Unorm`).
+    ao_grass_half: TextureId,
     ao_grass: [TextureId; 2],
     ao_grass_cur: usize,
     ao_grass_valid: [bool; 2],
@@ -423,6 +425,7 @@ pub(in crate::render) struct Slot {
     /// `fs_reshade_mask`'s group and its `Reshade` block.
     mask: BindGroupId,
     reshade: BufferId,
+    ao_grass_half: BindGroupId,
     ao_grass_tile: BindGroupId,
     ao_grass_union: BindGroupId,
     ao_grass_coarse: BindGroupId,

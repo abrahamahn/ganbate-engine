@@ -1109,6 +1109,32 @@ impl Renderer {
         })
     }
 
+    /// Conservative screen rectangle covering all visible water-shaded scene props.
+    pub(in crate::render) fn water_props_rect(
+        &self,
+        view_proj: &M4,
+        size: (u32, u32),
+    ) -> Option<Rect> {
+        let mut out: Option<Rect> = None;
+        for b in &self.props.batches {
+            if b.layer == Layer::Overlay
+                || !self
+                    .props
+                    .materials
+                    .get(b.material)
+                    .is_some_and(|m| m.desc.shading == Shading::Water)
+            {
+                continue;
+            }
+            for &bounds in &self.props.placed[b.first as usize..(b.first + b.count) as usize] {
+                if let Some(r) = box_rect(bounds, view_proj, size, 2.0) {
+                    out = Some(out.map_or(r, |acc| union(acc, r)));
+                }
+            }
+        }
+        out
+    }
+
     pub(super) fn create_prop_slot(
         &self,
         device: &mut Device<'_>,

@@ -5,8 +5,9 @@ use super::*;
 pub(super) const MAX_AO_REGIONS: usize = 16;
 const _: () = assert!(MAX_AO_REGIONS <= 16);
 
-/// Bytes of the AO's changed regions block: its head, view_proj's row lengths, then the regions.
-pub(super) const AO_CHANGED_BYTES: u64 = 32 + MAX_AO_REGIONS as u64 * 16;
+/// Bytes of the AO's changed regions block: its head, view_proj's row lengths, visible water rect,
+/// then the regions.
+pub(super) const AO_CHANGED_BYTES: u64 = 48 + MAX_AO_REGIONS as u64 * 16;
 
 /// Pixels the AO's changed regions are widened by, against the rounding of a kernel point's pixel
 /// apart where `fs_ssao` tests it and where it reads it.
@@ -16,13 +17,15 @@ pub(super) const AO_REGION_MARGIN: u32 = 2;
 /// fifth, lifted 0.08 off the surface), rounded up.
 pub(super) const AO_KERNEL_REACH: f32 = 0.96;
 
-/// Fine (`1/8` viewport) and coarse (`1/64` viewport) dimensions for the GPU visible-grass masks.
-pub(super) fn ao_grass_sizes((width, height): (u32, u32)) -> ((u32, u32), (u32, u32)) {
+/// Half (`1/2`), fine (`1/8`) and coarse (`1/64`) dimensions for the GPU visible-grass masks.
+pub(super) fn ao_grass_sizes((width, height): (u32, u32)) -> ((u32, u32), (u32, u32), (u32, u32)) {
+    let hw = width.max(1).div_ceil(2);
+    let hh = height.max(1).div_ceil(2);
     let gw = width.max(1).div_ceil(8);
     let gh = height.max(1).div_ceil(8);
     let cw = gw.div_ceil(8).max(1);
     let ch = gh.div_ceil(8).max(1);
-    ((gw, gh), (cw, ch))
+    ((hw, hh), (gw, gh), (cw, ch))
 }
 
 /// The regions of a `size` picture whose depth or normals changed, widened by
@@ -103,14 +106,59 @@ pub(super) fn union_area(regions: &[Rect]) -> u32 {
         .sum()
 }
 
-/// The AO's changed regions block (`AoChanged` in post.wgsl) for `regions` of a picture seen
-/// through `view_proj`.
-pub(super) fn ao_changed_block(regions: &[Rect], view_proj: &M4) -> Vec<u8> {
+/// The AO's changed regions block (`AoChanged` in post.wgsl) for `regions` and `water_rect` of a
+/// picture seen through `view_proj`.
+pub(super) fn ao_changed_block(
+    regions: &[Rect],
+    water_rect: Option<Rect>,
+    view_proj: &M4,
+) -> Vec<u8> {
     let row = |k: usize| math::length([view_proj[k], view_proj[4 + k], view_proj[8 + k]]);
     let mut block = vec![regions.len() as f32, AO_KERNEL_REACH, 0.0, 0.0];
     block.extend([row(0), row(1), row(3), 0.0]);
+    block.extend(water_rect.unwrap_or([0; 4]).map(|v| v as f32));
     block.extend(regions.iter().flat_map(|r| r.map(|v| v as f32)));
     f32_bytes(&block)
+}
+
+fn scissored_post_pass(
+    enc: &mut Encoder,
+    target: TextureId,
+    target_size: (u32, u32),
+    scissor: Rect,
+    pipeline: PipelineId,
+    group: BindGroupId,
+    push: [f32; 16],
+) {
+    let full = scissor == [0, 0, target_size.0, target_size.1];
+    let load = if full {
+        Load::DontCare
+    } else {
+        Load::Clear([0.0; 4])
+    };
+    enc.begin_pass(PassDesc {
+        colors: vec![Attachment {
+            texture: target,
+            mip: 0,
+            layer: 0,
+            load,
+            store: true,
+        }],
+        depth: None,
+    });
+    if !full {
+        enc.set_scissor(
+            scissor[0],
+            scissor[1],
+            scissor[2] - scissor[0],
+            scissor[3] - scissor[1],
+        );
+    }
+    enc.set_pipeline(pipeline);
+    enc.set_bind_group(0, group);
+    enc.push_constants(&f32_bytes(&push));
+    enc.draw(3, 1, 0, 0);
+    enc.end_pass();
 }
 
 #[derive(Clone, Copy)]
@@ -143,8 +191,8 @@ pub(super) struct AoEncodeInput<'a> {
     pub(super) seconds: f32,
     pub(super) cache_regions: &'a [Rect],
     pub(super) live_regions: &'a [Rect],
-    pub(super) water_drawn: bool,
-    pub(super) grass_drawn: bool,
+    pub(super) water_rect: Option<Rect>,
+    pub(super) grass_rect: Option<Rect>,
 }
 
 impl Renderer {
@@ -199,6 +247,61 @@ impl Renderer {
         key.finish()
     }
 
+    /// Conservative screen rectangle covering all grass blades and flowers `self.grass_grid` can
+    /// place (`None` when `blades == 0` or completely outside the viewport).
+    pub(super) fn grass_rect(&self, eye: &Eye, ground: &Ground, size: (u32, u32)) -> Option<Rect> {
+        let [x0, z0, cols, rows] = self.grass_grid;
+        if cols == 0 || rows == 0 {
+            return None;
+        }
+        let side = self.grass_side();
+        if side == 0 {
+            return None;
+        }
+        let s = GRASS_SPACING;
+        let half = (side / 2) as f32;
+        let cx = (eye.pos[0] / s).floor() - half;
+        let cz = (eye.pos[2] / s).floor() - half;
+        let g = &self.look.grass;
+        let (h, w, sway) = (g.height.abs(), g.width.abs(), g.sway.abs());
+        let pad_xz = s + 3.9 * w + (0.25 + 0.75 * sway) * 1.45 * h + 0.4;
+        let lo = [
+            (cx + x0 as f32) * s - pad_xz,
+            ground.top - ground.range - 1.5 * h - 1.0,
+            (cz + z0 as f32) * s - pad_xz,
+        ];
+        let hi = [
+            (cx + (x0 + cols) as f32) * s + pad_xz,
+            ground.top + 1.5 * h + 1.0,
+            (cz + (z0 + rows) as f32) * s + pad_xz,
+        ];
+        box_rect((lo, hi), &eye.view_proj, size, 2.0)
+    }
+
+    /// Conservative screen rectangle covering all visible world water draws and water-shaded scene
+    /// props (`None` when `!water_drawn` or completely outside the viewport).
+    pub(super) fn water_rect(
+        &self,
+        eye: &Eye,
+        main_frustum: &Frustum,
+        size: (u32, u32),
+        water_drawn: bool,
+    ) -> Option<Rect> {
+        if !water_drawn {
+            return None;
+        }
+        let mut out = self.water_props_rect(&eye.view_proj, size);
+        for d in &self.scene.draws {
+            if d.water
+                && main_frustum.intersects_aabb(d.bounds.0, d.bounds.1)
+                && let Some(r) = box_rect(d.bounds, &eye.view_proj, size, 2.0)
+            {
+                out = Some(out.map_or(r, |acc| union(acc, r)));
+            }
+        }
+        out
+    }
+
     /// Encodes the GPU visible-grass masks (when needed) and the whole, kept, or skipped SSAO pass.
     pub(super) fn encode_ao(
         &self,
@@ -246,18 +349,20 @@ impl Renderer {
             (false, Vec::new(), 0, false)
         };
 
+        let grass_drawn = inp.grass_rect.is_some();
         let sway_bits = self.look.grass.sway.to_bits();
         let time_bits = inp.seconds.to_bits();
         let prev_idx = inp.prev.grass_cur;
         let prev_has_grass = inp.prev.grass_valid[prev_idx];
-        let grass_changed = if !keep_ao || (!inp.grass_drawn && !prev_has_grass) {
+        let grass_changed = if !keep_ao || (!grass_drawn && !prev_has_grass) {
             false
         } else {
-            inp.grass_drawn != prev_has_grass
+            grass_drawn != prev_has_grass
                 || sway_bits != inp.prev.grass_sway
                 || (self.look.grass.sway != 0.0 && time_bits != inp.prev.grass_time)
         };
 
+        let ((hw, hh), (gw, gh), _) = ao_grass_sizes(inp.size);
         let next = if !inp.cached {
             AoNextState::default()
         } else if keep_ao && regions.is_empty() && !grass_changed {
@@ -273,16 +378,40 @@ impl Renderer {
             let cur_idx = 1 - prev_idx;
             let mut valid = [false; 2];
             valid[prev_idx] = prev_has_grass;
-            valid[cur_idx] = inp.grass_drawn;
-            if inp.grass_drawn {
-                Self::post_pass(
+            valid[cur_idx] = grass_drawn;
+            if let Some([gx0, gy0, gx1, gy1]) = inp.grass_rect {
+                let h_rect = [
+                    gx0 / 2,
+                    gy0 / 2,
+                    gx1.div_ceil(2).min(hw),
+                    gy1.div_ceil(2).min(hh),
+                ];
+                scissored_post_pass(
+                    enc,
+                    t.ao_grass_half,
+                    (hw, hh),
+                    h_rect,
+                    p.ao_grass_half,
+                    slot.ao_grass_half,
+                    [0.0; 16],
+                );
+                let g_rect = [
+                    gx0 / 8,
+                    gy0 / 8,
+                    gx1.div_ceil(8).min(gw),
+                    gy1.div_ceil(8).min(gh),
+                ];
+                let mut tpc = [0.0f32; 16];
+                tpc[0] = 1.0 / hw as f32;
+                tpc[1] = 1.0 / hh as f32;
+                scissored_post_pass(
                     enc,
                     t.ao_grass[cur_idx],
-                    0,
-                    Load::DontCare,
+                    (gw, gh),
+                    g_rect,
                     p.ao_grass_tile,
                     slot.ao_grass_tile,
-                    [0.0; 16],
+                    tpc,
                 );
             }
             if keep_ao && grass_changed {
@@ -298,6 +427,9 @@ impl Renderer {
                     slot.ao_grass_union,
                     gpc,
                 );
+                let mut cpc = [0.0f32; 16];
+                cpc[0] = 1.0 / gw as f32;
+                cpc[1] = 1.0 / gh as f32;
                 Self::post_pass(
                     enc,
                     t.ao_grass_coarse,
@@ -305,7 +437,7 @@ impl Renderer {
                     Load::DontCare,
                     p.ao_grass_coarse,
                     slot.ao_grass_coarse,
-                    [0.0; 16],
+                    cpc,
                 );
             }
             AoNextState {
@@ -328,8 +460,8 @@ impl Renderer {
         if keep_ao {
             stats.ao_kept = true;
             stats.ao_changed_pixels = changed_pixels;
-            if inp.water_drawn || !regions.is_empty() || grass_changed {
-                let block = ao_changed_block(&regions, &inp.eye.view_proj);
+            if inp.water_rect.is_some() || !regions.is_empty() || grass_changed {
+                let block = ao_changed_block(&regions, inp.water_rect, &inp.eye.view_proj);
                 device.write_buffer(slot.ao_changed, 0, &block)?;
                 pc[4] = 1.0;
                 pc[5] = f32::from(u8::from(grass_changed));

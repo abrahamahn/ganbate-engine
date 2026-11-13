@@ -625,12 +625,12 @@ mod cache;
 #[cfg(test)]
 mod tests;
 
+#[cfg(test)]
+pub(in crate::render) use cache::units_sent;
 use cache::zeros;
 pub(in crate::render) use cache::{
     CacheChanges, CacheView, PropSet, Props, Rect, SHADOW_DRIFT_TEXELS, ShadowMap, bounds,
-    commit_prop_shadows, corners, merge_boxes, ray_box, ray_triangle, screen_rect,
+    box_rect, commit_prop_shadows, corners, merge_boxes, ray_box, ray_triangle, screen_rect,
     track_cached_props, union,
 };
 pub use cache::{Pick, WorldPick};
-#[cfg(test)]
-pub(in crate::render) use cache::{box_rect, units_sent};

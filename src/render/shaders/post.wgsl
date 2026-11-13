@@ -88,21 +88,33 @@ const KERNEL = array<vec3f, 16>(
   vec3f(-0.4776, 0.2847, 0.0271)
 );
 
-// Visible grass and flowers per 8 x 8 pixel tile of the picture (`ao_grass`): exclusively
-// `fs_grass` and `fs_flower` write `aux = (0, 1, 0, 0)` at `depth > 0`.
+fn grass_aux(a: vec4f) -> bool {
+  return a.y > 0.5 && a.w <= 0.0;
+}
+
+// 1/2-scale visible grass and flowers (`ao_grass_half`): exclusively `fs_grass` and `fs_flower`
+// write `aux = (0, 1, 0, 0)`.
+@fragment fn fs_ao_grass_half(in: Screen) -> @location(0) vec4f {
+  let b = vec2i(in.clip.xy) * 2;
+  let hi = vec2i(frame.viewport.xy) - vec2i(1);
+  let a0 = textureLoad(aux_tex, min(b, hi), 0);
+  let a1 = textureLoad(aux_tex, min(b + vec2i(1, 0), hi), 0);
+  let a2 = textureLoad(aux_tex, min(b + vec2i(0, 1), hi), 0);
+  let a3 = textureLoad(aux_tex, min(b + vec2i(1, 1), hi), 0);
+  let any_grass = grass_aux(a0) || grass_aux(a1) || grass_aux(a2) || grass_aux(a3);
+  return vec4f(select(0.0, 1.0, any_grass));
+}
+
+// 1/8-scale grass tile mask (`ao_grass`, `pc.a.xy = 1 / half_size`): 4 bilinear quad taps over
+// `ao_grass_half`.
 @fragment fn fs_ao_grass_tile(in: Screen) -> @location(0) vec4f {
-  let base = vec2i(in.clip.xy) * 8;
-  let end = min(base + vec2i(8), vec2i(frame.viewport.xy));
-  for (var y = base.y; y < end.y; y++) {
-    for (var x = base.x; x < end.x; x++) {
-      let p = vec2i(x, y);
-      let aux = textureLoad(aux_tex, p, 0);
-      if (aux.y > 0.5 && aux.w <= 0.0 && textureLoad(depth_tex, p, 0) > 0.0) {
-        return vec4f(1.0);
-      }
-    }
-  }
-  return vec4f(0.0);
+  let b = floor(in.clip.xy) * 4.0;
+  let inv = pc.a.xy;
+  let s = textureSampleLevel(src_tex, lin_sampler, (b + vec2f(1.0, 1.0)) * inv, 0.0).r
+    + textureSampleLevel(src_tex, lin_sampler, (b + vec2f(3.0, 1.0)) * inv, 0.0).r
+    + textureSampleLevel(src_tex, lin_sampler, (b + vec2f(1.0, 3.0)) * inv, 0.0).r
+    + textureSampleLevel(src_tex, lin_sampler, (b + vec2f(3.0, 3.0)) * inv, 0.0).r;
+  return vec4f(select(0.0, 1.0, s > 0.1));
 }
 
 // Union of last frame's and this frame's 1/8-scale grass tile masks (`pc.a.xy = (use_0, use_1)`).
@@ -121,18 +133,21 @@ const KERNEL = array<vec3f, 16>(
   return vec4f(0.0);
 }
 
-// 1/64-scale coarse grass mask (`ao_grass_coarse`): 1 where any 8 x 8 block of fine tiles has grass.
+fn grass_coarse_row(b: vec2f, y: f32, inv: vec2f) -> f32 {
+  return textureSampleLevel(src_tex, lin_sampler, (b + vec2f(1.0, y)) * inv, 0.0).r
+    + textureSampleLevel(src_tex, lin_sampler, (b + vec2f(3.0, y)) * inv, 0.0).r
+    + textureSampleLevel(src_tex, lin_sampler, (b + vec2f(5.0, y)) * inv, 0.0).r
+    + textureSampleLevel(src_tex, lin_sampler, (b + vec2f(7.0, y)) * inv, 0.0).r;
+}
+
+// 1/64-scale coarse grass mask (`ao_grass_coarse`, `pc.a.xy = 1 / fine_size`): 16 bilinear quad
+// taps over an 8 x 8 block of fine tiles.
 @fragment fn fs_ao_grass_coarse(in: Screen) -> @location(0) vec4f {
-  let base = vec2i(in.clip.xy) * 8;
-  let end = min(base + vec2i(8), vec2i(textureDimensions(src_tex)));
-  for (var y = base.y; y < end.y; y++) {
-    for (var x = base.x; x < end.x; x++) {
-      if (textureLoad(src_tex, vec2i(x, y), 0).r > 0.5) {
-        return vec4f(1.0);
-      }
-    }
-  }
-  return vec4f(0.0);
+  let b = floor(in.clip.xy) * 8.0;
+  let inv = pc.a.xy;
+  let s = grass_coarse_row(b, 1.0, inv) + grass_coarse_row(b, 3.0, inv)
+    + grass_coarse_row(b, 5.0, inv) + grass_coarse_row(b, 7.0, inv);
+  return vec4f(select(0.0, 1.0, s > 0.05));
 }
 
 // The regions of the picture whose depth or aux may differ from those the AO kept in its target
@@ -141,6 +156,7 @@ struct AoChanged {
   head: vec4f,              // regions, the farthest a kernel point lies from its surface point
                             // (in radii), unused, unused
   rows: vec4f,              // the lengths of the xyz of view_proj's x, y and w rows, unused
+  water: vec4f,             // conservative screen box [x0, y0, x1, y1] of visible water
   rects: array<vec4f, 16>,
 };
 @group(0) @binding(7) var<uniform> ao_changed: AoChanged;
@@ -217,11 +233,12 @@ fn ao_regions_met(reach: AoReach) -> u32 {
 }
 
 // Whether any 64 x 64 coarse grass tile (`src_tex` = `ao_grass_coarse` in `fs_ssao`) in
-// `reach` held visible grass on the last frame or this frame.
-fn grass_coarse_met(reach: AoReach) -> bool {
+// `reach` (or `px`'s own coarse tile) held visible grass on the last frame or this frame.
+fn grass_coarse_met(reach: AoReach, px: vec2i) -> bool {
   let full = frame.viewport.xy;
-  let lo = vec2i(max(reach.a, vec2f(0.0))) >> vec2u(6u);
-  let hi = vec2i(clamp(reach.z, vec2f(0.0), full - 1.0)) >> vec2u(6u);
+  let own = px >> vec2u(6u);
+  let lo = min(vec2i(max(reach.a, vec2f(0.0))) >> vec2u(6u), own);
+  let hi = max(vec2i(clamp(reach.z, vec2f(0.0), full - 1.0)) >> vec2u(6u), own);
   for (var cy = lo.y; cy <= hi.y; cy++) {
     for (var cx = lo.x; cx <= hi.x; cx++) {
       if (textureLoad(src_tex, vec2i(cx, cy), 0).r > 0.5) {
@@ -277,37 +294,56 @@ fn ao_reads_changed(
   let px = clamp(vec2i(in.uv * full), vec2i(0), size - vec2i(1));
   let d = textureLoad(depth_tex, px, 0);
   let kept = pc.b.x > 0.5;
+  let px_changed = kept && ao_changed_at(px, ao_all_regions());
   if (d <= 0.0) {
-    if (kept && !ao_changed_at(px, ao_all_regions())) {
+    if (kept && !px_changed) {
       discard;
     }
     return vec4f(1.0);
   }
-  let aux = textureLoad(aux_tex, px, 0);
-  if (aux.w <= 0.0) {
-    return vec4f(1.0);
-  }
   let grass_active = pc.b.y > 0.5;
-  let water = abs(aux.w - WATER_AUX) < 0.05;
-  if (kept && !water && !grass_active && ao_changed.head.x < 0.5) {
+  let pxf = vec2f(px);
+  let in_water_rect = kept
+    && all(pxf >= ao_changed.water.xy)
+    && all(pxf < ao_changed.water.zw);
+  if (kept && !in_water_rect && !grass_active && ao_changed.head.x < 0.5) {
     discard;
   }
   let p = world_at(in.uv, d);
   let radius = pc.a.x * clamp(linear_depth(d) * 0.04, 0.6, 3.0);
-  let hit = !kept
-    || water
-    || ao_changed_at(px, ao_all_regions())
-    || (grass_active && grass_fine_at(px));
   var reg_met = 0u;
   var grs_hit = false;
-  if (!hit) {
+  if (kept && !in_water_rect && !px_changed) {
     let reach = ao_reach(p, radius);
     reg_met = ao_regions_met(reach);
-    grs_hit = grass_active && grass_coarse_met(reach);
+    grs_hit = grass_active && grass_coarse_met(reach, px);
     if (reg_met == 0u && !grs_hit) {
       discard;
     }
   }
+  let aux = textureLoad(aux_tex, px, 0);
+  if (aux.w <= 0.0) {
+    if (kept && !px_changed && !(grass_active && grass_fine_at(px))) {
+      discard;
+    }
+    return vec4f(1.0);
+  }
+  let water = abs(aux.w - WATER_AUX) < 0.05;
+  if (in_water_rect && !water && !px_changed) {
+    if (!grass_active && ao_changed.head.x < 0.5) {
+      discard;
+    }
+    let reach = ao_reach(p, radius);
+    reg_met = ao_regions_met(reach);
+    grs_hit = grass_active && grass_coarse_met(reach, px);
+    if (reg_met == 0u && !grs_hit) {
+      discard;
+    }
+  }
+  let hit = !kept
+    || water
+    || px_changed
+    || (grass_active && grass_fine_at(px));
   let n = normalize(aux.xyz);
   let spin = rand01(u32(in.clip.x) * 2749u + u32(in.clip.y) * 6151u + u32(frame.wind.w) * 15485863u) * 6.2831;
   var up = vec3f(0.0, 1.0, 0.0);

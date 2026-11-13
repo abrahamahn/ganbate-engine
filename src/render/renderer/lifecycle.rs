@@ -292,7 +292,7 @@ impl Renderer {
         };
         let refl = scaled(q.reflection_scale);
         let ao = scaled(q.ao_scale);
-        let ((gw, gh), (cw, ch)) = ao_grass_sizes((width, height));
+        let ((hw, hh), (gw, gh), (cw, ch)) = ao_grass_sizes((width, height));
         let bloom_size = ((width / 2).max(1), (height / 2).max(1));
         let max_levels = 32 - bloom_size.0.min(bloom_size.1).leading_zeros();
         let bloom_levels = q.bloom_levels.clamp(1, max_levels.max(1));
@@ -333,6 +333,7 @@ impl Renderer {
             ao_tex: tex(device, ao.0, ao.1, Format::R16Float, rt)?,
             ao_for: None,
             ao_cleared: false,
+            ao_grass_half: tex(device, hw, hh, Format::R8Unorm, rt)?,
             ao_grass: [
                 tex(device, gw, gh, Format::R8Unorm, rt)?,
                 tex(device, gw, gh, Format::R8Unorm, rt)?,
@@ -458,7 +459,7 @@ impl Renderer {
         let (scene, sky) = (pair(scene), pair(sky));
         let (grass, flower, particle) = (blades[0], blades[1], blades[2]);
         let ao_changed = upload(device, AO_CHANGED_BYTES, BufferUsage::UNIFORM)?;
-        device.write_buffer(ao_changed, 0, &[0; 32])?;
+        device.write_buffer(ao_changed, 0, &[0; 48])?;
         let post = |d: &mut Device<'_>, pipe, src: Resource, extra: Resource| {
             d.create_bind_group(
                 pipe,
@@ -503,7 +504,13 @@ impl Renderer {
                 (18, Resource::Texture(t.cache_shadow)),
             ],
         )?;
-        let ao_grass_tile = post(device, p.ao_grass_tile, none, none)?;
+        let ao_grass_half = post(device, p.ao_grass_half, none, none)?;
+        let ao_grass_tile = post(
+            device,
+            p.ao_grass_tile,
+            Resource::Texture(t.ao_grass_half),
+            none,
+        )?;
         let ao_grass_union = post(
             device,
             p.ao_grass_union,
@@ -601,6 +608,7 @@ impl Renderer {
             restore,
             mask,
             reshade,
+            ao_grass_half,
             ao_grass_tile,
             ao_grass_union,
             ao_grass_coarse,
@@ -758,6 +766,7 @@ impl Renderer {
                     s.particle,
                     s.restore,
                     s.mask,
+                    s.ao_grass_half,
                     s.ao_grass_tile,
                     s.ao_grass_union,
                     s.ao_grass_coarse,
@@ -806,6 +815,7 @@ impl Renderer {
             old.refl_aux,
             old.refl_depth,
             old.ao_tex,
+            old.ao_grass_half,
             old.ao_grass[0],
             old.ao_grass[1],
             old.ao_grass_union,
