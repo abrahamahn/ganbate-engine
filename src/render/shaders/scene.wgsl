@@ -548,6 +548,16 @@ fn water_normal(world: vec3f, t: f32) -> vec3f {
   return normalize(vec3f(-g.x * 0.045, 1.0, -g.y * 0.045));
 }
 
+fn ground_shore_at(texel: vec2i, off: vec2i, max_c: vec2i, shore_h: f32) -> bool {
+  let qd = textureLoad(ground_depth, clamp(texel + off, vec2i(0), max_c), 0);
+  return qd < 1.0 && ground_height(qd) > shore_h;
+}
+
+fn world_shore_at(texel: vec2i, off: vec2i, max_c: vec2i, shore_h: f32) -> bool {
+  let qd = textureLoad(world_depth, clamp(texel + off, vec2i(0), max_c), 0);
+  return qd < 1.0 && world_height(qd) > shore_h;
+}
+
 #import scene_detail
 
 // Blended props (detail3.z = 1) write premultiplied colour; opaque draws keep alpha unused.
@@ -744,63 +754,68 @@ fn shade_scene(
     } else {
       refl = sky_color(reflect(-v, wn));
     }
+    let water_p = frame.water;
+    let shallow = frame.shallow;
     var below = 50.0;
     var foam = 0.0;
     let g = ground_texel(in.world);
     if (g.z >= 0.0) {
       let texel = vec2i(g.xy);
       let size = i32(frame.ground.z);
-      let gd = textureLoad(ground_depth, clamp(texel, vec2i(0), vec2i(size - 1)), 0);
+      let max_c = vec2i(size - 1);
+      let gd = textureLoad(ground_depth, clamp(texel, vec2i(0), max_c), 0);
       if (gd < 1.0) {
-        below = frame.water.x - ground_height(gd);
+        below = water_p.x - ground_height(gd);
       }
-      if (below > 0.02) {
-        var near = 0.0;
-        var offs = array<vec2i, 4>(vec2i(2, 0), vec2i(-2, 0), vec2i(0, 2), vec2i(0, -2));
-        for (var i = 0; i < 4; i++) {
-          let q = clamp(texel + offs[i], vec2i(0), vec2i(size - 1));
-          let qd = textureLoad(ground_depth, q, 0);
-          if (qd < 1.0 && ground_height(qd) > frame.water.x - 0.05) {
-            near = 1.0;
-          }
+      if (below > 0.02 && below < 0.6 && shallow.w > 0.0) {
+        let shore_h = water_p.x - 0.05;
+        if (ground_shore_at(texel, vec2i(2, 0), max_c, shore_h)
+          || ground_shore_at(texel, vec2i(-2, 0), max_c, shore_h)
+          || ground_shore_at(texel, vec2i(0, 2), max_c, shore_h)
+          || ground_shore_at(texel, vec2i(0, -2), max_c, shore_h)) {
+          let churn = 0.35 + 0.65 * smoothstep(0.3, 0.7, noise2(in.world.xz * 4.3 + vec2f(t * 0.35, -t * 0.27)));
+          foam = smoothstep(0.6, 0.05, below) * churn * shallow.w;
         }
-        let churn = 0.35 + 0.65 * smoothstep(0.3, 0.7, noise2(in.world.xz * 4.3 + vec2f(t * 0.35, -t * 0.27)));
-        foam = near * smoothstep(0.6, 0.05, below) * churn * frame.shallow.w;
       }
     } else {
       let w = world_texel(in.world);
       if (w.z >= 0.0) {
         let size = i32(frame.world.z);
-        let texel = clamp(vec2i(w.xy), vec2i(0), vec2i(size - 1));
+        let max_c = vec2i(size - 1);
+        let texel = clamp(vec2i(w.xy), vec2i(0), max_c);
         let wd = textureLoad(world_depth, texel, 0);
         if (wd < 1.0) {
-          below = frame.water.x - world_height(wd);
+          below = water_p.x - world_height(wd);
         }
-        if (below > 0.02) {
-          var near = 0.0;
-          var offs = array<vec2i, 4>(vec2i(1, 0), vec2i(-1, 0), vec2i(0, 1), vec2i(0, -1));
-          for (var i = 0; i < 4; i++) {
-            let q = clamp(texel + offs[i], vec2i(0), vec2i(size - 1));
-            let qd = textureLoad(world_depth, q, 0);
-            if (qd < 1.0 && world_height(qd) > frame.water.x - 0.05) {
-              near = 1.0;
-            }
+        if (below > 0.02 && below < 1.0 && shallow.w > 0.0) {
+          let shore_h = water_p.x - 0.05;
+          if (world_shore_at(texel, vec2i(1, 0), max_c, shore_h)
+            || world_shore_at(texel, vec2i(-1, 0), max_c, shore_h)
+            || world_shore_at(texel, vec2i(0, 1), max_c, shore_h)
+            || world_shore_at(texel, vec2i(0, -1), max_c, shore_h)) {
+            let churn = 0.35 + 0.65 * smoothstep(0.3, 0.7, noise2(in.world.xz * 1.7 + vec2f(t * 0.3, -t * 0.22)));
+            foam = smoothstep(1.0, 0.1, below) * churn * shallow.w;
           }
-          let churn = 0.35 + 0.65 * smoothstep(0.3, 0.7, noise2(in.world.xz * 1.7 + vec2f(t * 0.3, -t * 0.22)));
-          foam = near * smoothstep(1.0, 0.1, below) * churn * frame.shallow.w;
         }
       }
     }
     let shallows = (1.0 - smoothstep(0.0, 1.4, max(below, 0.0))) * 0.45;
-    let water_col = mix(frame.water_color.rgb, frame.shallow.rgb, shallows);
+    let water_col = mix(frame.water_color.rgb, shallow.rgb, shallows);
     let deep = water_col * (hemi + key * 0.25) + lamps * 0.05;
-    var col = mix(deep, refl, clamp(fres * 1.4 + 0.3, 0.0, 1.0) * frame.water.y);
+    var col = mix(deep, refl, clamp(fres * 1.4 + 0.3, 0.0, 1.0) * water_p.y);
     let r = reflect(-v, wn);
-    col += key * (pow(max(dot(r, l), 0.0), 600.0) * 6.0 * sh);
-    col += key * (pow(max(dot(r, l), 0.0), 40.0) * 0.08 * sh);
-    let cell = floor(in.world.xz * 7.0);
-    let spark = step(0.92, hash2(cell + vec2f(floor(t * 5.0) * 13.0, 0.0)));
-    col += key * (spark * pow(max(dot(r, l), 0.0), 90.0) * 9.0 * frame.water2.x * sh);
+    let rl = max(dot(r, l), 0.0);
+    if (rl > 0.0 && sh > 0.0) {
+      col += key * (pow(rl, 600.0) * 6.0 * sh);
+      col += key * (pow(rl, 40.0) * 0.08 * sh);
+      if (frame.water2.x > 0.0) {
+        let cell = floor(in.world.xz * 7.0);
+        let spark = step(0.92, hash2(cell + vec2f(floor(t * 5.0) * 13.0, 0.0)));
+        if (spark > 0.0) {
+          col += key * (spark * pow(rl, 90.0) * 9.0 * frame.water2.x * sh);
+        }
+      }
+    }
     let foam_lit = key * (0.35 + 0.65 * sh) * 0.8 + hemi * 0.9 + lamps * 0.4;
     col = mix(col, vec3f(0.86, 0.93, 0.92) * foam_lit, clamp(foam, 0.0, 0.7));
     var wout: FsOut;
