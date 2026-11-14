@@ -31,7 +31,7 @@ pub(super) const OUT_OF_REACH: ([f32; 4], f32) = ([1.0, 1.0, -1.0, -1.0], f32::N
 /// Pairs of a receiver and a footprint whose shadow volume [`Renderer::reshade_plan`] bounds in a
 /// frame, at most (a microsecond or so apiece natively): past them a receiver in reach adds all
 /// of its picture, as each did before the volumes bounded it.
-pub(super) const MAX_RESHADE_PAIRS: u32 = 64;
+pub(super) const MAX_RESHADE_PAIRS: u32 = 128;
 
 /// A moved prop's footprint in one shadow map props cast into ([`Renderer::shadow_footprints`]):
 /// the map (0, 1 the key light's cascades; 2, 3 a game's lights), its clip-space rect and its
@@ -305,10 +305,9 @@ impl ReceiverBounds {
         let seen = |d: &&DrawItem| view.intersects_aabb(d.bounds.0, d.bounds.1);
         let in_maps = |d: &DrawItem| {
             std::array::from_fn(|v| {
-                let (m, _, grow) = &maps[v];
+                let (m, margin, grow) = &maps[v];
                 let grown = (d.bounds.0.map(|x| x - grow), d.bounds.1.map(|x| x + grow));
-                let (r, _, far) = map_bounds(grown, m);
-                (r, far)
+                receiver_map_bounds(grown, m, (v >= 2).then_some(*margin))
             })
         };
         let (bounds, screen) = draws
@@ -359,6 +358,225 @@ pub(super) fn map_bounds(b: (V3, V3), m: &M4) -> ([f32; 4], f32, f32) {
         (near, far) = (near.min(q[2]), far.max(q[2]));
     }
     (r, near, far)
+}
+
+/// Receiver box `b` in shadow map `m` (`spot_margin`: `Some(margin)` for a perspective spotlight
+/// map, where points behind the light `c.w <= 1e-6`, beyond range `q.z > 1 + 1e-3`, or outside
+/// `[-1 - margin, 1 + margin]^2` have `game_light_share == 1.0` identically). Expands `b` by
+/// world-space depth-reconstruction slack `eps` and clips against `c.w >= 1e-6` so tall walls,
+/// roofs, and water extending above a spotlight do not expand to `[-1e9, 1e9]`.
+pub(super) fn receiver_map_bounds(
+    b: (V3, V3),
+    m: &M4,
+    spot_margin: Option<f32>,
+) -> ([f32; 4], f32) {
+    let perspective = m[3] != 0.0 || m[7] != 0.0 || m[11] != 0.0;
+    let Some(margin) = spot_margin.filter(|_| perspective) else {
+        let (r, _, far) = map_bounds(b, m);
+        return (r, far);
+    };
+    const FRONT: f32 = 1e-6;
+    let eps = 1e-5
+        * corners(b)
+            .iter()
+            .flatten()
+            .fold(1.0f32, |a, x| a.max(x.abs()));
+    let b = (b.0.map(|x| x - eps), b.1.map(|x| x + eps));
+    let clip = corners(b).map(|p| transform(m, [p[0], p[1], p[2], 1.0]));
+    let mut r = [
+        f32::INFINITY,
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::NEG_INFINITY,
+    ];
+    let (mut near, mut far, mut any) = (f32::INFINITY, f32::NEG_INFINITY, false);
+    let mut push = |c: [f32; 4]| {
+        let q = [c[0] / c[3], c[1] / c[3], c[2] / c[3]];
+        r = [
+            r[0].min(q[0]),
+            r[1].min(q[1]),
+            r[2].max(q[0]),
+            r[3].max(q[1]),
+        ];
+        (near, far, any) = (near.min(q[2]), far.max(q[2]), true);
+    };
+    for c in clip {
+        if c[3] >= FRONT {
+            push(c);
+        }
+    }
+    for i in 0..8 {
+        for bit in [1, 2, 4] {
+            if i & bit == 0 {
+                let (a, b_c) = (clip[i], clip[i | bit]);
+                if (a[3] < FRONT) != (b_c[3] < FRONT) {
+                    let f = (FRONT - a[3]) / (b_c[3] - a[3]);
+                    let mut c = std::array::from_fn(|k| a[k] + (b_c[k] - a[k]) * f);
+                    c[3] = FRONT;
+                    push(c);
+                }
+            }
+        }
+    }
+    let xy_lim = 1.0 + margin;
+    let z_lim = 1.0 + 1e-3;
+    if !any || near > z_lim || r[0] > xy_lim || r[2] < -xy_lim || r[1] > xy_lim || r[3] < -xy_lim {
+        return OUT_OF_REACH;
+    }
+    (r, far.min(z_lim))
+}
+
+/// Screen rectangle of the shadow prism `shadow_volume(b, f, maps)` (`points`) clipped to the
+/// camera frustum when any prism vertex crosses behind/near the camera or outside the viewport.
+pub(super) fn volume_screen_rect(
+    b: (V3, V3),
+    f: &Footprint,
+    maps: &[(M4, f32, f32); 4],
+    view_proj: &M4,
+    near: f32,
+    size: (u32, u32),
+    points: &[V3],
+) -> Option<Rect> {
+    if points.is_empty() {
+        return None;
+    }
+    let front_w = (near * 0.99).max(1e-4);
+    let all_inside = points.iter().all(|p| {
+        let c = transform(view_proj, [p[0], p[1], p[2], 1.0]);
+        c[3] >= front_w && c[0].abs() <= c[3] && c[1].abs() <= c[3]
+    });
+    if all_inside {
+        return screen_rect(points, view_proj, size, 1.0);
+    }
+    let &(v, fr, f_near) = f;
+    let (m, _, grow) = &maps[v];
+    let scale_coord = corners(b)
+        .iter()
+        .flatten()
+        .fold(1.0f32, |a, x| a.max(x.abs()));
+    let eps = 1e-5 * scale_coord;
+    let b_eps = (b.0.map(|x| x - eps), b.1.map(|x| x + eps));
+    let mut planes: Vec<[f64; 4]> = Vec::with_capacity(18);
+    let mut push_plane = |h: [f64; 4]| {
+        let len2 = h[0] * h[0] + h[1] * h[1] + h[2] * h[2];
+        if len2 >= 1e-24 {
+            let inv = 1.0 / len2.sqrt();
+            planes.push([h[0] * inv, h[1] * inv, h[2] * inv, h[3] * inv]);
+        }
+    };
+    for h in box_hull(b_eps).planes {
+        push_plane(h.map(f64::from));
+    }
+    if !fr.iter().chain([&f_near]).any(|x| x.abs() > 1e6) {
+        let far = corners(b_eps)
+            .iter()
+            .map(|p| transform(m, [p[0], p[1], p[2], 1.0]))
+            .filter(|c| c[3] > 1e-6)
+            .map(|c| c[2] / c[3])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let far = if v >= 2 { far.min(1.0 + 1e-3) } else { far };
+        if far == f32::NEG_INFINITY || v >= 2 && f_near > far {
+            return None;
+        }
+        let (lo, hi) = ([fr[0], fr[1], f_near], [fr[2], fr[3], far.max(f_near)]);
+        if let Some(vol) = map_hull(m, lo, hi, grow + eps) {
+            for h in vol.planes {
+                push_plane(h.map(f64::from));
+            }
+        }
+    }
+    let row = |r: usize| {
+        [
+            view_proj[r],
+            view_proj[4 + r],
+            view_proj[8 + r],
+            view_proj[12 + r],
+        ]
+        .map(f64::from)
+    };
+    let (r0, r1, r2, r3) = (row(0), row(1), row(2), row(3));
+    for h in [
+        std::array::from_fn(|j| 1.001 * r3[j] + r0[j]),
+        std::array::from_fn(|j| 1.001 * r3[j] - r0[j]),
+        std::array::from_fn(|j| 1.001 * r3[j] + r1[j]),
+        std::array::from_fn(|j| 1.001 * r3[j] - r1[j]),
+        std::array::from_fn(|j| 1.001 * r3[j] - r2[j]),
+        [r3[0], r3[1], r3[2], r3[3] - 1e-4],
+    ] {
+        push_plane(h);
+    }
+    let tol = -1e-4 * f64::from(scale_coord);
+    let n = planes.len();
+    let (w_px, h_px) = (size.0 as f32, size.1 as f32);
+    let (mut lo, mut hi, mut any) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2], false);
+    let cross3 = |a: [f64; 3], b: [f64; 3]| {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    };
+    for i in 0..n {
+        let pi = planes[i];
+        let ni = [pi[0], pi[1], pi[2]];
+        for j in (i + 1)..n {
+            if i < 6 && j == (i ^ 1) {
+                continue;
+            }
+            let pj = planes[j];
+            let nj = [pj[0], pj[1], pj[2]];
+            let ab = cross3(ni, nj);
+            if ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2] <= 1e-18 {
+                continue;
+            }
+            for k in (j + 1)..n {
+                if j < 6 && k == (j ^ 1) {
+                    continue;
+                }
+                let pk = planes[k];
+                let nk = [pk[0], pk[1], pk[2]];
+                let det = ni[0] * (nj[1] * nk[2] - nj[2] * nk[1])
+                    + ni[1] * (nj[2] * nk[0] - nj[0] * nk[2])
+                    + ni[2] * (nj[0] * nk[1] - nj[1] * nk[0]);
+                if det.abs() <= 1e-10 {
+                    continue;
+                }
+                let bd = cross3(nj, nk);
+                let da = cross3(nk, ni);
+                let inv = -1.0 / det;
+                let x = [
+                    (bd[0] * pi[3] + da[0] * pj[3] + ab[0] * pk[3]) * inv,
+                    (bd[1] * pi[3] + da[1] * pj[3] + ab[1] * pk[3]) * inv,
+                    (bd[2] * pi[3] + da[2] * pj[3] + ab[2] * pk[3]) * inv,
+                ];
+                if !x.iter().all(|v| v.is_finite()) {
+                    continue;
+                }
+                if planes
+                    .iter()
+                    .all(|h| h[0] * x[0] + h[1] * x[1] + h[2] * x[2] + h[3] >= tol)
+                {
+                    let c = transform(view_proj, [x[0] as f32, x[1] as f32, x[2] as f32, 1.0]);
+                    let cw = c[3].max(5e-5);
+                    let sx = (c[0] / cw * 0.5 + 0.5) * w_px;
+                    let sy = (c[1] / cw * 0.5 + 0.5) * h_px;
+                    lo = [lo[0].min(sx), lo[1].min(sy)];
+                    hi = [hi[0].max(sx), hi[1].max(sy)];
+                    any = true;
+                }
+            }
+        }
+    }
+    if !any {
+        return None;
+    }
+    let r = [
+        (lo[0] - 1.0).floor().clamp(0.0, w_px) as u32,
+        (lo[1] - 1.0).floor().clamp(0.0, h_px) as u32,
+        (hi[0] + 1.0).ceil().clamp(0.0, w_px) as u32,
+        (hi[1] + 1.0).ceil().clamp(0.0, h_px) as u32,
+    ];
+    (r[0] < r[2] && r[1] < r[3]).then_some(r)
 }
 
 /// The picture's pixels a frame shades again because moved props' shadows can reach them

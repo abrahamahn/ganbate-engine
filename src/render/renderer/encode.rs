@@ -1438,14 +1438,15 @@ impl Renderer {
                 grade[13] = if self.quality.fxaa { 1.0 } else { 0.0 };
                 grade[14] = if encode_srgb { 1.0 } else { 0.0 };
                 let plain = usize::from(l.grade_is_identity());
+                let op = l.tonemap as usize;
                 let (pipe, group) = match (t.graded, p.grade_once, slot.grade_once) {
                     (Some(graded), Some((pipes, read)), Some((groups, read_group))) => {
                         stats.graded_once = true;
-                        let (pipe, group) = (pipes[plain], groups[plain]);
+                        let (pipe, group) = (pipes[plain][op], groups[plain][op]);
                         Self::post_pass(enc, graded, 0, Load::DontCare, pipe, group, grade);
                         (read, read_group)
                     }
-                    _ => (p.tonemap_output[plain], slot.tonemap_output[plain]),
+                    _ => (p.tonemap_output[plain][op], slot.tonemap_output[plain][op]),
                 };
                 Self::post_pass(enc, dest, 0, Load::DontCare, pipe, group, grade);
             }

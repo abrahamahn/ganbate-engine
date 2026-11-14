@@ -160,6 +160,22 @@ pub(super) fn fullscreen_specialized(
     })
 }
 
+fn tonemap_pair(
+    device: &mut Device<'_>,
+    vs: &Compiled,
+    entries: [&str; 2],
+    format: Format,
+) -> Result<[[PipelineId; 3]; 2]> {
+    let mut row = |entry| -> Result<[PipelineId; 3]> {
+        let mut op = |m| {
+            let s = [("TONEMAP_MODE", SpecValue::I32(m))];
+            fullscreen_specialized(device, vs, entry, &s, format, Blend::Replace)
+        };
+        Ok([op(0)?, op(1)?, op(2)?])
+    };
+    Ok([row(entries[0])?, row(entries[1])?])
+}
+
 impl Pipelines {
     pub(super) fn new(device: &mut Device<'_>, output: Format) -> Result<Self> {
         let layout = VertexLayout {
@@ -693,16 +709,12 @@ impl Pipelines {
             bloom_up: fullscreen(device, &fsvs, "fs_bloom_up", HDR, Blend::Additive)?,
             tonemap: fullscreen(device, &fsvs, "fs_tonemap", HDR, Blend::Replace)?,
             tonemap_final: fullscreen(device, &fsvs, "fs_tonemap_final", output, Blend::Replace)?,
-            tonemap_output: [
-                fullscreen(device, &fsvs, "fs_tonemap_output", output, Blend::Replace)?,
-                fullscreen(
-                    device,
-                    &fsvs,
-                    "fs_tonemap_output_plain",
-                    output,
-                    Blend::Replace,
-                )?,
-            ],
+            tonemap_output: tonemap_pair(
+                device,
+                &fsvs,
+                ["fs_tonemap_output", "fs_tonemap_output_plain"],
+                output,
+            )?,
             grade_once: None,
             paint: fullscreen(device, &fsvs, "fs_paint", HDR, Blend::Replace)?,
             output: fullscreen(device, &fsvs, "fs_final", output, Blend::Replace)?,
@@ -713,10 +725,9 @@ impl Pipelines {
     pub(super) fn grade_once(
         device: &mut Device<'_>,
         output: Format,
-    ) -> Result<([PipelineId; 2], PipelineId)> {
+    ) -> Result<([[PipelineId; 3]; 2], PipelineId)> {
         let fsvs = compile(POST, Stage::Vertex, "vs_fullscreen")?;
-        let mut pass = |entry| fullscreen(device, &fsvs, entry, GRADED_FORMAT, Blend::Replace);
-        let grade = [pass("fs_grade")?, pass("fs_grade_plain")?];
+        let grade = tonemap_pair(device, &fsvs, ["fs_grade", "fs_grade_plain"], GRADED_FORMAT)?;
         let read = fullscreen_specialized(
             device,
             &fsvs,

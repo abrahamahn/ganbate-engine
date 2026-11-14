@@ -1424,7 +1424,7 @@ fn odd_viewport_grass_boundaries_and_water_props_match_whole_ao() {
 /// draw, and matches whole-frame SSAO byte-for-byte throughout.
 #[test]
 fn occluded_ocean_under_opaque_deck_skips_dry_pixels_and_reuses_water_mask() {
-    assert_eq!(crate::render::renderer::ssao::AO_CHANGED_BYTES, 288);
+    assert_eq!(crate::render::renderer::ssao::AO_CHANGED_BYTES, 304);
 
     let Ok(mut device) = Device::headless() else {
         return;
@@ -1957,6 +1957,302 @@ fn unpausing_after_prop_uncovers_swaying_grass_matches_whole_ao() {
     let (b, b_ao) = present_with_ao(&mut device, &mut whole, (&view, &env_t5), w_out, w_ao, None);
     assert_same_ao(&device, &a_ao, &b_ao, "unpaused after quiet frame");
     assert_same_frame(&device, &a, &b, "unpaused after quiet frame");
+
+    for (tex, buf) in [k_out, w_out] {
+        device.destroy_texture(tex);
+        device.destroy_buffer(buf);
+    }
+    device.destroy_buffer(k_ao);
+    device.destroy_buffer(w_ao);
+    let errs = device.validation_errors();
+    assert!(errs.is_empty(), "validation errors: {errs:?}");
+    for r in [&mut kept, &mut whole] {
+        r.destroy_props(&mut device);
+    }
+}
+
+/// Regression for Wave F Part 2: with wide world water (`water_rect` spanning most of the screen),
+/// swaying grass confined to the upper portion (`ao_changed.grass` clamping `grass_coarse_met`),
+/// and a live prop moving across frames 1..=6, both ping-pong `ao_grass` slots reach
+/// `ao_grass_water == [true, true]` on frame 2 and run incrementally (`Load::Load` with
+/// `ao_water_stale` handoff) across frames 3..=6 with `ao_kept == true` and 0 differing bytes vs
+/// `forget_ao()`, and disabling grass density also matches byte-for-byte.
+#[test]
+fn incremental_ping_pong_ao_grass_and_coarse_bounds_match_whole_ao() {
+    let Ok(mut device) = Device::headless() else {
+        return;
+    };
+    let mut world = World::default();
+    world.materials.push(Material {
+        name: "deck".into(),
+        base_color: [0.58, 0.5, 0.42, 1.0],
+        roughness: 0.78,
+        shading: Shading::Standard,
+        ..Material::default()
+    });
+    world.materials.push(Material {
+        name: "lawn".into(),
+        base_color: [0.25, 0.52, 0.24, 1.0],
+        roughness: 0.9,
+        shading: Shading::Standard,
+        ..Material::default()
+    });
+    world.materials.push(Material {
+        name: "ocean".into(),
+        base_color: [0.1, 0.3, 0.44, 1.0],
+        roughness: 0.06,
+        shading: Shading::Water,
+        ..Material::default()
+    });
+    // Wide ocean mesh under the scene (`water_rect` spans almost the entire viewport).
+    world.meshes.push(Mesh {
+        material: Some(2),
+        ..make_quad_mesh(0.0, 24.0)
+    });
+    // Foreground stone deck covering the lower/middle viewport (occluding the ocean beneath it, no
+    // grass growing here).
+    world.meshes.push(super::post::box_world_mesh(
+        [-6.0, 0.1, -0.6],
+        [6.0, 0.45, 7.0],
+        0,
+    ));
+    // Elevated grassy terrace in the upper portion of the viewport (`z = -7.0..-2.6`), plus a low
+    // ridge wall behind it so swaying blades modulate AO creases there while `grass_rect` stays in
+    // the upper rows of the screen.
+    world.meshes.push(super::post::box_world_mesh(
+        [-5.0, 0.9, -7.0],
+        [5.0, 1.15, -2.6],
+        1,
+    ));
+    world.meshes.push(super::post::box_world_mesh(
+        [-4.0, 1.15, -5.6],
+        [4.0, 2.2, -5.1],
+        0,
+    ));
+    for mesh in 0..world.meshes.len() as u32 {
+        world.instances.push(Instance {
+            mesh,
+            transform: Transform(math::IDENTITY),
+        });
+    }
+
+    let mut look = Look {
+        painterly: 0.0,
+        ao_radius: 0.65,
+        water_ripples: 1.0,
+        ..Look::default()
+    };
+    look.details.push(DetailRule {
+        patterns: vec!["lawn".into()],
+        preset: DetailPreset::Grass,
+        scale: [1.0, 1.0],
+        strength: 1.0,
+        variation: 0.0,
+        color: None,
+        gloss: 0.0,
+    });
+    look.grass.density = 1.0;
+    look.grass.height = 0.42;
+    look.grass.width = 0.06;
+    look.grass.sway = 1.5;
+    look.grass.flowers = 0.2;
+
+    let size = (256, 256);
+    let quality = Quality {
+        ao_samples: 12,
+        ao_scale: 0.5,
+        grass: 0.35,
+        ..Quality::realtime()
+    };
+    let view = View {
+        name: "inc_grass_water".into(),
+        eye: [0.0, 4.2, 4.6],
+        target: [0.0, 0.7, -2.2],
+        fov: 56.0,
+        ..View::default()
+    };
+    let make_env = |look_ref: &Look, seconds: f32| {
+        Environment::resolve(
+            &TimeOfDay {
+                hours: 15.2,
+                ..TimeOfDay::default()
+            },
+            &Weather {
+                wind: 4.5,
+                ..Weather::default()
+            },
+            &look_ref.palette,
+            seconds,
+        )
+    };
+
+    let (cube_pos, cube_nrm, cube_uv, cube_idx) = sphere_prop_data();
+    let setup = |device: &mut Device<'_>| {
+        let mut r = Renderer::new(
+            device,
+            &world,
+            look.clone(),
+            quality,
+            size,
+            Output::Surface(Format::Rgba8Unorm),
+        )
+        .expect("renderer");
+        r.finish_ao(device).expect("ao");
+        let mesh = r
+            .create_prop_mesh(
+                device,
+                &MeshData {
+                    positions: &cube_pos,
+                    normals: &cube_nrm,
+                    uvs: &cube_uv,
+                    indices: &cube_idx,
+                },
+            )
+            .expect("mesh");
+        let mat = r
+            .create_prop_material(
+                device,
+                &MaterialDesc {
+                    name: "crate".into(),
+                    base_color: [0.76, 0.58, 0.42, 1.0],
+                    roughness: 0.7,
+                    casts_shadow: true,
+                    ..MaterialDesc::default()
+                },
+            )
+            .expect("mat");
+        // Stationary crate so `has_prop_shadows` stays invariant even when `mover` hides on frame 6.
+        r.create_prop_instance(
+            mesh,
+            mat,
+            &AoGarden::placed([-2.2, 0.68, 1.5], [0.22, 0.22, 0.22]),
+        )
+        .expect("anchor");
+        let mover = r
+            .create_prop_instance(
+                mesh,
+                mat,
+                &AoGarden::placed([-0.9, 0.68, 1.2], [0.24, 0.22, 0.24]),
+            )
+            .expect("mover");
+        let ao = readable_ao(device, &mut r);
+        let out = canvas(device, size);
+        (r, mover, out, ao)
+    };
+
+    let (mut kept, k_mover, k_out, k_ao) = setup(&mut device);
+    let (mut whole, w_mover, w_out, w_ao) = setup(&mut device);
+
+    // Warm up so world_cache is established, then `forget_ao()` so frame 1 starts a clean 6-frame
+    // ping-pong sequence.
+    let warm_env = make_env(&look, 0.05);
+    for _ in 0..10 {
+        let _ = present_with_ao(
+            &mut device,
+            &mut kept,
+            (&view, &warm_env),
+            k_out,
+            k_ao,
+            None,
+        );
+        let _ = present_with_ao(
+            &mut device,
+            &mut whole,
+            (&view, &warm_env),
+            w_out,
+            w_ao,
+            None,
+        );
+    }
+    assert!(kept.last_frame_stats().world_cached);
+    kept.forget_ao();
+
+    // Frames 1..=6: live prop moves across the foreground deck (and over exposed water at the side)
+    // while grass sways in the top half, exercising:
+    // - Frame 1: `!ao_kept`, captures slot 1 (`ao_grass_water == [false, true]`)
+    // - Frame 2: `ao_kept`, captures slot 0 (`ao_grass_water == [true, true]`, `water_stale[1]` set)
+    // - Frames 3..=6: `ao_kept`, alternating slots 1, 0, 1, 0 in `incremental = true` mode!
+    let steps: [(Option<[f32; 3]>, f32); 6] = [
+        (Some([-0.8, 0.68, 1.2]), 0.2),
+        (Some([-0.3, 0.68, 1.15]), 0.65),
+        (Some([0.25, 0.68, 1.1]), 1.1),
+        (Some([0.8, 0.68, 1.05]), 1.55),
+        (Some([-0.45, 0.68, 1.35]), 1.55),
+        (None, 2.05),
+    ];
+    for (idx, (pos, t)) in steps.into_iter().enumerate() {
+        let frame_no = idx + 1;
+        for (r, m) in [(&mut kept, k_mover), (&mut whole, w_mover)] {
+            if let Some(p) = pos {
+                r.set_prop_instance(m, &AoGarden::placed(p, [0.24, 0.22, 0.24]), true)
+                    .expect("move prop");
+            } else {
+                r.set_prop_instance(m, &math::IDENTITY, false)
+                    .expect("hide prop");
+            }
+        }
+        let env = make_env(&look, t);
+        let (a, a_ao) = present_with_ao(&mut device, &mut kept, (&view, &env), k_out, k_ao, None);
+        let stats = kept.last_frame_stats();
+        if frame_no == 1 {
+            assert!(!stats.ao_kept, "frame 1 starts whole AO");
+            assert_eq!(kept.targets.ao_grass_water, [false, true]);
+        } else {
+            assert!(
+                stats.ao_kept && stats.ssao_drawn,
+                "frame {frame_no}: {stats:?}"
+            );
+            assert_eq!(
+                kept.targets.ao_grass_water,
+                [true, true],
+                "frame {frame_no}: both ping-pong slots must retain static water"
+            );
+            let cur = kept.targets.ao_grass_cur;
+            assert!(
+                kept.targets.ao_water_stale[cur].is_none(),
+                "frame {frame_no}: active slot {cur} just refreshed"
+            );
+            assert!(
+                kept.targets.ao_water_stale[1 - cur].is_some(),
+                "frame {frame_no}: inactive slot {} must record stale prop region",
+                1 - cur
+            );
+        }
+        whole.forget_ao();
+        let (b, b_ao) = present_with_ao(&mut device, &mut whole, (&view, &env), w_out, w_ao, None);
+        let what = format!("incremental ping-pong frame {frame_no}");
+        assert_same_ao(&device, &a_ao, &b_ao, &what);
+        assert_same_frame(&device, &a, &b, &what);
+    }
+
+    // Verify `ao_changed.grass` + `.g` water mask skip dry foreground deck texels far from grass!
+    let (computed, total) = recomputed_texels(
+        &mut device,
+        &mut kept,
+        (&view, &make_env(&look, 2.55)),
+        k_out,
+        k_ao,
+    );
+    assert!(
+        computed > 0 && computed * 5 < total * 3,
+        "expected dry deck texels outside grass_rect to discard in fs_ssao, got {computed}/{total}"
+    );
+
+    // Disable grass (`density = 0.0`): verify clean rebuild + subsequent `ao_kept == true` parity.
+    let mut no_grass = look.clone();
+    no_grass.grass.density = 0.0;
+    kept.set_look(no_grass.clone());
+    whole.set_look(no_grass.clone());
+    for (step, t) in [3.0, 3.45].into_iter().enumerate() {
+        let env = make_env(&no_grass, t);
+        let (a, a_ao) = present_with_ao(&mut device, &mut kept, (&view, &env), k_out, k_ao, None);
+        assert_eq!(kept.last_frame_stats().ao_kept, step > 0);
+        whole.forget_ao();
+        let (b, b_ao) = present_with_ao(&mut device, &mut whole, (&view, &env), w_out, w_ao, None);
+        let what = format!("after grass density 0 step {step}");
+        assert_same_ao(&device, &a_ao, &b_ao, &what);
+        assert_same_frame(&device, &a, &b, &what);
+    }
 
     for (tex, buf) in [k_out, w_out] {
         device.destroy_texture(tex);

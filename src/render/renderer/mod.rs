@@ -344,12 +344,13 @@ pub(in crate::render) struct Pipelines {
     tonemap: PipelineId,
     tonemap_final: PipelineId,
     /// `fs_tonemap` and `fs_final` in one pass, where no painterly filter runs between them; then
-    /// the same for a Look whose grade changes nothing ([`Look::grade_is_identity`]).
-    tonemap_output: [PipelineId; 2],
+    /// the same for a Look whose grade changes nothing ([`Look::grade_is_identity`]), specialized
+    /// per [`ToneMap`] operator.
+    tonemap_output: [[PipelineId; 3]; 2],
     /// The same in two passes ([`Renderer::set_grade_once`]), made when first chosen: `fs_grade`
     /// and `fs_grade_plain` into [`GRADED_FORMAT`], then `fs_tonemap_output` compiled with
     /// `GRADED`, which reads what they wrote.
-    grade_once: Option<([PipelineId; 2], PipelineId)>,
+    grade_once: Option<([[PipelineId; 3]; 2], PipelineId)>,
     paint: PipelineId,
     output: PipelineId,
 }
@@ -388,7 +389,9 @@ pub(in crate::render) struct Targets {
     ao_grass: [TextureId; 2],
     ao_grass_cur: usize,
     ao_grass_valid: [bool; 2],
+    ao_grass_rect: [Option<Rect>; 2],
     ao_grass_water: [bool; 2],
+    ao_water_stale: [Option<Rect>; 2],
     ao_union_water: bool,
     ao_grass_time: u32,
     ao_grass_sway: u32,
@@ -440,9 +443,9 @@ pub(in crate::render) struct Slot {
     up: Vec<BindGroupId>,
     tonemap: BindGroupId,
     tonemap_final: BindGroupId,
-    tonemap_output: [BindGroupId; 2],
+    tonemap_output: [[BindGroupId; 3]; 2],
     /// `Pipelines::grade_once`'s groups, where frames grade once.
-    grade_once: Option<([BindGroupId; 2], BindGroupId)>,
+    grade_once: Option<([[BindGroupId; 3]; 2], BindGroupId)>,
     paint: Option<BindGroupId>,
     output: Option<BindGroupId>,
 }

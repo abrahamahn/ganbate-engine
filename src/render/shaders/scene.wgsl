@@ -306,8 +306,10 @@ fn game_light_share(world: vec3f, n: vec3f, l: Light, frag: vec2f) -> f32 {
   let p = vec4f(world, 1.0);
   let dist = length(frame.camera.xyz - world);
   let c0 = frame.shadow0 * p;
-  let lit0 = reshade.head.y > 0u && moved_footprint(2u, frame.light_shadow0 * p, false);
-  let lit1 = reshade.head.z > 0u && moved_footprint(3u, frame.light_shadow1 * p, false);
+  let l0 = frame.light_shadow0 * p;
+  let l1 = frame.light_shadow1 * p;
+  let lit0 = reshade.head.y > 0u && l0.w > 0.0 && moved_footprint(2u, l0, false);
+  let lit1 = reshade.head.z > 0u && l1.w > 0.0 && moved_footprint(3u, l1, false);
   let key = moved_footprint(0u, c0, true)
     || (!near_cascade_only(c0, dist, reshade.near.xy) && moved_footprint(1u, frame.shadow1 * p, true));
   if (!(lit0 || lit1 || key)) {

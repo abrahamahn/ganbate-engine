@@ -37,6 +37,13 @@ fn world_at(uv: vec2f, depth: f32) -> vec3f {
   return p.xyz / p.w;
 }
 
+fn clip_at(uv: vec2f, depth: f32) -> vec4f {
+  let q = vec4f(uv * 2.0 - 1.0, max(depth, 1e-7), 1.0);
+  let hw = frame.inv_view_proj[0][3] * q.x + frame.inv_view_proj[1][3] * q.y
+    + frame.inv_view_proj[2][3] * q.z + frame.inv_view_proj[3][3];
+  return q / hw;
+}
+
 fn depth_px(p: vec2i) -> f32 {
   let size = vec2i(frame.viewport.xy);
   return textureLoad(depth_tex, clamp(p, vec2i(0), size - vec2i(1)), 0);
@@ -170,6 +177,7 @@ struct AoChanged {
   head: vec4f,              // regions, the farthest a kernel point lies from its surface point
                             // (in radii), unused, unused
   rows: vec4f,              // the lengths of the xyz of view_proj's x, y and w rows, unused
+  grass: vec4f,             // inclusive coarse-tile bounds (x0, y0, x1, y1) of active grass
   rects: array<vec4f, 16>,
 };
 @group(0) @binding(7) var<uniform> ao_changed: AoChanged;
@@ -207,11 +215,10 @@ struct AoReach {
   near_eye: bool,
 };
 
-// Screen box `[a, z]` the kernel ball around `p` (`radius` times the kernel's reach) can span,
-// each clip coordinate moving by at most its row's length times the ball's radius, widened by
-// a pixel.
-fn ao_reach(p: vec3f, radius: f32) -> AoReach {
-  let c = frame.view_proj * vec4f(p, 1.0);
+// Screen box `[a, z]` the kernel ball around clip-space `c` (`radius` times the kernel's reach)
+// can span, each clip coordinate moving by at most its row's length times the ball's radius,
+// widened by a pixel.
+fn ao_reach(c: vec4f, radius: f32) -> AoReach {
   let reach = ao_changed.rows.xyz * (radius * ao_changed.head.y);
   let w0 = c.w - reach.z;
   let full = frame.viewport.xy;
@@ -246,12 +253,11 @@ fn ao_regions_met(reach: AoReach) -> u32 {
 }
 
 // Whether any 64 x 64 coarse grass tile (`src_tex` = `ao_grass_coarse` in `fs_ssao`) in
-// `reach` (or `px`'s own coarse tile) held visible grass on the last frame or this frame.
-fn grass_coarse_met(reach: AoReach, px: vec2i) -> bool {
+// `reach` held visible grass on the last frame or this frame (`own_coarse.r` checked first).
+fn grass_coarse_met(reach: AoReach) -> bool {
   let full = frame.viewport.xy;
-  let own = px >> vec2u(6u);
-  let lo = min(vec2i(max(reach.a, vec2f(0.0))) >> vec2u(6u), own);
-  let hi = max(vec2i(clamp(reach.z, vec2f(0.0), full - 1.0)) >> vec2u(6u), own);
+  let lo = max(vec2i(max(reach.a, vec2f(0.0))) >> vec2u(6u), vec2i(ao_changed.grass.xy));
+  let hi = min(vec2i(clamp(reach.z, vec2f(0.0), full - 1.0)) >> vec2u(6u), vec2i(ao_changed.grass.zw));
   for (var cy = lo.y; cy <= hi.y; cy++) {
     for (var cx = lo.x; cx <= hi.x; cx++) {
       if (textureLoad(src_tex, vec2i(cx, cy), 0).r > 0.5) {
@@ -329,14 +335,13 @@ fn ao_reads_changed(
     }
     return vec4f(1.0);
   }
-  let p = world_at(in.uv, d);
   let radius = pc.a.x * clamp(linear_depth(d) * 0.04, 0.6, 3.0);
   var reg_met = 0u;
   var grs_hit = false;
   if (kept && !maybe_water && !px_changed) {
-    let reach = ao_reach(p, radius);
+    let reach = ao_reach(clip_at(in.uv, d), radius);
     reg_met = ao_regions_met(reach);
-    grs_hit = grass_active && (own_coarse.r > 0.5 || grass_coarse_met(reach, px));
+    grs_hit = grass_active && (own_coarse.r > 0.5 || grass_coarse_met(reach));
     if (reg_met == 0u && !grs_hit) {
       discard;
     }
@@ -353,13 +358,14 @@ fn ao_reads_changed(
     if (!grass_active && ao_changed.head.x < 0.5) {
       discard;
     }
-    let reach = ao_reach(p, radius);
+    let reach = ao_reach(clip_at(in.uv, d), radius);
     reg_met = ao_regions_met(reach);
-    grs_hit = grass_active && (own_coarse.r > 0.5 || grass_coarse_met(reach, px));
+    grs_hit = grass_active && (own_coarse.r > 0.5 || grass_coarse_met(reach));
     if (reg_met == 0u && !grs_hit) {
       discard;
     }
   }
+  let p = world_at(in.uv, d);
   let hit = !kept
     || water
     || px_changed
@@ -400,7 +406,8 @@ fn ao_reads_changed(
 fn light_shafts(uv: vec2f, frag: vec2f) -> vec3f {
   let strength = frame.paint.z;
   let g = frame.glow_dir.xyz;
-  if (strength <= 0.0 || g.y < -0.08) {
+  let low = smoothstep(0.75, 0.05, g.y);
+  if (strength <= 0.0 || g.y < -0.08 || low <= 0.0) {
     return vec3f(0.0);
   }
   let sp = frame.view_proj * vec4f(frame.camera.xyz + g * 1000.0, 1.0);
@@ -430,8 +437,6 @@ fn light_shafts(uv: vec2f, frag: vec2f) -> vec3f {
     total += weight;
     weight *= 0.93;
   }
-  // Strongest when the light is low (dawn, sunset, moonrise) and in mist.
-  let low = smoothstep(0.75, 0.05, g.y);
   let haze = 0.6 + 0.8 * frame.fog2.z;
   return frame.glow.rgb * (sum / total * falloff * low * haze * strength);
 }
@@ -457,6 +462,11 @@ fn outline_norm(nq: vec4f, aux_n: vec3f) -> f32 {
 @fragment fn fs_air(in: Screen) -> @location(0) vec4f {
   let px = vec2i(in.clip.xy);
   let d = depth_px(px);
+  let cam = frame.camera.xyz;
+  let world = world_at(in.uv, d);
+  let to = world - cam;
+  let dist = length(to);
+  let lin = linear_depth(d);
   var edge = 0.0;
   var aux_w = 0.0;
   if (d > 0.0) {
@@ -465,12 +475,10 @@ fn outline_norm(nq: vec4f, aux_n: vec3f) -> f32 {
     // Grass and flowers (aux.w = 0) get no outlines, and leaves and petals (aux.w = 0.5) only a
     // trace: a line round every leaf cluster of a canopy speckles it.
     if (pc.a.y > 0.0 && aux_w >= 0.01) {
-      let edge_dist = length(world_at(in.uv, d) - frame.camera.xyz);
-      let edge_weight = pc.a.y * smoothstep(90.0, 15.0, edge_dist) * select(1.0, 0.15, aux_w < 0.6);
+      let edge_weight = pc.a.y * smoothstep(90.0, 15.0, dist) * select(1.0, 0.15, aux_w < 0.6);
       if (edge_weight > 0.0) {
         // Soft illustrated outlines on depth and normal breaks, fading with distance.
         let w = i32(max(pc.a.z, 1.0));
-        let lin = linear_depth(d);
         edge = max(edge, outline_depth(depth_px(px + vec2i(w, 0)), lin));
         edge = max(edge, outline_depth(depth_px(px + vec2i(-w, 0)), lin));
         edge = max(edge, outline_depth(depth_px(px + vec2i(0, w)), lin));
@@ -487,10 +495,6 @@ fn outline_norm(nq: vec4f, aux_n: vec3f) -> f32 {
       }
     }
   }
-  let cam = frame.camera.xyz;
-  let world = world_at(in.uv, d);
-  let to = world - cam;
-  let dist = length(to);
   var col = textureLoad(src_tex, px, 0).rgb;
   let dir = to / max(dist, 1e-4);
   let fc = fog_color(dir);
@@ -520,7 +524,7 @@ fn outline_norm(nq: vec4f, aux_n: vec3f) -> f32 {
     }
   }
   let shafts = light_shafts(in.uv, in.clip.xy);
-  let near = select(1.0 - smoothstep(6.0, 18.0, linear_depth(d)), 0.0, d <= 0.0);
+  let near = select(1.0 - smoothstep(6.0, 18.0, lin), 0.0, d <= 0.0);
   return vec4f(col + select(shafts, shafts * 0.5, d <= 0.0), near);
 }
 
@@ -609,13 +613,14 @@ fn tonemap_aces_fitted(x_in: vec3f) -> vec3f {
   return clamp(out, vec3f(0.0), vec3f(1.0));
 }
 
+const TONEMAP_MODE: i32 = -1;
+
 fn apply_tonemap(x: vec3f, mode: i32) -> vec3f {
-  if (mode == 1) {
-    return tonemap_agx(x);
-  }
-  if (mode == 2) {
-    return tonemap_aces_fitted(x);
-  }
+  if (TONEMAP_MODE == 0) { return aces(x * 0.8); }
+  if (TONEMAP_MODE == 1) { return tonemap_agx(x); }
+  if (TONEMAP_MODE == 2) { return tonemap_aces_fitted(x); }
+  if (mode == 1) { return tonemap_agx(x); }
+  if (mode == 2) { return tonemap_aces_fitted(x); }
   return aces(x * 0.8);
 }
 
@@ -635,8 +640,9 @@ fn apply_tonemap(x: vec3f, mode: i32) -> vec3f {
   let c = clamp((g - vec3f(0.5)) * pc.a.w + vec3f(0.5), vec3f(0.0), vec3f(1.0));
   col = pow(c, vec3f(2.2));
   col = col * pc.c.rgb + pc.b.rgb * (vec3f(1.0) - col);
-  let v = length(in.uv - vec2f(0.5)) * 1.35;
-  col *= 1.0 - pc.b.w * pow(v, 2.6);
+  if (pc.b.w != 0.0) {
+    col *= 1.0 - pc.b.w * pow(length(in.uv - vec2f(0.5)) * 1.35, 2.6);
+  }
   return vec4f(clamp(col, vec3f(0.0), vec3f(1.0)), 1.0);
 }
 
@@ -815,8 +821,9 @@ fn graded_at(p: vec2i, identity: bool) -> vec4f {
     col = pow(c, vec3f(2.2));
     col = col * pc.c.rgb + pc.b.rgb * (vec3f(1.0) - col);
   }
-  let v = length(uv - vec2f(0.5)) * 1.35;
-  col *= 1.0 - pc.b.w * pow(v, 2.6);
+  if (pc.b.w != 0.0) {
+    col *= 1.0 - pc.b.w * pow(length(uv - vec2f(0.5)) * 1.35, 2.6);
+  }
   return vec4f(clamp(col, vec3f(0.0), vec3f(1.0)), src.a);
 }
 

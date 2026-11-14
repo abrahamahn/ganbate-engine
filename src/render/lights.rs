@@ -121,9 +121,9 @@ fn entry(desc: &LightDesc) -> Result<Entry> {
         // An inner edge on the outer one would leave no fade: keep a sliver.
         r[12] = s.inner.cos().max(r[11] + 1e-4);
         if desc.shadow > 0.0 {
-            if s.outer > MAX_SHADOW_CONE {
+            if !(1e-4..=MAX_SHADOW_CONE).contains(&s.outer) {
                 return Err(format!(
-                    "light: a spot casting shadows reaches at most {MAX_SHADOW_CONE} radians out"
+                    "light: a spot casting shadows must have outer in 1e-4..={MAX_SHADOW_CONE} radians"
                 ));
             }
             r[15] = desc.shadow;
@@ -378,6 +378,15 @@ mod tests {
                 shadow: 0.5,
                 spot: Some(SpotCone {
                     direction: [0.0, -1.0, 0.0],
+                    inner: 0.0,
+                    outer: 0.0,
+                }),
+                ..lamp()
+            },
+            LightDesc {
+                shadow: 0.5,
+                spot: Some(SpotCone {
+                    direction: [0.0, -1.0, 0.0],
                     inner: 0.4,
                     outer: 1.5,
                 }),
@@ -386,5 +395,18 @@ mod tests {
         ] {
             assert!(entry(&bad).is_err(), "{bad:?}");
         }
+        // Unshadowed zero-angle spot remains valid.
+        assert!(
+            entry(&LightDesc {
+                shadow: 0.0,
+                spot: Some(SpotCone {
+                    direction: [0.0, -1.0, 0.0],
+                    inner: 0.0,
+                    outer: 0.0,
+                }),
+                ..lamp()
+            })
+            .is_ok()
+        );
     }
 }

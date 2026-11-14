@@ -340,7 +340,9 @@ impl Renderer {
             ],
             ao_grass_cur: 0,
             ao_grass_valid: [false; 2],
+            ao_grass_rect: [None; 2],
             ao_grass_water: [false; 2],
+            ao_water_stale: [None; 2],
             ao_union_water: false,
             ao_grass_time: 0,
             ao_grass_sway: 0,
@@ -461,7 +463,7 @@ impl Renderer {
         let (scene, sky) = (pair(scene), pair(sky));
         let (grass, flower, particle) = (blades[0], blades[1], blades[2]);
         let ao_changed = upload(device, AO_CHANGED_BYTES, BufferUsage::UNIFORM)?;
-        device.write_buffer(ao_changed, 0, &[0; 32])?;
+        device.write_buffer(ao_changed, 0, &[0; 48])?;
         let post = |d: &mut Device<'_>, pipe, src: Resource, extra: Resource| {
             d.create_bind_group(
                 pipe,
@@ -562,12 +564,17 @@ impl Renderer {
             Resource::TextureMip(t.bloom, 0),
         )?;
         // The fused output's groups, or `fs_grade`'s: the lit picture and its bloom.
-        let lit = |d: &mut Device<'_>, pipes: [PipelineId; 2]| -> Result<[BindGroupId; 2]> {
-            let [graded, plain] = pipes.map(|pipe| {
-                let (lit, bloom) = (Resource::Texture(t.lit), Resource::TextureMip(t.bloom, 0));
-                post(d, pipe, lit, bloom)
-            });
-            Ok([graded?, plain?])
+        let lit = |d: &mut Device<'_>,
+                   pipes: [[PipelineId; 3]; 2]|
+         -> Result<[[BindGroupId; 3]; 2]> {
+            let mut row = |r: [PipelineId; 3]| -> Result<[BindGroupId; 3]> {
+                let mut g = |pipe| {
+                    let (lit, bloom) = (Resource::Texture(t.lit), Resource::TextureMip(t.bloom, 0));
+                    post(d, pipe, lit, bloom)
+                };
+                Ok([g(r[0])?, g(r[1])?, g(r[2])?])
+            };
+            Ok([row(pipes[0])?, row(pipes[1])?])
         };
         let tonemap_output = lit(device, p.tonemap_output)?;
         let grade_once = match (t.graded, p.grade_once) {
@@ -775,11 +782,11 @@ impl Renderer {
                     s.ssao,
                     s.air,
                 ])
-                .chain(s.tonemap_output)
+                .chain(s.tonemap_output.into_iter().flatten())
                 .chain(
                     s.grade_once
                         .into_iter()
-                        .flat_map(|(grade, read)| grade.into_iter().chain([read])),
+                        .flat_map(|(grade, read)| grade.into_iter().flatten().chain([read])),
                 )
                 .chain([s.tonemap, s.tonemap_final])
                 .chain(s.paint)
@@ -1300,7 +1307,7 @@ impl Renderer {
                     if f.0 == 1 && near_cascade_only(&points, eye.pos, cas.split, m0, *grow0) {
                         continue;
                     }
-                    screen_rect(&points, &eye.view_proj, size, 1.0)
+                    volume_screen_rect(b, f, &maps, &eye.view_proj, eye.near, size, &points)
                         .and_then(|r| intersect(r, screen))
                 };
                 if let Some(r) = r {
@@ -1333,12 +1340,15 @@ impl Renderer {
                 break;
             }
             let bounds = std::array::from_fn(|v| {
-                let (m, _, grow) = &maps[v];
+                let (m, margin, grow) = &maps[v];
                 if !used[v] {
                     return OUT_OF_REACH;
                 }
-                let (r, _, far) = map_bounds((b.0.map(|x| x - grow), b.1.map(|x| x + grow)), m);
-                (r, far)
+                receiver_map_bounds(
+                    (b.0.map(|x| x - grow), b.1.map(|x| x + grow)),
+                    m,
+                    (v >= 2).then_some(*margin),
+                )
             });
             if !reached(footprints, &bounds) {
                 continue;
