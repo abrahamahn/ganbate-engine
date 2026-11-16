@@ -1,7 +1,7 @@
 //! Run-time glTF/GLB models, clip evaluation, Hermite cross-fade, Look-At, Two-Bone IK, and
 //! morph target overrides.
 
-use super::{Runtime, bytes, floats, matrix, with, words, write_floats};
+use super::{Runtime, bytes, float_array, floats, matrix, with, words, write_floats};
 use crate::{give, say};
 use ganbate_engine::anim::{
     BoneOffset, ClipLayer, LookAtChain, MorphOverride, PoseSpec, TwoBoneIk, normalize_q,
@@ -240,9 +240,9 @@ pub extern "C" fn ganbate_rt_model_destroy(model: u32) -> u32 {
 /// `matrix` must address 64 readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ganbate_rt_model_instance(model: u32, matrix: *const u8) -> u32 {
-    // SAFETY: the caller passes 16 floats.
-    let m = unsafe { floats(matrix, 16) };
+    let m = (!matrix.is_null()).then(|| unsafe { float_array::<16>(matrix) });
     with(0, |rt| {
+        let m = m.ok_or_else(|| "a matrix needs 16 floats".to_string())?;
         let i = rt.renderer.create_model_instance(
             &mut rt.device,
             ModelId::from_raw(model),
@@ -262,9 +262,9 @@ pub unsafe extern "C" fn ganbate_rt_model_instance_set(
     matrix: *const u8,
     visible: u32,
 ) -> u32 {
-    // SAFETY: the caller passes 16 floats.
-    let m = unsafe { floats(matrix, 16) };
+    let m = (!matrix.is_null()).then(|| unsafe { float_array::<16>(matrix) });
     with(0, |rt| {
+        let m = m.ok_or_else(|| "a matrix needs 16 floats".to_string())?;
         rt.renderer.set_model_instance(
             ModelInstance::from_raw(instance),
             &self::matrix(&m)?,
@@ -520,9 +520,9 @@ pub unsafe extern "C" fn ganbate_rt_model_node_set(
     node: u32,
     ptr: *const u8,
 ) -> u32 {
-    // SAFETY: the caller passes 10 floats.
-    let v = unsafe { floats(ptr, 10) };
+    let v = (!ptr.is_null()).then(|| unsafe { float_array::<10>(ptr) });
     with(0, |rt| {
+        let v = v.ok_or_else(|| "model_node_set: null buffer".to_string())?;
         if v.iter().any(|x| !x.is_finite()) {
             return Err("model_node_set: values must be finite".into());
         }

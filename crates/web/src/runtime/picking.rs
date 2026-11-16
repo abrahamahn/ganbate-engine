@@ -1,7 +1,7 @@
 //! Stereo XR camera views, 120 Hz QoS frame-budget governor, cooked-world edits, screen
 //! projection, and screen/3D-ray picking.
 
-use super::{floats, matrix, with, write_floats};
+use super::{float_array, matrix, with, write_floats};
 use ganbate_engine::xr::{
     DEFAULT_IPD_METRES, FrameBudgetGovernor, QualityBudget, clamp_ipd_metres, compute_stereo_views,
 };
@@ -127,8 +127,8 @@ pub extern "C" fn ganbate_rt_governor_reset() -> u32 {
 pub unsafe extern "C" fn ganbate_rt_project(x: f32, y: f32, z: f32, out: *mut u8) -> u32 {
     with(0, |rt| {
         let size = rt.renderer.size();
-        let active_view = rt.active_view();
-        let Some(p) = rt.renderer.project(&active_view, size, [x, y, z]) else {
+        let projected = rt.with_active_view(|v| rt.renderer.project(v, size, [x, y, z]));
+        let Some(p) = projected else {
             return Ok(0);
         };
         // SAFETY: the caller passes 12 writable bytes.
@@ -172,9 +172,9 @@ pub unsafe extern "C" fn ganbate_rt_set_world_instance(
     matrix_at: *const u8,
     visible: u32,
 ) -> u32 {
-    // SAFETY: the caller passes 16 readable floats.
-    let m = unsafe { floats(matrix_at, 16) };
+    let m = (!matrix_at.is_null()).then(|| unsafe { float_array::<16>(matrix_at) });
     with(0, |rt| {
+        let m = m.ok_or_else(|| "a matrix needs 16 floats".to_string())?;
         let m = matrix(&m)?;
         rt.renderer
             .set_world_instance(&mut rt.device, index as usize, m, visible != 0)?;
@@ -218,8 +218,8 @@ pub extern "C" fn ganbate_rt_set_world_light(index: u32, x: f32, y: f32, z: f32)
 pub unsafe extern "C" fn ganbate_rt_pick_world(x: f32, y: f32, out: *mut u8) -> u32 {
     with(0, |rt| {
         let size = rt.renderer.size();
-        let active_view = rt.active_view();
-        let Some(hit) = rt.renderer.pick_world(&active_view, size, (x, y)) else {
+        let picked = rt.with_active_view(|v| rt.renderer.pick_world(v, size, (x, y)));
+        let Some(hit) = picked else {
             return Ok(0);
         };
         let p = hit.point;
@@ -239,8 +239,8 @@ pub unsafe extern "C" fn ganbate_rt_pick_world(x: f32, y: f32, out: *mut u8) -> 
 pub unsafe extern "C" fn ganbate_rt_pick(x: f32, y: f32, layers: u32, out: *mut u8) -> u32 {
     with(0, |rt| {
         let size = rt.renderer.size();
-        let active_view = rt.active_view();
-        let Some(hit) = rt.renderer.pick(&active_view, size, (x, y), layers) else {
+        let picked = rt.with_active_view(|v| rt.renderer.pick(v, size, (x, y), layers));
+        let Some(hit) = picked else {
             return Ok(0);
         };
         let p = hit.point;

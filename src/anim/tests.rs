@@ -485,3 +485,120 @@ fn blend_spaces_1d_and_2d_produce_exact_convex_pose_combinations() {
     // At [0.5, 0.5], all three samples have symmetric influence 0.5 -> normalized 1/3 each -> (0 + 2 + 6)/3.
     assert!(close(&pose.translation[0], &[8.0 / 3.0, 0.0, 0.0]));
 }
+
+#[test]
+fn globals_into_matches_globals_across_stack_and_heap_node_counts() {
+    for count in [12usize, 256, 300] {
+        let mut m = Model::default();
+        for i in 0..count {
+            let parent = if i > 0 { Some((i - 1) / 2) } else { None };
+            let mut n = node(
+                &format!("n{i}"),
+                parent,
+                [(i as f32) * 0.1, -0.05 * (i % 7) as f32, 0.2],
+            );
+            n.scale = [1.0 + (i % 3) as f32 * 0.1, 1.0, 0.9];
+            m.nodes.push(n);
+            if let Some(p) = parent {
+                m.nodes[p].children.push(i);
+            }
+        }
+        m.roots = vec![0];
+        let pose = Pose::rest(&m);
+        let expected = pose.globals(&m);
+        let mut out = vec![[99.0; 16]; 4];
+        pose.globals_into(&m, &mut out);
+        assert_eq!(out, expected, "globals_into mismatch at count={count}");
+    }
+}
+
+#[test]
+fn morph_range_into_preserves_exact_accumulation_bits_for_dense_and_sparse_sets() {
+    let p = Primitive {
+        positions: vec![
+            [1.0, 2.0, 3.0],
+            [-0.5, 0.25, 4.0],
+            [0.0, -3.0, 1.5],
+            [2.25, 0.5, -1.0],
+        ],
+        normals: vec![[0.0, 1.0, 0.0]; 4],
+        uvs: vec![],
+        indices: vec![0, 1, 2, 1, 3, 2],
+        material: None,
+        joints: vec![],
+        weights: vec![],
+        targets: vec![
+            MorphTarget {
+                positions: vec![
+                    [0.1, -0.2, 0.3],
+                    [0.4, 0.5, -0.6],
+                    [-0.7, 0.8, 0.9],
+                    [0.2, -0.1, 0.4],
+                ],
+                normals: vec![
+                    [0.2, 0.0, 0.1],
+                    [-0.1, 0.0, 0.3],
+                    [0.0, 0.0, -0.2],
+                    [0.3, -0.1, 0.0],
+                ],
+            },
+            MorphTarget {
+                positions: vec![
+                    [-0.05, 0.15, 0.25],
+                    [0.0, -0.3, 0.1],
+                    [0.6, -0.4, 0.2],
+                    [-0.3, 0.7, -0.5],
+                ],
+                normals: vec![
+                    [-0.1, 0.0, 0.2],
+                    [0.4, 0.1, 0.0],
+                    [-0.2, 0.0, 0.1],
+                    [0.0, 0.2, -0.3],
+                ],
+            },
+        ],
+    };
+    let weights = [0.35f32, -0.62f32];
+    let mut dense_pos = Vec::new();
+    let mut dense_nrm = Vec::new();
+    morph_range_into(
+        &p,
+        &weights,
+        &[0, 1, 2, 3],
+        0,
+        4,
+        &mut dense_pos,
+        &mut dense_nrm,
+    );
+    let (ref_pos, ref_nrm) = deform(&p, &weights, None);
+    for (a, b) in dense_pos.iter().zip(&ref_pos) {
+        assert_eq!(a.map(f32::to_bits), b.map(f32::to_bits));
+    }
+    for (a, b) in dense_nrm.iter().zip(&ref_nrm) {
+        assert_eq!(a.map(f32::to_bits), b.map(f32::to_bits));
+    }
+
+    let mut sparse_pos = Vec::new();
+    let mut sparse_nrm = Vec::new();
+    morph_range_into(
+        &p,
+        &weights,
+        &[1, 3],
+        1,
+        3,
+        &mut sparse_pos,
+        &mut sparse_nrm,
+    );
+    assert_eq!(
+        sparse_pos[0].map(f32::to_bits),
+        ref_pos[1].map(f32::to_bits)
+    );
+    assert_eq!(
+        sparse_pos[1].map(f32::to_bits),
+        p.positions[2].map(f32::to_bits)
+    );
+    assert_eq!(
+        sparse_pos[2].map(f32::to_bits),
+        ref_pos[3].map(f32::to_bits)
+    );
+}

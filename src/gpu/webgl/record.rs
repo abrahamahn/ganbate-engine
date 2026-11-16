@@ -130,7 +130,7 @@ impl Ring {
 
 /// The GL bindings this submission's stream has made so far, indexed directly by slot.
 #[derive(Default)]
-struct Host {
+pub(super) struct Host {
     pipeline: Option<u32>,
     /// Uniform block binding point → (buffer, offset, size); the ring is buffer 0.
     points: Vec<Option<(u32, u32, u32)>>,
@@ -264,12 +264,13 @@ impl Gpu<'_> {
         acquired: Option<TextureId>,
         out: &mut Vec<u32>,
         ring: &mut Ring,
+        host: &mut Host,
     ) -> Result<()> {
         e.finish()?;
         out.clear();
         out.reserve(e.commands.len() * 6);
         ring.reset(self.info.uniform_align);
-        let mut host = Host::default();
+        host.reset();
         let commands = &e.commands;
         let mut i = 0;
         while i < commands.len() {
@@ -285,15 +286,7 @@ impl Gpu<'_> {
                         return Err("begin_pass without end_pass".into());
                     };
                     let desc = e.pass(colors, depth);
-                    self.record_pass(
-                        e,
-                        desc,
-                        &commands[i + 1..end],
-                        out,
-                        ring,
-                        &mut host,
-                        acquired,
-                    )?;
+                    self.record_pass(e, desc, &commands[i + 1..end], out, ring, host, acquired)?;
                     i = end;
                 }
                 Command::Transfer(idx) => match &e.transfers[idx as usize] {

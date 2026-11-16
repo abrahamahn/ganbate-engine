@@ -8,18 +8,23 @@ pub const IDENTITY: M4 = [
     1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
 ];
 
+#[inline]
 pub fn add(a: V3, b: V3) -> V3 {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
+#[inline]
 pub fn sub(a: V3, b: V3) -> V3 {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
 }
+#[inline]
 pub fn scale(a: V3, s: f32) -> V3 {
     [a[0] * s, a[1] * s, a[2] * s]
 }
+#[inline]
 pub fn dot(a: V3, b: V3) -> f32 {
     a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 }
+#[inline]
 pub fn cross(a: V3, b: V3) -> V3 {
     [
         a[1] * b[2] - a[2] * b[1],
@@ -27,9 +32,11 @@ pub fn cross(a: V3, b: V3) -> V3 {
         a[0] * b[1] - a[1] * b[0],
     ]
 }
+#[inline]
 pub fn length(a: V3) -> f32 {
     dot(a, a).sqrt()
 }
+#[inline]
 pub fn normalize(a: V3) -> V3 {
     let l = length(a);
     if l > 1e-12 {
@@ -38,9 +45,11 @@ pub fn normalize(a: V3) -> V3 {
         [0.0, 1.0, 0.0]
     }
 }
+#[inline]
 pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
+#[inline]
 pub fn lerp3(a: V3, b: V3, t: f32) -> V3 {
     [
         lerp(a[0], b[0], t),
@@ -48,12 +57,14 @@ pub fn lerp3(a: V3, b: V3, t: f32) -> V3 {
         lerp(a[2], b[2], t),
     ]
 }
+#[inline]
 pub fn smoothstep(e0: f32, e1: f32, x: f32) -> f32 {
     let t = ((x - e0) / (e1 - e0)).clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
 }
 
 /// `a * b`.
+#[inline]
 pub fn mul(a: &M4, b: &M4) -> M4 {
     let mut out = [0.0; 16];
     for c in 0..4 {
@@ -64,12 +75,13 @@ pub fn mul(a: &M4, b: &M4) -> M4 {
     out
 }
 /// `m * (x, y, z, w)`.
+#[inline]
 pub fn transform(m: &M4, v: [f32; 4]) -> [f32; 4] {
     std::array::from_fn(|r| (0..4).map(|k| m[k * 4 + r] * v[k]).sum())
 }
+#[inline]
 pub fn transform_point(m: &M4, p: V3) -> V3 {
-    let v = transform(m, [p[0], p[1], p[2], 1.0]);
-    [v[0], v[1], v[2]]
+    std::array::from_fn(|r| (((0.0 + m[r] * p[0]) + m[4 + r] * p[1]) + m[8 + r] * p[2]) + m[12 + r])
 }
 
 /// Right-handed view matrix: the camera looks down its -Z axis.

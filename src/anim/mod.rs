@@ -107,11 +107,44 @@ impl Pose {
     /// Every node's transform in the model's space (parents first; roots relative to the
     /// model's origin).
     pub fn globals(&self, model: &Model) -> Vec<M4> {
-        let mut out = vec![math::IDENTITY; model.nodes.len()];
-        let mut done = vec![false; model.nodes.len()];
-        // Parents before children: walk up from each node to its first resolved ancestor.
+        let mut out = Vec::with_capacity(model.nodes.len());
+        self.globals_into(model, &mut out);
+        out
+    }
+
+    /// Writes every node's model-space transform into `out`, reusing `out`'s allocation and
+    /// avoiding heap temporaries for skeletons up to 256 nodes.
+    pub fn globals_into(&self, model: &Model, out: &mut Vec<M4>) {
+        let count = model.nodes.len();
+        out.resize(count, math::IDENTITY);
+        if count <= 256 {
+            let mut done = [0u64; 4];
+            let mut chain = [0usize; 256];
+            for i in 0..count {
+                let mut at = i;
+                let mut len = 0;
+                while (done[at >> 6] >> (at & 63)) & 1 == 0 {
+                    chain[len] = at;
+                    len += 1;
+                    match model.nodes[at].parent {
+                        Some(p) => at = p,
+                        None => break,
+                    }
+                }
+                for &n in chain[..len].iter().rev() {
+                    let local = self.local(n);
+                    out[n] = match model.nodes[n].parent {
+                        Some(p) => math::mul(&out[p], &local),
+                        None => local,
+                    };
+                    done[n >> 6] |= 1u64 << (n & 63);
+                }
+            }
+            return;
+        }
+        let mut done = vec![false; count];
         let mut chain = Vec::new();
-        for i in 0..model.nodes.len() {
+        for i in 0..count {
             let mut at = i;
             chain.clear();
             while !done[at] {
@@ -130,19 +163,27 @@ impl Pose {
                 done[n] = true;
             }
         }
-        out
     }
 }
 
 /// The joint matrices of `skin` for a mesh skinned by it: `global(joint) * inverse_bind`, in
 /// the model's space (glTF ignores the skinned mesh node's own transform).
 pub fn joint_matrices(model: &Model, skin: usize, globals: &[M4]) -> Vec<M4> {
+    let mut out = Vec::with_capacity(model.skins[skin].joints.len());
+    joint_matrices_into(model, skin, globals, &mut out);
+    out
+}
+
+/// Writes `skin`'s joint matrices into `out`, reusing its allocation.
+pub fn joint_matrices_into(model: &Model, skin: usize, globals: &[M4], out: &mut Vec<M4>) {
     let s = &model.skins[skin];
-    s.joints
-        .iter()
-        .zip(&s.inverse_bind)
-        .map(|(&j, ib)| math::mul(&globals[j], ib))
-        .collect()
+    out.clear();
+    out.extend(
+        s.joints
+            .iter()
+            .zip(&s.inverse_bind)
+            .map(|(&j, ib)| math::mul(&globals[j], ib)),
+    );
 }
 
 /// A primitive's positions and normals after morph targets (`weights`) and skinning (`joints`,
@@ -313,34 +354,87 @@ pub fn morph_range(
     first: usize,
     count: usize,
 ) -> (Vec<V3>, Vec<V3>) {
+    let mut pos = Vec::new();
+    let mut nrm = Vec::new();
+    morph_range_into(p, weights, moved, first, count, &mut pos, &mut nrm);
+    (pos, nrm)
+}
+
+/// Writes morphed positions and unit normals for `first..first + count` into `pos` and `nrm`,
+/// reusing their allocations and streaming target-major for cache locality and auto-vectorization.
+pub fn morph_range_into(
+    p: &Primitive,
+    weights: &[f32],
+    moved: &[u32],
+    first: usize,
+    count: usize,
+    pos: &mut Vec<V3>,
+    nrm: &mut Vec<V3>,
+) {
     let end = (first + count).min(p.positions.len());
-    let mut pos = p.positions[first..end].to_vec();
-    let mut nrm = if p.normals.is_empty() {
-        vec![]
-    } else {
-        p.normals[first..end].to_vec()
-    };
-    for &v in moved {
-        let v = v as usize;
-        if v < first || v >= end {
-            continue;
-        }
+    pos.clear();
+    nrm.clear();
+    if first >= end {
+        return;
+    }
+    pos.extend_from_slice(&p.positions[first..end]);
+    if !p.normals.is_empty() {
+        nrm.extend_from_slice(&p.normals[first..end]);
+    }
+    let span = end - first;
+    let start_idx = moved.partition_point(|&v| (v as usize) < first);
+    let end_idx = moved.partition_point(|&v| (v as usize) < end);
+    let active_moved = &moved[start_idx..end_idx];
+    let dense = active_moved.len() == span
+        && active_moved
+            .iter()
+            .enumerate()
+            .all(|(k, &v)| v as usize == first + k);
+    if dense {
         for (t, &w) in p.targets.iter().zip(weights) {
             if w == 0.0 {
                 continue;
             }
-            if let Some(d) = t.positions.get(v) {
-                pos[v - first] = math::add(pos[v - first], math::scale(*d, w));
+            let tp_end = end.min(t.positions.len());
+            if tp_end > first {
+                for (o, d) in pos[..tp_end - first]
+                    .iter_mut()
+                    .zip(&t.positions[first..tp_end])
+                {
+                    *o = math::add(*o, math::scale(*d, w));
+                }
             }
-            if let (Some(n), Some(d)) = (nrm.get_mut(v - first), t.normals.get(v)) {
-                *n = math::add(*n, math::scale(*d, w));
+            if !nrm.is_empty() {
+                let tn_end = end.min(t.normals.len());
+                if tn_end > first {
+                    for (o, d) in nrm[..tn_end - first]
+                        .iter_mut()
+                        .zip(&t.normals[first..tn_end])
+                    {
+                        *o = math::add(*o, math::scale(*d, w));
+                    }
+                }
+            }
+        }
+    } else {
+        for (t, &w) in p.targets.iter().zip(weights) {
+            if w == 0.0 {
+                continue;
+            }
+            for &v in active_moved {
+                let v = v as usize;
+                if let Some(d) = t.positions.get(v) {
+                    pos[v - first] = math::add(pos[v - first], math::scale(*d, w));
+                }
+                if let (Some(n), Some(d)) = (nrm.get_mut(v - first), t.normals.get(v)) {
+                    *n = math::add(*n, math::scale(*d, w));
+                }
             }
         }
     }
-    for n in &mut nrm {
+    for n in nrm.iter_mut() {
         *n = math::normalize(*n);
     }
-    (pos, nrm)
 }
 
 /// Translation, rotation, scale to a column-major matrix.

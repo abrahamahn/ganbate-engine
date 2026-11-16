@@ -248,6 +248,16 @@ impl<'w> Device<'w> {
     pub fn write_buffer(&mut self, b: BufferId, offset: u64, data: &[u8]) -> Result<()> {
         self.gpu.write_buffer(b, offset, data)
     }
+    /// Writes `f32` values as little-endian bytes without allocating on little-endian targets.
+    #[inline]
+    pub fn write_buffer_f32(&mut self, b: BufferId, offset: u64, values: &[f32]) -> Result<()> {
+        with_le_bytes_f32(values, |bytes| self.write_buffer(b, offset, bytes))
+    }
+    /// Writes `u32` values as little-endian bytes without allocating on little-endian targets.
+    #[inline]
+    pub fn write_buffer_u32(&mut self, b: BufferId, offset: u64, values: &[u32]) -> Result<()> {
+        with_le_bytes_u32(values, |bytes| self.write_buffer(b, offset, bytes))
+    }
     /// The bytes a write to `b` sends at least: a write sends every unit of this many bytes it
     /// touches whole, so writes to one unit cost no more joined. Here only the 4 bytes writes
     /// align to (on WebGL 2 a storage buffer's are a row of its texture).
@@ -464,6 +474,16 @@ impl Device<'_> {
     /// Ordered after earlier submissions. On WebGPU, offset and length must be multiples of 4.
     pub fn write_buffer(&mut self, b: BufferId, offset: u64, data: &[u8]) -> Result<()> {
         web!(mut self, g => g.write_buffer(b, offset, data))
+    }
+    /// Writes `f32` values as little-endian bytes without allocating on little-endian targets.
+    #[inline]
+    pub fn write_buffer_f32(&mut self, b: BufferId, offset: u64, values: &[f32]) -> Result<()> {
+        with_le_bytes_f32(values, |bytes| self.write_buffer(b, offset, bytes))
+    }
+    /// Writes `u32` values as little-endian bytes without allocating on little-endian targets.
+    #[inline]
+    pub fn write_buffer_u32(&mut self, b: BufferId, offset: u64, values: &[u32]) -> Result<()> {
+        with_le_bytes_u32(values, |bytes| self.write_buffer(b, offset, bytes))
     }
     /// The bytes a write to `b` sends at least: a write sends every unit of this many bytes it
     /// touches whole, so writes to one unit cost no more joined. On WebGL 2 a storage buffer's

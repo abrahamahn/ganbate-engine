@@ -546,6 +546,32 @@ pub(crate) fn as_le_bytes_u32(values: &[u32]) -> &[u8] {
     }
 }
 
+/// Calls `f` with the little-endian bytes of `values` (zero-copy on little-endian targets).
+#[inline]
+pub fn with_le_bytes_f32<R>(values: &[f32], f: impl FnOnce(&[u8]) -> R) -> R {
+    #[cfg(target_endian = "little")]
+    {
+        f(as_le_bytes_f32(values))
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        f(&f32_bytes(values))
+    }
+}
+
+/// Calls `f` with the little-endian bytes of `values` (zero-copy on little-endian targets).
+#[inline]
+pub fn with_le_bytes_u32<R>(values: &[u32], f: impl FnOnce(&[u8]) -> R) -> R {
+    #[cfg(target_endian = "little")]
+    {
+        f(as_le_bytes_u32(values))
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        f(&u32_bytes(values))
+    }
+}
+
 /// Little-endian bytes of `values`, for `write_buffer` and `push_constants`.
 #[inline]
 pub fn f32_bytes(values: &[f32]) -> Vec<u8> {

@@ -154,6 +154,7 @@ impl Renderer {
             world_drawn: false,
             world_cache: None,
             grass_grid: [0; 4],
+            grass_cache: None,
             receivers: None,
             water_statics: None,
             cache_ao_revision: 0,
@@ -193,6 +194,7 @@ impl Renderer {
     /// Draws the cached picture afresh next frame.
     pub(in crate::render) fn forget_world_cache(&mut self) {
         self.world_cache = None;
+        self.grass_cache = None;
         self.forget_ao();
     }
     pub fn set_look(&mut self, look: Look) {
@@ -200,6 +202,7 @@ impl Renderer {
         self.look = look;
         self.world_drawn = false;
         self.world_cache = None;
+        self.grass_cache = None;
         self.forget_ao();
         self.ground_cached_vp = None;
         self.lut_dirty = true;
@@ -231,6 +234,7 @@ impl Renderer {
     pub fn import_ao(&mut self, device: &mut Device<'_>, data: &[u8]) -> Result<()> {
         self.scene.import_ao(device, data)?;
         self.world_cache = None;
+        self.grass_cache = None;
         self.forget_ao();
         Ok(())
     }
@@ -1027,6 +1031,7 @@ impl Renderer {
         }
 
         self.quality = quality;
+        self.grass_cache = None;
         let slots = match self.output {
             Output::Still => 1,
             Output::Surface(_) => 2,
@@ -1038,13 +1043,23 @@ impl Renderer {
         Ok(())
     }
 
-    pub(in crate::render) fn eye(&self, view: &View, jitter: [f32; 2], (w, h): (u32, u32)) -> Eye {
+    #[inline]
+    pub(in crate::render) fn view_proj(
+        &self,
+        view: &View,
+        jitter: [f32; 2],
+        (w, h): (u32, u32),
+    ) -> M4 {
         let v = look_at(view.eye, view.target, camera_up(view));
         let mut p = perspective(view.fov.to_radians(), w as f32 / h as f32, near(view));
         // Column 2 skews the frustum: x_ndc gains -p[8] and y_ndc (pointing down) -p[9].
         p[8] += 2.0 * jitter[0] / w as f32 - view.shift[0];
         p[9] += 2.0 * jitter[1] / h as f32 + view.shift[1];
-        let view_proj = mul(&p, &v);
+        mul(&p, &v)
+    }
+
+    pub(in crate::render) fn eye(&self, view: &View, jitter: [f32; 2], size: (u32, u32)) -> Eye {
+        let view_proj = self.view_proj(view, jitter, size);
         Eye {
             view_proj,
             inv: invert(&view_proj).unwrap_or(math::IDENTITY),
@@ -1115,17 +1130,19 @@ impl Renderer {
             .into_iter()
             .enumerate()
         {
-            let mut pts = vec![];
+            let mut pts = [[0.0f32; 3]; 8];
+            let mut pt_idx = 0;
             for d in [d0, d1] {
                 for sx in [-1.0, 1.0] {
                     for sy in [-1.0, 1.0] {
-                        pts.push(add(
+                        pts[pt_idx] = add(
                             add(view.eye, scale(fwd, d)),
                             add(
                                 scale(right, (sx - shift_x) * d * tx),
                                 scale(up, (sy - shift_y) * d * ty),
                             ),
-                        ));
+                        );
+                        pt_idx += 1;
                     }
                 }
             }
@@ -1217,23 +1234,33 @@ impl Renderer {
     ) -> Vec<Footprint> {
         let maps = self.prop_shadow_maps(cas);
         let lights = self.game_lights.shadow_views().len().min(2);
-        let active: Vec<usize> = (0..4)
-            .filter(|&v| if v < 2 { key } else { v - 2 < lights })
-            .collect();
-        let boxes = if moved.len() * active.len() > MAX_RESHADE_ENTRIES {
-            let all = moved.iter().copied().reduce(|a, b| {
+        let mut active = [0usize; 4];
+        let mut active_len = 0;
+        for v in 0..4 {
+            if if v < 2 { key } else { v - 2 < lights } {
+                active[active_len] = v;
+                active_len += 1;
+            }
+        }
+        let active = &active[..active_len];
+        let single;
+        let boxes: &[(V3, V3)] = if moved.len() * active.len() > MAX_RESHADE_ENTRIES {
+            let Some(all) = moved.iter().copied().reduce(|a, b| {
                 (
                     std::array::from_fn(|k| a.0[k].min(b.0[k])),
                     std::array::from_fn(|k| a.1[k].max(b.1[k])),
                 )
-            });
-            all.into_iter().collect()
+            }) else {
+                return Vec::new();
+            };
+            single = [all];
+            &single
         } else {
-            moved.to_vec()
+            moved
         };
-        let mut footprints = vec![];
-        for b in &boxes {
-            for &v in &active {
+        let mut footprints = Vec::with_capacity(boxes.len() * active.len());
+        for b in boxes {
+            for &v in active {
                 let (m, margin, _) = &maps[v];
                 let (r, near, _) = map_bounds(*b, m);
                 let r = [r[0] - margin, r[1] - margin, r[2] + margin, r[3] + margin];

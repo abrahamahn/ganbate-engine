@@ -255,6 +255,7 @@ pub(crate) struct Gpu<'w> {
     layout_ids: HashMap<Vec<(u32, BindingKind)>, u32>,
     cmd_buf: Vec<u32>,
     ring: record::Ring,
+    host: record::Host,
     /// Vertex arrays, created while recording.
     vaos: RefCell<HashMap<VaoKey, u32>>,
     /// The canvas texture, once `acquire` has registered it.
@@ -312,6 +313,7 @@ impl Gpu<'static> {
             layout_ids: HashMap::new(),
             cmd_buf: Vec::new(),
             ring: record::Ring::default(),
+            host: record::Host::default(),
             vaos: RefCell::new(HashMap::new()),
             surface: None,
             presentable,
@@ -1348,10 +1350,12 @@ impl<'w> Gpu<'w> {
     pub fn submit(&mut self, e: &crate::gpu::Encoder) -> Result<()> {
         let mut commands = core::mem::take(&mut self.cmd_buf);
         let mut ring = core::mem::take(&mut self.ring);
-        let res = self.record(e, None, &mut commands, &mut ring);
+        let mut host = core::mem::take(&mut self.host);
+        let res = self.record(e, None, &mut commands, &mut ring, &mut host);
         let out = res.and_then(|()| ffi::submit(&commands, &ring.bytes, false));
         self.cmd_buf = commands;
         self.ring = ring;
+        self.host = host;
         out
     }
 
@@ -1407,10 +1411,12 @@ impl<'w> Gpu<'w> {
             .ok_or("present: call acquire first to get the canvas texture")?;
         let mut commands = core::mem::take(&mut self.cmd_buf);
         let mut ring = core::mem::take(&mut self.ring);
-        let res = self.record(e, Some(surface), &mut commands, &mut ring);
+        let mut host = core::mem::take(&mut self.host);
+        let res = self.record(e, Some(surface), &mut commands, &mut ring, &mut host);
         let out = res.and_then(|()| ffi::submit(&commands, &ring.bytes, true));
         self.cmd_buf = commands;
         self.ring = ring;
+        self.host = host;
         out?;
         self.frame = (self.frame + 1) % 2;
         Ok(())

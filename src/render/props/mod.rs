@@ -31,7 +31,7 @@ use super::scene::MaterialData;
 use crate::gpu::pool::Pool;
 use crate::gpu::{
     Attachment, BindGroupId, BufferDesc, BufferId, BufferUsage, Device, Format, Memory, Resource,
-    Result, TextureDesc, TextureId, TextureUsage, f32_bytes, u32_bytes,
+    Result, TextureDesc, TextureId, TextureUsage,
 };
 use crate::world::Shading;
 

@@ -64,9 +64,18 @@ pub(super) struct InstanceEntry {
 }
 
 #[derive(Default)]
+struct ModelsScratch {
+    skins: Vec<(usize, Vec<M4>, Vec<PropInstance>)>,
+    morph_pos: Vec<[f32; 3]>,
+    morph_nrm: Vec<[f32; 3]>,
+    placements: Vec<(PropInstance, M4, bool)>,
+}
+
+#[derive(Default)]
 pub(super) struct Models {
     models: Pool<ModelEntry>,
     instances: Pool<InstanceEntry>,
+    scratch: ModelsScratch,
 }
 
 /// Whether a primitive of `mesh` under `node` is deformed per instance.
@@ -468,100 +477,213 @@ impl Renderer {
         device: &mut Device<'_>,
         i: ModelInstance,
     ) -> Result<()> {
-        let e = self
-            .models
-            .instances
-            .get(i.0)
-            .ok_or_else(|| format!("{i:?} was destroyed"))?;
-        let model = &self
-            .models
-            .models
-            .get(e.model.0)
-            .ok_or("the instance's model was destroyed")?
-            .model;
-        let globals = e.pose.globals(model);
-        // Each skin's joint matrices once, shared by every primitive that follows them.
-        let mut skins: Vec<(usize, Vec<M4>, Vec<PropInstance>)> = vec![];
-        let mut morphs = vec![];
-        for (k, part) in e.parts.iter().enumerate() {
-            let Some(own) = part.own else { continue };
-            let p = &model.meshes[part.mesh].primitives[part.primitive];
-            if let Some(s) = model.nodes[part.node].skin.filter(|_| !p.joints.is_empty()) {
-                match skins.iter_mut().find(|(skin, ..)| *skin == s) {
-                    Some((.., parts)) => parts.push(part.instance),
-                    None => skins.push((
-                        s,
-                        anim::joint_matrices(model, s, &globals),
-                        vec![part.instance],
-                    )),
+        enum MorphAction {
+            WeightsOnly(usize),
+            Full(usize, PropMesh),
+            Range(usize, PropMesh, usize, usize),
+        }
+        let mut scratch = std::mem::take(&mut self.models.scratch);
+        let result = (|| -> Result<()> {
+            let mut skin_count = 0usize;
+            let mut morph_actions: [Option<MorphAction>; 8] = [const { None }; 8];
+            let mut morph_actions_vec: Vec<MorphAction> = Vec::new();
+            let mut morph_count = 0usize;
+            {
+                let e = self
+                    .models
+                    .instances
+                    .get_mut(i.0)
+                    .ok_or_else(|| format!("{i:?} was destroyed"))?;
+                let model = &self
+                    .models
+                    .models
+                    .get(e.model.0)
+                    .ok_or("the instance's model was destroyed")?
+                    .model;
+                e.pose.globals_into(model, &mut e.globals);
+                // Each skin's joint matrices once, shared by every primitive that follows them.
+                for (k, part) in e.parts.iter().enumerate() {
+                    let Some(own) = part.own else { continue };
+                    let p = &model.meshes[part.mesh].primitives[part.primitive];
+                    if let Some(s) = model.nodes[part.node].skin.filter(|_| !p.joints.is_empty()) {
+                        match scratch.skins[..skin_count]
+                            .iter_mut()
+                            .find(|(skin, ..)| *skin == s)
+                        {
+                            Some((.., parts)) => parts.push(part.instance),
+                            None => {
+                                if skin_count < scratch.skins.len() {
+                                    let entry = &mut scratch.skins[skin_count];
+                                    entry.0 = s;
+                                    anim::joint_matrices_into(model, s, &e.globals, &mut entry.1);
+                                    entry.2.clear();
+                                    entry.2.push(part.instance);
+                                } else {
+                                    scratch.skins.push((
+                                        s,
+                                        anim::joint_matrices(model, s, &e.globals),
+                                        vec![part.instance],
+                                    ));
+                                }
+                                skin_count += 1;
+                            }
+                        }
+                    }
+                    let weights = &e.pose.weights[part.node];
+                    if !p.targets.is_empty() && part.morphed != *weights {
+                        let action = match (part.moved.first(), part.moved.last()) {
+                            // Only targets that move none of its vertices changed: nothing to rewrite.
+                            _ if !anim::morph_changes(&part.morphed, weights, &part.moving) => {
+                                MorphAction::WeightsOnly(k)
+                            }
+                            // Without normals of its own the whole mesh is shaded again.
+                            _ if p.normals.is_empty() => MorphAction::Full(k, own),
+                            // Only the span of the vertices its targets move is morphed and rewritten.
+                            (Some(&lo), Some(&hi)) => {
+                                MorphAction::Range(k, own, lo as usize, (hi - lo) as usize + 1)
+                            }
+                            _ => MorphAction::WeightsOnly(k),
+                        };
+                        if morph_count < morph_actions.len() {
+                            morph_actions[morph_count] = Some(action);
+                        } else {
+                            morph_actions_vec.push(action);
+                        }
+                        morph_count += 1;
+                    }
                 }
             }
-            let weights = &e.pose.weights[part.node];
-            if !p.targets.is_empty() && part.morphed != *weights {
-                match (part.moved.first(), part.moved.last()) {
-                    // Only targets that move none of its vertices changed: nothing to rewrite.
-                    _ if !anim::morph_changes(&part.morphed, weights, &part.moving) => {
-                        morphs.push((k, own, Some(0), vec![], vec![], weights.clone()));
+            let all_actions = morph_actions
+                .into_iter()
+                .take(morph_count.min(8))
+                .flatten()
+                .chain(morph_actions_vec);
+            for action in all_actions {
+                match action {
+                    MorphAction::WeightsOnly(k) => {
+                        let e = self.model_instance_entry(i)?;
+                        if let Some(part) = e.parts.get_mut(k) {
+                            let weights = &e.pose.weights[part.node];
+                            part.morphed.clear();
+                            part.morphed.extend_from_slice(weights);
+                        }
                     }
-                    // Without normals of its own the whole mesh is shaded again.
-                    _ if p.normals.is_empty() => {
-                        let (pos, nrm) = anim::deform(p, weights, None);
-                        morphs.push((k, own, None, pos, nrm, weights.clone()));
+                    MorphAction::Full(k, mesh) => {
+                        let (pos, nrm) = {
+                            let e = self
+                                .models
+                                .instances
+                                .get(i.0)
+                                .ok_or_else(|| format!("{i:?} was destroyed"))?;
+                            let model = &self
+                                .models
+                                .models
+                                .get(e.model.0)
+                                .ok_or("the instance's model was destroyed")?
+                                .model;
+                            let part = &e.parts[k];
+                            let p = &model.meshes[part.mesh].primitives[part.primitive];
+                            anim::deform(p, &e.pose.weights[part.node], None)
+                        };
+                        self.update_prop_mesh(device, mesh, &pos, &nrm)?;
+                        let e = self.model_instance_entry(i)?;
+                        if let Some(part) = e.parts.get_mut(k) {
+                            let weights = &e.pose.weights[part.node];
+                            part.morphed.clear();
+                            part.morphed.extend_from_slice(weights);
+                        }
                     }
-                    // Only the span of the vertices its targets move is morphed and rewritten.
-                    (Some(&lo), Some(&hi)) => {
-                        let (first, count) = (lo as usize, (hi - lo) as usize + 1);
-                        let (pos, nrm) = anim::morph_range(p, weights, &part.moved, first, count);
-                        morphs.push((k, own, Some(first), pos, nrm, weights.clone()));
+                    MorphAction::Range(k, mesh, first, count) => {
+                        {
+                            let e = self
+                                .models
+                                .instances
+                                .get(i.0)
+                                .ok_or_else(|| format!("{i:?} was destroyed"))?;
+                            let model = &self
+                                .models
+                                .models
+                                .get(e.model.0)
+                                .ok_or("the instance's model was destroyed")?
+                                .model;
+                            let part = &e.parts[k];
+                            let p = &model.meshes[part.mesh].primitives[part.primitive];
+                            anim::morph_range_into(
+                                p,
+                                &e.pose.weights[part.node],
+                                &part.moved,
+                                first,
+                                count,
+                                &mut scratch.morph_pos,
+                                &mut scratch.morph_nrm,
+                            );
+                        }
+                        self.update_prop_mesh_range(
+                            device,
+                            mesh,
+                            first,
+                            &scratch.morph_pos,
+                            &scratch.morph_nrm,
+                        )?;
+                        let e = self.model_instance_entry(i)?;
+                        if let Some(part) = e.parts.get_mut(k) {
+                            let weights = &e.pose.weights[part.node];
+                            part.morphed.clear();
+                            part.morphed.extend_from_slice(weights);
+                        }
                     }
-                    _ => morphs.push((k, own, Some(0), vec![], vec![], weights.clone())),
                 }
             }
-        }
-        for (k, mesh, first, pos, nrm, weights) in morphs {
-            match first {
-                Some(first) => self.update_prop_mesh_range(device, mesh, first, &pos, &nrm)?,
-                None => self.update_prop_mesh(device, mesh, &pos, &nrm)?,
+            for (_, joints, parts) in &scratch.skins[..skin_count] {
+                self.share_prop_instance_joints(parts, joints)?;
             }
-            if let Some(part) = self.model_instance_entry(i)?.parts.get_mut(k) {
-                part.morphed = weights;
-            }
-        }
-        for (_, joints, parts) in &skins {
-            self.share_prop_instance_joints(parts, joints)?;
-        }
-        self.model_instance_entry(i)?.globals = globals;
+            Ok(())
+        })();
+        self.models.scratch = scratch;
+        result?;
         self.place_model_parts(i)
     }
 
     /// Sets every part's prop instance from the instance transform and node globals.
     fn place_model_parts(&mut self, i: ModelInstance) -> Result<()> {
-        let e = self
-            .models
-            .instances
-            .get(i.0)
-            .ok_or_else(|| format!("{i:?} was destroyed"))?;
-        let model = &self
-            .models
-            .models
-            .get(e.model.0)
-            .ok_or("the instance's model was destroyed")?
-            .model;
-        let mut placements = Vec::with_capacity(e.parts.len());
-        for part in &e.parts {
-            let p = &model.meshes[part.mesh].primitives[part.primitive];
-            let skinned = !p.joints.is_empty() && model.nodes[part.node].skin.is_some();
-            // Skinned vertices are already in the model's space.
-            let m = if skinned {
-                e.transform
-            } else {
-                math::mul(&e.transform, &e.globals[part.node])
-            };
-            placements.push((part.instance, m, e.visible && !e.hidden_nodes[part.node]));
+        let mut placements = std::mem::take(&mut self.models.scratch.placements);
+        placements.clear();
+        let prep = (|| -> Result<()> {
+            let e = self
+                .models
+                .instances
+                .get(i.0)
+                .ok_or_else(|| format!("{i:?} was destroyed"))?;
+            let model = &self
+                .models
+                .models
+                .get(e.model.0)
+                .ok_or("the instance's model was destroyed")?
+                .model;
+            for part in &e.parts {
+                let p = &model.meshes[part.mesh].primitives[part.primitive];
+                let skinned = !p.joints.is_empty() && model.nodes[part.node].skin.is_some();
+                // Skinned vertices are already in the model's space.
+                let m = if skinned {
+                    e.transform
+                } else {
+                    math::mul(&e.transform, &e.globals[part.node])
+                };
+                placements.push((part.instance, m, e.visible && !e.hidden_nodes[part.node]));
+            }
+            Ok(())
+        })();
+        if let Err(err) = prep {
+            self.models.scratch.placements = placements;
+            return Err(err);
         }
-        for (instance, m, visible) in placements {
-            self.set_prop_instance(instance, &m, visible)?;
+        for &(instance, ref m, visible) in &placements {
+            if let Err(err) = self.set_prop_instance(instance, m, visible) {
+                self.models.scratch.placements = placements;
+                return Err(err);
+            }
         }
+        self.models.scratch.placements = placements;
         Ok(())
     }
 

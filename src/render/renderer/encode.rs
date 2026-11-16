@@ -6,16 +6,16 @@ impl Renderer {
     /// stand.
     pub(super) fn tile_key(&self, eye: &Eye, size: (u32, u32), tiles: (u32, u32), on: bool) -> u64 {
         let mut key = Fnv::new();
-        key.write(&f32_bytes(&eye.view_proj));
-        key.write(&f32_bytes(&[eye.pos[0], eye.pos[1], eye.pos[2], eye.near]));
+        with_le_bytes_f32(&eye.view_proj, |b| key.write(b));
+        with_le_bytes_f32(&[eye.pos[0], eye.pos[1], eye.pos[2], eye.near], |b| {
+            key.write(b);
+        });
         for n in [size.0, size.1, tiles.0, tiles.1, u32::from(on)] {
             key.write(&n.to_le_bytes());
         }
         key.write(&self.quality.tile_size.to_le_bytes());
         key.write(&self.scene.revision.to_le_bytes());
-        for record in self.game_lights.records() {
-            key.write(&f32_bytes(record));
-        }
+        with_le_bytes_f32(self.game_lights.records().as_flattened(), |b| key.write(b));
         key.finish()
     }
 
@@ -27,7 +27,9 @@ impl Renderer {
         on: bool,
     ) -> (Vec<u32>, Vec<u32>) {
         let ts = self.quality.tile_size as f32;
-        let mut lists: Vec<Vec<u32>> = vec![vec![]; (tx * ty * CLUSTER_SLICES) as usize];
+        let cluster_count = (tx * ty * CLUSTER_SLICES) as usize;
+        let mut counts = vec![0u8; cluster_count];
+        let mut entries = vec![0u32; cluster_count * MAX_LIGHTS_PER_CLUSTER];
         // The lamps while they are lit, and a game's lights (after them in the light buffer):
         // those that follow the lamps while they are lit, the rest always.
         let lamps = self.scene.lights.len();
@@ -103,27 +105,31 @@ impl Renderer {
                 for s in s0..=s1 {
                     for y in ay..=by {
                         for x in ax..=bx {
-                            let list = &mut lists[((s * ty + y) * tx + x) as usize];
-                            if list.len() < MAX_LIGHTS_PER_CLUSTER {
-                                list.push(i as u32);
+                            let c_idx = ((s * ty + y) * tx + x) as usize;
+                            let len = usize::from(counts[c_idx]);
+                            if len < MAX_LIGHTS_PER_CLUSTER {
+                                entries[c_idx * MAX_LIGHTS_PER_CLUSTER + len] = i as u32;
+                                counts[c_idx] = (len + 1) as u8;
                             }
                         }
                     }
                 }
             }
         }
-        let mut tiles = Vec::with_capacity(lists.len() * 2);
-        let mut index = vec![];
+        let mut tiles = Vec::with_capacity(cluster_count * 2);
         // The index buffer holds `CLUSTER_ENTRIES_PER_TILE` a tile. When the lists hold more,
         // every cluster keeps the same number of its nearest lamps (each list was filled nearest
         // first), as many as fit, rather than the last clusters losing all of theirs.
         let room = (u64::from(tx) * u64::from(ty) * CLUSTER_ENTRIES_PER_TILE) as usize;
-        let cap = cluster_cap(lists.iter().map(Vec::len), room);
-        for list in lists {
-            let kept = list.len().min(cap);
+        let cap = cluster_cap(counts.iter().map(|&c| usize::from(c)), room);
+        let total_kept: usize = counts.iter().map(|&c| usize::from(c).min(cap)).sum();
+        let mut index = Vec::with_capacity(total_kept.max(1));
+        for (c_idx, &count) in counts.iter().enumerate() {
+            let kept = usize::from(count).min(cap);
             tiles.push(index.len() as u32);
             tiles.push(kept as u32);
-            index.extend_from_slice(&list[..kept]);
+            let base = c_idx * MAX_LIGHTS_PER_CLUSTER;
+            index.extend_from_slice(&entries[base..base + kept]);
         }
         if index.is_empty() {
             index.push(0);
@@ -144,9 +150,9 @@ impl Renderer {
         has_prop_shadows: bool,
         has_reflection: bool,
         seed: u32,
-    ) -> Vec<u8> {
+    ) -> FrameBlock {
         let l = &self.look;
-        let mut b = Block(Vec::with_capacity(248));
+        let mut b = FrameBlock::new();
         b.m(&eye.view_proj);
         b.m(&eye.inv);
         b.m(&cas.mats[0]);
@@ -252,17 +258,15 @@ impl Renderer {
         };
         let [r, g, bl] = l.tide_color;
         b.f(tide, r, g, bl);
-        let mut bytes = f32_bytes(&b.0);
         for u in [
             tiles.0,
             tiles.1,
             self.quality.tile_size,
             (self.scene.lights.len() + self.game_lights.records().len()) as u32,
         ] {
-            bytes.extend_from_slice(&u.to_le_bytes());
+            b.push_u32(u);
         }
         // The game lights' shadow maps and unified surface model parameters.
-        let mut b = Block(Vec::with_capacity(44));
         let views = self.game_lights.shadow_views();
         for layer in 0..crate::render::lights::MAX_SHADOWED_LIGHTS {
             b.m(views.get(layer).unwrap_or(&math::IDENTITY));
@@ -290,9 +294,8 @@ impl Renderer {
         b.v(l.subsurface_color, l.clearcoat_roughness);
         let [x, z, w, _] = self.grass_grid;
         b.f(x as f32, z as f32, w as f32, 0.0);
-        bytes.extend_from_slice(&f32_bytes(&b.0));
-        debug_assert!(bytes.len() as u64 <= FRAME_BYTES);
-        bytes
+        debug_assert!(b.len as u64 <= FRAME_BYTES);
+        b
     }
 
     /// Grass instances to draw: the part of the instance grid (scaled by quality and the Look's
@@ -306,10 +309,23 @@ impl Renderer {
     /// lowest ground to the tallest blade, clipped to the view widened as that test widens it; the
     /// blades outside it are dropped by the test anyway, so the picture is the same, without
     /// running the vertex stage for hundreds of thousands of blades the view cannot show.
-    pub(super) fn visible_grass(&self, eye: &Eye, ground: &Ground) -> [u32; 4] {
+    pub(super) fn visible_grass(&mut self, eye: &Eye, ground: &Ground) -> [u32; 4] {
         let side = self.grass_side();
         if side == 0 {
             return [0; 4];
+        }
+        let key: GrassKey = (
+            eye.view_proj.map(f32::to_bits),
+            eye.pos.map(f32::to_bits),
+            ground.top.to_bits(),
+            ground.range.to_bits(),
+            self.look.grass.height.to_bits(),
+            side,
+        );
+        if let Some((cached_key, cached_grid)) = self.grass_cache
+            && cached_key == key
+        {
+            return cached_grid;
         }
         let s = f64::from(GRASS_SPACING);
         let half = i64::from(side / 2);
@@ -331,19 +347,22 @@ impl Renderer {
         let m = &eye.view_proj;
         let row = |k: usize| [m[k], m[4 + k], m[8 + k], m[12 + k]].map(f64::from);
         let (r0, r1, r3) = (row(0), row(1), row(3));
-        let mut planes: Vec<([f64; 3], f64)> = vec![];
+        let mut planes = [([0.0f64; 3], 0.0f64); 11];
         for k in 0..3 {
             let mut n = [0.0; 3];
             n[k] = -1.0;
-            planes.push((n, lo[k]));
+            planes[2 * k] = (n, lo[k]);
             n[k] = 1.0;
-            planes.push((n, -hi[k]));
+            planes[2 * k + 1] = (n, -hi[k]);
         }
-        for (r, sign) in [(r0, 1.0), (r0, -1.0), (r1, 1.0), (r1, -1.0)] {
+        for (idx, (r, sign)) in [(r0, 1.0), (r0, -1.0), (r1, 1.0), (r1, -1.0)]
+            .into_iter()
+            .enumerate()
+        {
             let a: [f64; 4] = std::array::from_fn(|i| sign * r[i] - 1.15 * r3[i]);
-            planes.push(([a[0], a[1], a[2]], a[3] - 0.5));
+            planes[6 + idx] = ([a[0], a[1], a[2]], a[3] - 0.5);
         }
-        planes.push(([-r3[0], -r3[1], -r3[2]], -r3[3]));
+        planes[10] = ([-r3[0], -r3[1], -r3[2]], -r3[3]);
         // The clipped box's corners: where three planes meet inside all the others.
         let (mut xz_lo, mut xz_hi) = ([f64::INFINITY; 2], [f64::NEG_INFINITY; 2]);
         for i in 0..planes.len() {
@@ -379,16 +398,19 @@ impl Renderer {
                 }
             }
         }
-        if xz_lo[0] > xz_hi[0] {
-            return [0; 4];
-        }
-        let cells = |v: f64, axis: usize| {
-            ((v / s).floor() as i64 - corner[axis]).clamp(0, i64::from(side)) as u32
+        let grid = if xz_lo[0] > xz_hi[0] {
+            [0; 4]
+        } else {
+            let cells = |v: f64, axis: usize| {
+                ((v / s).floor() as i64 - corner[axis]).clamp(0, i64::from(side)) as u32
+            };
+            let (x0, z0) = (cells(xz_lo[0], 0), cells(xz_lo[1], 1));
+            let (x1, z1) = (cells(xz_hi[0], 0) + 1, cells(xz_hi[1], 1) + 1);
+            let (x1, z1) = (x1.min(side), z1.min(side));
+            [x0, z0, x1.saturating_sub(x0), z1.saturating_sub(z0)]
         };
-        let (x0, z0) = (cells(xz_lo[0], 0), cells(xz_lo[1], 1));
-        let (x1, z1) = (cells(xz_hi[0], 0) + 1, cells(xz_hi[1], 1) + 1);
-        let (x1, z1) = (x1.min(side), z1.min(side));
-        [x0, z0, x1.saturating_sub(x0), z1.saturating_sub(z0)]
+        self.grass_cache = Some((key, grid));
+        grid
     }
 
     /// Rows of the grass instance grid this frame (0 when nothing grows grass).
@@ -411,10 +433,10 @@ impl Renderer {
         mask: TextureId,
         vp: &M4,
     ) {
-        enc.begin_pass(PassDesc {
-            colors: vec![Attachment::clear(mask, [0.0; 4])],
-            depth: Some(Attachment::clear(depth, [1.0; 4])),
-        });
+        enc.begin_pass_slice(
+            &[Attachment::clear(mask, [0.0; 4])],
+            Some(Attachment::clear(depth, [1.0; 4])),
+        );
         enc.set_pipeline(self.pipelines.ground);
         enc.set_vertex_buffer(self.scene.vertices, 0);
         enc.set_index_buffer(self.scene.indices, 0);
@@ -440,7 +462,7 @@ impl Renderer {
             } else {
                 0.0
             };
-            enc.push_constants(&f32_bytes(&gp));
+            enc.push_f32(&gp);
             enc.draw_indexed(d.count, 1, d.first_index, 0, 0);
         }
         enc.end_pass();
@@ -529,7 +551,7 @@ impl Renderer {
         model_push[20..24].copy_from_slice(&m.emissive);
         model_push[24..28].copy_from_slice(&m.params);
         model_push[28..32].copy_from_slice(&m.flags);
-        enc.push_constants(&f32_bytes(model_push));
+        enc.push_f32(model_push);
         enc.draw_indexed(d.count, 1, d.first_index, 0, 0);
     }
 
@@ -542,19 +564,19 @@ impl Renderer {
         group: BindGroupId,
         push: [f32; 16],
     ) {
-        enc.begin_pass(PassDesc {
-            colors: vec![Attachment {
+        enc.begin_pass_slice(
+            &[Attachment {
                 texture: target,
                 mip,
                 layer: 0,
                 load,
                 store: true,
             }],
-            depth: None,
-        });
+            None,
+        );
         enc.set_pipeline(pipeline);
         enc.set_bind_group(0, group);
-        enc.push_constants(&f32_bytes(&push));
+        enc.push_f32(&push);
         enc.draw(3, 1, 0, 0);
         enc.end_pass();
     }
@@ -623,16 +645,10 @@ impl Renderer {
         let has_prop_shadows = self.has_prop_shadows();
         // A game's lights after the lamps in the light buffer, written when they changed.
         if self.game_lights.dirty {
-            let data: Vec<f32> = self
-                .game_lights
-                .records()
-                .iter()
-                .flatten()
-                .copied()
-                .collect();
-            if !data.is_empty() {
+            let records = self.game_lights.records();
+            if !records.is_empty() {
                 let at = (self.scene.lights.len() * 64) as u64;
-                device.write_buffer(self.scene.light_buffer, at, &crate::gpu::f32_bytes(&data))?;
+                device.write_buffer_f32(self.scene.light_buffer, at, records.as_flattened())?;
             }
             self.game_lights.dirty = false;
         }
@@ -675,8 +691,8 @@ impl Renderer {
             let tiles_key = self.tile_key(&eye, size, tiles_dim[0], lamps_on);
             if self.slots[slot_index].tiles_for[0] != Some(tiles_key) {
                 let (tiles, index) = self.tile_lights(&eye, size, tiles_dim[0], lamps_on);
-                device.write_buffer(tile_buffers[0], 0, &crate::gpu::u32_bytes(&tiles))?;
-                device.write_buffer(index_buffers[0], 0, &crate::gpu::u32_bytes(&index))?;
+                device.write_buffer_u32(tile_buffers[0], 0, &tiles)?;
+                device.write_buffer_u32(index_buffers[0], 0, &index)?;
                 self.slots[slot_index].tiles_for[0] = Some(tiles_key);
             }
             let block = self.frame_block(
@@ -691,23 +707,22 @@ impl Renderer {
                 has_reflection,
                 seed,
             );
-            device.write_buffer(frame_buffers[0], 0, &block)?;
+            let block_bytes = block.as_slice();
+            device.write_buffer(frame_buffers[0], 0, block_bytes)?;
             // What the world's picture depends on: this view's frame inputs (but the clock,
             // which moves only what the cached world leaves out), the world and the lights.
             let mut key = Fnv::new();
-            key.write(&block[..CAMERA_SECONDS]);
-            key.write(&block[CAMERA_SECONDS + 4..]);
+            key.write(&block_bytes[..CAMERA_SECONDS]);
+            key.write(&block_bytes[CAMERA_SECONDS + 4..]);
             key.write(&self.scene.revision.to_le_bytes());
-            for record in self.game_lights.records() {
-                key.write(&f32_bytes(record));
-            }
+            with_le_bytes_f32(self.game_lights.records().as_flattened(), |b| key.write(b));
             world_key = key.finish();
             if let Some(re) = &refl_eye {
                 let tiles_key = self.tile_key(re, refl_size, tiles_dim[1], lamps_on);
                 if self.slots[slot_index].tiles_for[1] != Some(tiles_key) {
                     let (tiles, index) = self.tile_lights(re, refl_size, tiles_dim[1], lamps_on);
-                    device.write_buffer(tile_buffers[1], 0, &crate::gpu::u32_bytes(&tiles))?;
-                    device.write_buffer(index_buffers[1], 0, &crate::gpu::u32_bytes(&index))?;
+                    device.write_buffer_u32(tile_buffers[1], 0, &tiles)?;
+                    device.write_buffer_u32(index_buffers[1], 0, &index)?;
                     self.slots[slot_index].tiles_for[1] = Some(tiles_key);
                 }
                 let block = self.frame_block(
@@ -722,7 +737,7 @@ impl Renderer {
                     has_reflection,
                     seed,
                 );
-                device.write_buffer(frame_buffers[1], 0, &block)?;
+                device.write_buffer(frame_buffers[1], 0, block.as_slice())?;
             }
         }
         // A presented view draws the world's part of the main pass, and the water's reflection,
@@ -853,20 +868,20 @@ impl Renderer {
             } else {
                 for (layer, m) in cas.mats.iter().enumerate() {
                     let shadow_frustum = Frustum::from_view_proj(m);
-                    enc.begin_pass(PassDesc {
-                        colors: vec![],
-                        depth: Some(Attachment {
+                    enc.begin_pass_slice(
+                        &[],
+                        Some(Attachment {
                             texture: self.shadow_map,
                             mip: 0,
                             layer: layer as u32,
                             load: Load::Clear([1.0; 4]),
                             store: true,
                         }),
-                    });
+                    );
                     enc.set_pipeline(self.pipelines.shadow);
                     enc.set_vertex_buffer(self.scene.vertices, 0);
                     enc.set_index_buffer(self.scene.indices, 0);
-                    enc.push_constants(&f32_bytes(m));
+                    enc.push_f32(m);
                     let masked = |d: &&DrawItem| self.shadow_materials[d.material].is_some();
                     for d in self.scene.draws.iter().filter(|d| {
                         !d.water
@@ -898,7 +913,7 @@ impl Renderer {
                             mat.flags[0],
                             0.0,
                         ]);
-                        enc.push_constants(&f32_bytes(&push));
+                        enc.push_f32(&push);
                         stats.shadow_world_draws += 1;
                         enc.draw_indexed(d.count, 1, d.first_index, 0, 0);
                     }
@@ -908,16 +923,16 @@ impl Renderer {
             }
             if redraw_prop_shadows && (has_prop_shadows || first_shadow_layers) {
                 for (layer, m) in cas.mats.iter().enumerate() {
-                    enc.begin_pass(PassDesc {
-                        colors: vec![],
-                        depth: Some(Attachment {
+                    enc.begin_pass_slice(
+                        &[],
+                        Some(Attachment {
                             texture: self.shadow_map,
                             mip: 0,
                             layer: (layer + 2) as u32,
                             load: Load::Clear([1.0; 4]),
                             store: true,
                         }),
-                    });
+                    );
                     if has_prop_shadows {
                         self.draw_prop_shadows(enc, slot_index, m);
                     }
@@ -928,16 +943,16 @@ impl Renderer {
             self.static_shadows_vp = None;
             let clear_layers = if first_shadow_layers { 4 } else { 2 };
             for layer in 0..clear_layers {
-                enc.begin_pass(PassDesc {
-                    colors: vec![],
-                    depth: Some(Attachment {
+                enc.begin_pass_slice(
+                    &[],
+                    Some(Attachment {
                         texture: self.shadow_map,
                         mip: 0,
                         layer,
                         load: Load::Clear([1.0; 4]),
                         store: true,
                     }),
-                });
+                );
                 enc.end_pass();
             }
         }
@@ -949,16 +964,16 @@ impl Renderer {
             if light_vp.is_none() && !first_light_shadows {
                 continue;
             }
-            enc.begin_pass(PassDesc {
-                colors: vec![],
-                depth: Some(Attachment {
+            enc.begin_pass_slice(
+                &[],
+                Some(Attachment {
                     texture: self.light_shadow_map,
                     mip: 0,
                     layer: layer as u32,
                     load: Load::Clear([1.0; 4]),
                     store: true,
                 }),
-            });
+            );
             if let Some(m) = light_vp {
                 self.draw_prop_shadows(enc, slot_index, m);
             }
@@ -997,27 +1012,25 @@ impl Renderer {
                 self.targets.refl_aux,
                 self.targets.refl_depth,
             );
-            enc.begin_pass(PassDesc {
-                colors: vec![
+            let refl_frustum = Frustum::from_view_proj(&re.view_proj);
+            enc.begin_pass_slice(
+                &[
                     Attachment::clear(refl_hdr, clear),
                     Attachment::clear(refl_aux, clear),
                 ],
-                depth: Some(Attachment::clear(refl_depth, clear)),
-            });
+                Some(Attachment::clear(refl_depth, clear)),
+            );
             enc.set_pipeline(self.pipelines.scene);
             enc.set_bind_group(0, self.slots[slot_index].scene[1]);
             self.draw_world(enc, &mut push, re, false, WorldPart::All, None);
-            self.draw_props(enc, slot_index, 1, PropSet::All, None);
+            self.draw_props(enc, slot_index, 1, PropSet::All, Some(&refl_frustum));
             enc.set_pipeline(self.pipelines.sky);
             enc.set_bind_group(0, self.slots[slot_index].sky[1]);
             enc.draw(3, 1, 0, 0);
             enc.end_pass();
         } else if !self.targets.refl_cleared {
             self.targets.refl_cleared = true;
-            enc.begin_pass(PassDesc {
-                colors: vec![Attachment::clear(self.targets.refl_hdr, clear)],
-                depth: None,
-            });
+            enc.begin_pass_slice(&[Attachment::clear(self.targets.refl_hdr, clear)], None);
             enc.end_pass();
         }
 
@@ -1049,10 +1062,10 @@ impl Renderer {
                 },
                 ..Attachment::clear(t.cache_shadow, clear)
             };
-            enc.begin_pass(PassDesc {
-                colors: vec![target(t.cache_hdr), target(t.cache_aux), shadow_target],
-                depth: Some(target(t.cache_depth)),
-            });
+            enc.begin_pass_slice(
+                &[target(t.cache_hdr), target(t.cache_aux), shadow_target],
+                Some(target(t.cache_depth)),
+            );
             for r in if rebuild { &whole[..] } else { &regions[..] } {
                 if !rebuild {
                     enc.set_scissor(r[0], r[1], r[2] - r[0], r[3] - r[1]);
@@ -1060,8 +1073,15 @@ impl Renderer {
                     enc.draw(3, 1, 0, 0);
                 }
                 let within = eye.within(r, size);
+                let seen;
+                let prop_frustum = if rebuild {
+                    &main_frustum
+                } else {
+                    seen = Frustum::from_view_proj(&within.view_proj);
+                    &seen
+                };
                 // The settled props first: they stand nearest and cover most of the picture.
-                self.draw_props(enc, slot_index, 0, PropSet::Settled, None);
+                self.draw_props(enc, slot_index, 0, PropSet::Settled, Some(prop_frustum));
                 enc.set_pipeline(p.cache_scene[1]);
                 enc.set_bind_group(0, slot.scene[0]);
                 count(self.draw_world(enc, &mut push, &within, true, WorldPart::Opaque, None));
@@ -1075,25 +1095,22 @@ impl Renderer {
         if let Some(plan) = &reshade {
             // Mark the pixels to shade again (depth 0; elsewhere 1, which nothing passes), then
             // draw what the picture holds over them alone, as the picture was drawn.
-            device.write_buffer(slot.reshade, 0, &crate::gpu::u32_bytes(&plan.block))?;
+            device.write_buffer_u32(slot.reshade, 0, &plan.block)?;
             let [x0, y0, x1, y1] = plan.region;
             let keep = |texture| Attachment {
                 load: Load::Load,
                 ..Attachment::clear(texture, clear)
             };
-            enc.begin_pass(PassDesc {
-                colors: vec![],
-                depth: Some(Attachment::clear(t.reshade_depth, [1.0; 4])),
-            });
+            enc.begin_pass_slice(&[], Some(Attachment::clear(t.reshade_depth, [1.0; 4])));
             enc.set_scissor(x0, y0, x1 - x0, y1 - y0);
             enc.set_pipeline(p.reshade_mask);
             enc.set_bind_group(0, slot.mask);
             enc.draw(3, 1, 0, 0);
             enc.end_pass();
-            enc.begin_pass(PassDesc {
-                colors: vec![keep(t.cache_hdr), keep(t.cache_aux), keep(t.cache_shadow)],
-                depth: Some(keep(t.reshade_depth)),
-            });
+            enc.begin_pass_slice(
+                &[keep(t.cache_hdr), keep(t.cache_aux), keep(t.cache_shadow)],
+                Some(keep(t.reshade_depth)),
+            );
             enc.set_scissor(x0, y0, x1 - x0, y1 - y0);
             let within = eye.within(&plan.region, size);
             // The settled props with a pixel in the region (the rest draw none there).
@@ -1120,8 +1137,8 @@ impl Renderer {
         };
         if let Some((kept, rects)) = water_regions {
             enc.blit((t.cache_depth, 0, 0), (t.depth, 0, 0), Filter::Nearest);
-            enc.begin_pass(PassDesc {
-                colors: vec![Attachment {
+            enc.begin_pass_slice(
+                &[Attachment {
                     load: if water_whole {
                         Load::Clear(clear)
                     } else {
@@ -1129,12 +1146,12 @@ impl Renderer {
                     },
                     ..Attachment::clear(kept, clear)
                 }],
-                depth: Some(Attachment {
+                Some(Attachment {
                     load: Load::Load,
                     store: false,
                     ..Attachment::clear(t.depth, clear)
                 }),
-            });
+            );
             enc.set_pipeline(p.water_static);
             enc.set_bind_group(0, slot.scene[0]);
             for r in rects {
@@ -1148,7 +1165,7 @@ impl Renderer {
         }
         let water_kept = match (slot.water, &water_block) {
             (Some((group, moved)), Some(block)) => {
-                device.write_buffer(moved, 0, &crate::gpu::u32_bytes(block))?;
+                device.write_buffer_u32(moved, 0, block)?;
                 stats.water_kept = true;
                 stats.water_footprints = block[0];
                 Some(group)
@@ -1168,8 +1185,8 @@ impl Renderer {
         } else {
             Load::Clear(clear)
         };
-        enc.begin_pass(PassDesc {
-            colors: vec![
+        enc.begin_pass_slice(
+            &[
                 Attachment {
                     load: main_color_load,
                     ..Attachment::clear(t.hdr, clear)
@@ -1179,7 +1196,7 @@ impl Renderer {
                     ..Attachment::clear(t.aux, clear)
                 },
             ],
-            depth: Some(Attachment {
+            Some(Attachment {
                 load: if cached {
                     Load::Load
                 } else {
@@ -1187,7 +1204,7 @@ impl Renderer {
                 },
                 ..Attachment::clear(t.depth, clear)
             }),
-        });
+        );
         // Timing each part (`split_passes`): the pass ends and goes on as another.
         let splits = self.split_passes && cached;
         let split = |enc: &mut crate::gpu::Encoder| {
@@ -1197,10 +1214,7 @@ impl Renderer {
                     ..Attachment::clear(texture, clear)
                 };
                 enc.end_pass();
-                enc.begin_pass(PassDesc {
-                    colors: vec![keep(t.hdr), keep(t.aux)],
-                    depth: Some(keep(t.depth)),
-                });
+                enc.begin_pass_slice(&[keep(t.hdr), keep(t.aux)], Some(keep(t.depth)));
             }
         };
         if cached {
@@ -1209,11 +1223,11 @@ impl Renderer {
             enc.set_bind_group(0, slot.restore);
             enc.draw(3, 1, 0, 0);
             split(enc);
-            self.draw_props(enc, slot_index, 0, PropSet::Live, None);
+            self.draw_props(enc, slot_index, 0, PropSet::Live, Some(&main_frustum));
         } else {
             // The game's props first: the table and its players stand nearest and cover most
             // of the screen, so the world behind them fails the depth test before it is shaded.
-            self.draw_props(enc, slot_index, 0, PropSet::All, None);
+            self.draw_props(enc, slot_index, 0, PropSet::All, Some(&main_frustum));
             enc.set_pipeline(p.scene_opaque);
             enc.set_bind_group(0, slot.scene[0]);
             count(self.draw_world(enc, &mut push, &eye, true, WorldPart::Opaque, None));
@@ -1283,7 +1297,7 @@ impl Renderer {
                     [0.7, 0.75, 0.85, 0.3],
                     boxes[0],
                 );
-                enc.push_constants(&f32_bytes(&pp));
+                enc.push_f32(&pp);
                 enc.draw(6, rain, 0, 0);
             }
             let petals = (env.petals * 3500.0) as u32;
@@ -1293,12 +1307,12 @@ impl Renderer {
                     [0.95, 0.5, 0.62, 0.9],
                     boxes[1],
                 );
-                enc.push_constants(&f32_bytes(&pp));
+                enc.push_f32(&pp);
                 enc.draw(6, petals, 0, 0);
             }
         }
         split(enc);
-        self.draw_blended_props(enc, slot_index);
+        self.draw_blended_props(enc, slot_index, Some(&main_frustum));
         enc.end_pass();
 
         let l = &self.look;
@@ -1452,23 +1466,23 @@ impl Renderer {
             }
         }
         if self.has_overlays() {
-            enc.begin_pass(PassDesc {
-                colors: vec![Attachment {
+            enc.begin_pass_slice(
+                &[Attachment {
                     texture: dest,
                     mip: 0,
                     layer: 0,
                     load: Load::Load,
                     store: true,
                 }],
-                depth: Some(Attachment {
+                Some(Attachment {
                     texture: t.depth,
                     mip: 0,
                     layer: 0,
                     load: Load::Load,
                     store: false,
                 }),
-            });
-            self.draw_overlays(enc, slot_index, encode_srgb);
+            );
+            self.draw_overlays(enc, slot_index, encode_srgb, Some(&main_frustum));
             enc.end_pass();
         }
         if let (Output::Still, Some(still), Some(rb)) = (self.output, t.still, t.readback) {

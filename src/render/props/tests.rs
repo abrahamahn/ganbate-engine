@@ -260,7 +260,9 @@ fn shadow_maps_are_drawn_again_once_a_caster_drifted_far_enough() {
         .instances
         .insert(instance_entry(quad, caster))
         .unwrap();
-    props.share_joints(&[figure], &[math::IDENTITY; 2]).unwrap();
+    props
+        .share_joints(&[PropInstance(figure)], &[math::IDENTITY; 2])
+        .unwrap();
     let pillar = props
         .instances
         .insert(instance_entry(plain, shadeless))
@@ -280,7 +282,9 @@ fn shadow_maps_are_drawn_again_once_a_caster_drifted_far_enough() {
     };
     let lift = |props: &mut Props, texels: f32| {
         let joints = [math::IDENTITY, translation_matrix(0.0, texels * texel, 0.0)];
-        props.share_joints(&[figure], &joints).unwrap();
+        props
+            .share_joints(&[PropInstance(figure)], &joints)
+            .unwrap();
     };
 
     // A caster appearing counts; the maps then hold it.
@@ -622,21 +626,22 @@ fn instances_share_joint_sets_until_the_last_of_them_goes() {
     let ids: Vec<u32> = (0..3)
         .map(|_| props.instances.insert(instance_entry(mesh, mat)).unwrap())
         .collect();
+    let handles: Vec<PropInstance> = ids.iter().copied().map(PropInstance).collect();
     let pose = |y: f32| [math::IDENTITY, translation_matrix(0.0, y, 0.0)];
     let set_of = |props: &Props, id: u32| props.instances.get(id).unwrap().joints;
     let users = |props: &Props, set: u32| props.joint_sets.get(set).map(|s| s.users);
 
     // One set for all three, written in place while it is theirs alone.
-    props.share_joints(&ids, &pose(1.0)).unwrap();
+    props.share_joints(&handles, &pose(1.0)).unwrap();
     let set = set_of(&props, ids[0]).unwrap();
-    props.share_joints(&ids, &pose(2.0)).unwrap();
+    props.share_joints(&handles, &pose(2.0)).unwrap();
     assert!(ids.iter().all(|&id| set_of(&props, id) == Some(set)));
     assert_eq!(users(&props, set), Some(3));
 
     // Given the same matrices of its own, an instance stays the same frame to frame.
     props.pose_instances();
     let still = props.instances.get(ids[0]).unwrap().still;
-    props.share_joints(&ids[..1], &pose(2.0)).unwrap();
+    props.share_joints(&handles[..1], &pose(2.0)).unwrap();
     props.pose_instances();
     assert_eq!(props.instances.get(ids[0]).unwrap().still, still + 1);
     let own = set_of(&props, ids[0]).unwrap();
@@ -645,7 +650,7 @@ fn instances_share_joint_sets_until_the_last_of_them_goes() {
 
     // Named twice, an instance counts once; a set goes with the last instance following it.
     props
-        .share_joints(&[ids[1], ids[1], ids[2]], &pose(4.0))
+        .share_joints(&[handles[1], handles[1], handles[2]], &pose(4.0))
         .unwrap();
     let shared = set_of(&props, ids[1]).unwrap();
     assert_eq!(users(&props, shared), Some(2));
@@ -655,15 +660,17 @@ fn instances_share_joint_sets_until_the_last_of_them_goes() {
     let matrices = |props: &Props, id: u32| {
         joints_of(&props.joint_sets, props.instances.get(id).unwrap()).to_vec()
     };
-    props.share_joints(&[ids[1], ids[1]], &pose(6.0)).unwrap();
+    props
+        .share_joints(&[handles[1], handles[1]], &pose(6.0))
+        .unwrap();
     assert_eq!(matrices(&props, ids[1]), pose(6.0));
     assert_eq!(matrices(&props, ids[2]), pose(4.0));
     assert_eq!(set_of(&props, ids[2]), Some(shared));
     assert_eq!(users(&props, shared), Some(1));
-    props.share_joints(&ids[1..], &pose(4.0)).unwrap();
+    props.share_joints(&handles[1..], &pose(4.0)).unwrap();
     let shared = set_of(&props, ids[1]).unwrap();
     assert_eq!(users(&props, shared), Some(2));
-    props.share_joints(&ids[..1], &[]).unwrap();
+    props.share_joints(&handles[..1], &[]).unwrap();
     assert_eq!((set_of(&props, ids[0]), users(&props, own)), (None, None));
     props.share_joints(&[], &pose(5.0)).unwrap();
     props.remove_instance(ids[1]);
@@ -1364,6 +1371,102 @@ fn shared_joint_set_settles_still_submeshes_and_clips_near_boxes() {
     let errs = device.validation_errors();
     assert!(errs.is_empty(), "validation errors: {errs:?}");
     for r in [&mut cached, &mut whole] {
+        r.destroy_props(&mut device);
+    }
+}
+
+#[test]
+fn blended_and_overlay_batches_coalesce_adjacent_runs_while_preserving_depth_order() {
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "android",
+        target_vendor = "apple"
+    )))]
+    return;
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "windows",
+        target_os = "android",
+        target_vendor = "apple"
+    ))]
+    {
+        let Ok(mut device) = Device::headless() else {
+            return;
+        };
+        let mut r = Renderer::new(
+            &mut device,
+            &crate::world::World::default(),
+            crate::render::Look::default(),
+            crate::render::Quality::low_cost(),
+            (64, 64),
+            crate::render::Output::Still,
+        )
+        .expect("renderer");
+        let mesh = r
+            .create_prop_mesh(
+                &mut device,
+                &MeshData {
+                    positions: &[[-0.1, -0.1, 0.0], [0.1, -0.1, 0.0], [0.0, 0.1, 0.0]],
+                    normals: &[[0.0, 0.0, 1.0]; 3],
+                    uvs: &[[0.0, 0.0]; 3],
+                    indices: &[0, 1, 2],
+                },
+            )
+            .expect("mesh");
+        let overlay_a = r
+            .create_prop_material(
+                &mut device,
+                &MaterialDesc {
+                    overlay: true,
+                    blend: BlendMode::Alpha,
+                    order: 1.0,
+                    casts_shadow: false,
+                    ..MaterialDesc::default()
+                },
+            )
+            .expect("overlay_a");
+        let overlay_b = r
+            .create_prop_material(
+                &mut device,
+                &MaterialDesc {
+                    overlay: true,
+                    blend: BlendMode::Alpha,
+                    order: 1.0,
+                    casts_shadow: false,
+                    ..MaterialDesc::default()
+                },
+            )
+            .expect("overlay_b");
+        let place = |z: f32| {
+            let mut m = math::IDENTITY;
+            m[14] = z;
+            m
+        };
+        // Eye at z=0 looking down -z: z=-5 and z=-4 use overlay_a (coalesced -> count=2),
+        // z=-3 uses overlay_b (count=1), z=-2 and z=-1 use overlay_a (coalesced -> count=2).
+        for (mat, z) in [
+            (overlay_a, -5.0),
+            (overlay_a, -4.0),
+            (overlay_b, -3.0),
+            (overlay_a, -2.0),
+            (overlay_a, -1.0),
+        ] {
+            r.create_prop_instance(mesh, mat, &place(z))
+                .expect("instance");
+        }
+        r.prepare_props(&mut device, 0, [0.0, 0.0, 0.0])
+            .expect("prepare_props");
+        let summary: Vec<(u32, u32)> = r
+            .props
+            .batches
+            .iter()
+            .map(|b| (b.material, b.count))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![(overlay_a.0, 2), (overlay_b.0, 1), (overlay_a.0, 2)]
+        );
         r.destroy_props(&mut device);
     }
 }

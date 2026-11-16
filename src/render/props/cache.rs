@@ -37,10 +37,9 @@ pub(super) const SETTLE_FRAMES: u32 = 8;
 pub(in crate::render) const SHADOW_DRIFT_TEXELS: f32 = 0.0;
 
 /// Hashes the bytes of `values` (as [`f32_bytes`] gives them, without making them).
+#[inline]
 pub(super) fn hash_f32s(h: &mut Fnv, values: &[f32]) {
-    for v in values {
-        h.write(&v.to_le_bytes());
-    }
+    crate::gpu::with_le_bytes_f32(values, |bytes| h.write(bytes));
 }
 
 /// What an instance's picture depends on besides the frame: where and how it is drawn, its
@@ -227,28 +226,34 @@ pub(in crate::render) fn box_rect(
 ) -> Option<Rect> {
     const FRONT: f32 = 1e-4;
     let clip = corners((lo, hi)).map(|p| math::transform(view_proj, [p[0], p[1], p[2], 1.0]));
-    let mut points: Vec<[f32; 4]> = clip.iter().copied().filter(|c| c[3] >= FRONT).collect();
+    let (w, h) = (size.0 as f32, size.1 as f32);
+    let (mut plo, mut phi) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
+    let mut push = |c: [f32; 4]| {
+        let p = [(c[0] / c[3] * 0.5 + 0.5) * w, (c[1] / c[3] * 0.5 + 0.5) * h];
+        plo = [plo[0].min(p[0]), plo[1].min(p[1])];
+        phi = [phi[0].max(p[0]), phi[1].max(p[1])];
+    };
+    for &c in &clip {
+        if c[3] >= FRONT {
+            push(c);
+        }
+    }
     for i in 0..8 {
-        for j in [1, 2, 4].map(|bit| i | bit).into_iter().filter(|&j| j != i) {
-            let (a, b) = (clip[i], clip[j]);
-            if (a[3] < FRONT) != (b[3] < FRONT) {
-                let f = (FRONT - a[3]) / (b[3] - a[3]);
-                points.push(std::array::from_fn(|k| a[k] + (b[k] - a[k]) * f));
+        for bit in [1, 2, 4] {
+            if i & bit == 0 {
+                let (a, b) = (clip[i], clip[i | bit]);
+                if (a[3] < FRONT) != (b[3] < FRONT) {
+                    let f = (FRONT - a[3]) / (b[3] - a[3]);
+                    push(std::array::from_fn(|k| a[k] + (b[k] - a[k]) * f));
+                }
             }
         }
     }
-    let (w, h) = (size.0 as f32, size.1 as f32);
-    let (mut lo, mut hi) = ([f32::INFINITY; 2], [f32::NEG_INFINITY; 2]);
-    for c in &points {
-        let p = [(c[0] / c[3] * 0.5 + 0.5) * w, (c[1] / c[3] * 0.5 + 0.5) * h];
-        lo = [lo[0].min(p[0]), lo[1].min(p[1])];
-        hi = [hi[0].max(p[0]), hi[1].max(p[1])];
-    }
     let r = [
-        (lo[0] - margin).floor().clamp(0.0, w) as u32,
-        (lo[1] - margin).floor().clamp(0.0, h) as u32,
-        (hi[0] + margin).ceil().clamp(0.0, w) as u32,
-        (hi[1] + margin).ceil().clamp(0.0, h) as u32,
+        (plo[0] - margin).floor().clamp(0.0, w) as u32,
+        (plo[1] - margin).floor().clamp(0.0, h) as u32,
+        (phi[0] + margin).ceil().clamp(0.0, w) as u32,
+        (phi[1] + margin).ceil().clamp(0.0, h) as u32,
     ];
     (r[0] < r[2] && r[1] < r[3]).then_some(r)
 }
@@ -542,8 +547,11 @@ pub(super) fn write_changed(
     };
     let unit = device.write_granularity(buffer);
     for run in changed_runs(data.len() / row, row * 4, unit, changed) {
-        let bytes = f32_bytes(&data[run.start * row..run.end * row]);
-        device.write_buffer(buffer, (run.start * row * 4) as u64, &bytes)?;
+        device.write_buffer_f32(
+            buffer,
+            (run.start * row * 4) as u64,
+            &data[run.start * row..run.end * row],
+        )?;
     }
     std::mem::swap(held, data);
     Ok(())
@@ -680,6 +688,8 @@ pub(in crate::render) struct Props {
     /// This frame's instance and joint rows as `prepare_props` makes them (kept to reuse).
     pub(super) rows: Vec<f32>,
     pub(super) joint_rows: Vec<f32>,
+    /// Interleaved vertex staging buffer reused across [`Renderer::update_prop_mesh_range`] calls.
+    pub(super) morph_scratch: Vec<f32>,
     /// World bounds of this frame's visible instances.
     pub(super) bounds: Option<(V3, V3)>,
 }
@@ -841,30 +851,36 @@ impl Props {
         }
     }
 
-    /// Makes `ids` (live instances) follow one joint set holding `joints` (`[]`: none, drawn as
+    /// Makes `instances` (live instances) follow one joint set holding `joints` (`[]`: none, drawn as
     /// modelled): the one they follow already when it is theirs alone, or a new one.
-    pub(super) fn share_joints(&mut self, ids: &[u32], joints: &[M4]) -> Result<()> {
-        if let Some(&id) = ids.iter().find(|&&id| self.instances.get(id).is_none()) {
-            return Err(format!("{:?} was destroyed", PropInstance(id)));
+    pub(super) fn share_joints(&mut self, instances: &[PropInstance], joints: &[M4]) -> Result<()> {
+        if let Some(&inst) = instances
+            .iter()
+            .find(|&&inst| self.instances.get(inst.0).is_none())
+        {
+            return Err(format!("{inst:?} was destroyed"));
         }
-        if ids.is_empty() {
+        if instances.is_empty() {
             return Ok(());
         }
-        // The set is theirs alone when its users are `ids`: as many as they, each following it,
-        // none named twice (else another user could hide behind the count).
-        let distinct = ids.iter().enumerate().all(|(k, id)| !ids[..k].contains(id));
-        let theirs = ids
+        // The set is theirs alone when its users are `instances`: as many as they, each following
+        // it, none named twice (else another user could hide behind the count).
+        let distinct = instances
+            .iter()
+            .enumerate()
+            .all(|(k, inst)| !instances[..k].contains(inst));
+        let theirs = instances
             .first()
-            .and_then(|&id| self.instances.get(id)?.joints)
+            .and_then(|inst| self.instances.get(inst.0)?.joints)
             .filter(|&set| {
                 distinct
                     && self
                         .joint_sets
                         .get(set)
-                        .is_some_and(|s| s.users as usize == ids.len())
-                    && ids.iter().all(|&id| {
+                        .is_some_and(|s| s.users as usize == instances.len())
+                    && instances.iter().all(|inst| {
                         self.instances
-                            .get(id)
+                            .get(inst.0)
                             .is_some_and(|i| i.joints == Some(set))
                     })
             });
@@ -883,8 +899,8 @@ impl Props {
                 placed: 0,
             })?)
         };
-        for &id in ids {
-            let Some(i) = self.instances.get_mut(id).filter(|i| i.joints != set) else {
+        for &inst in instances {
+            let Some(i) = self.instances.get_mut(inst.0).filter(|i| i.joints != set) else {
                 continue;
             };
             let old = std::mem::replace(&mut i.joints, set);

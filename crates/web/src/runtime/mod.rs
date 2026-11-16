@@ -52,11 +52,12 @@ struct Runtime {
 }
 
 impl Runtime {
-    fn active_view(&self) -> View {
+    #[inline]
+    fn with_active_view<R>(&self, f: impl FnOnce(&View) -> R) -> R {
         match self.stereo_eye {
-            -1 => compute_stereo_views(&self.view, self.stereo_ipd_metres).left,
-            1 => compute_stereo_views(&self.view, self.stereo_ipd_metres).right,
-            _ => self.view.clone(),
+            -1 => f(&compute_stereo_views(&self.view, self.stereo_ipd_metres).left),
+            1 => f(&compute_stereo_views(&self.view, self.stereo_ipd_metres).right),
+            _ => f(&self.view),
         }
     }
 }
@@ -117,6 +118,21 @@ unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> &'a [u8] {
         // SAFETY: the caller guarantees the range is readable.
         unsafe { std::slice::from_raw_parts(ptr, len) }
     }
+}
+
+/// `N` little-endian f32 at `ptr` (any alignment) on the stack without heap allocation.
+///
+/// # Safety
+/// As [`bytes`] for `N * 4` bytes.
+#[inline]
+unsafe fn float_array<const N: usize>(ptr: *const u8) -> [f32; N] {
+    // SAFETY: forwarded.
+    let raw = unsafe { bytes(ptr, N * 4) };
+    let mut out = [0.0f32; N];
+    for (dst, b) in out.iter_mut().zip(raw.chunks_exact(4)) {
+        *dst = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+    }
+    out
 }
 
 /// `count` little-endian f32 at `ptr` (any alignment).
@@ -278,8 +294,12 @@ pub unsafe extern "C" fn ganbate_rt_set_look(ptr: *const u8, len: usize) -> u32 
 /// `ptr` must address 68 readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ganbate_rt_set_view(ptr: *const u8) -> u32 {
+    if ptr.is_null() {
+        say(2, "set_view: null buffer");
+        return 0;
+    }
     // SAFETY: the caller passes 17 floats.
-    let v = unsafe { floats(ptr, 17) };
+    let v = unsafe { float_array::<17>(ptr) };
     with(0, |rt| {
         if v.iter().any(|x| !x.is_finite()) {
             return Err("set_view: values must be finite".into());
@@ -301,16 +321,17 @@ pub unsafe extern "C" fn ganbate_rt_set_view(ptr: *const u8) -> u32 {
                 v[13], v[14], v[15]
             ));
         }
-        rt.view = View {
-            name: "host".into(),
-            eye: [v[0], v[1], v[2]],
-            target: [v[3], v[4], v[5]],
-            up: [v[6], v[7], v[8]],
-            fov: v[9],
-            shift: [v[10], v[11]],
-            near: v[12],
-            focus,
-        };
+        if rt.view.name != "host" {
+            rt.view.name.clear();
+            rt.view.name.push_str("host");
+        }
+        rt.view.eye = [v[0], v[1], v[2]];
+        rt.view.target = [v[3], v[4], v[5]];
+        rt.view.up = [v[6], v[7], v[8]];
+        rt.view.fov = v[9];
+        rt.view.shift = [v[10], v[11]];
+        rt.view.near = v[12];
+        rt.view.focus = focus;
         Ok(1)
     })
 }
@@ -350,9 +371,10 @@ pub extern "C" fn ganbate_rt_set_lamp_boost(boost: f32) -> u32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ganbate_rt_set_weather(ptr: *const u8, len: usize) -> u32 {
     // SAFETY: the caller passes a readable range.
-    let name = String::from_utf8_lossy(unsafe { bytes(ptr, len) }).into_owned();
+    let raw = unsafe { bytes(ptr, len) };
     with(0, |rt| {
-        rt.weather = Weather::preset(&name).ok_or_else(|| format!("unknown weather {name:?}"))?;
+        let name = std::str::from_utf8(raw).map_err(|_| "unknown weather (invalid UTF-8)")?;
+        rt.weather = Weather::preset(name).ok_or_else(|| format!("unknown weather {name:?}"))?;
         Ok(1)
     })
 }
@@ -376,12 +398,23 @@ pub extern "C" fn ganbate_rt_render() -> u32 {
             rt.seconds,
         );
         env.lamp_level *= rt.lamp_boost;
-        let active_view = rt.active_view();
+        let stereo_view;
+        let active_view = match rt.stereo_eye {
+            -1 => {
+                stereo_view = compute_stereo_views(&rt.view, rt.stereo_ipd_metres).left;
+                &stereo_view
+            }
+            1 => {
+                stereo_view = compute_stereo_views(&rt.view, rt.stereo_ipd_metres).right;
+                &stereo_view
+            }
+            _ => &rt.view,
+        };
         let mut enc = rt.device.encoder();
         rt.renderer.encode(
             &mut rt.device,
             &mut enc,
-            &active_view,
+            active_view,
             &env,
             [0.0, 0.0],
             0,
@@ -574,10 +607,24 @@ pub unsafe extern "C" fn ganbate_rt_size(out: *mut u8) -> u32 {
 
 /// # Safety
 /// `out` must address `v.len() * 4` writable bytes.
+#[inline]
 unsafe fn write_floats(out: *mut u8, v: &[f32]) {
-    let b: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
-    // SAFETY: forwarded.
-    unsafe { std::ptr::copy_nonoverlapping(b.as_ptr(), out, b.len()) };
+    if out.is_null() || v.is_empty() {
+        return;
+    }
+    #[cfg(target_endian = "little")]
+    {
+        // SAFETY: `f32` has identical bit representation in little-endian memory and `copy_nonoverlapping`
+        // over `u8` requires only 1-byte alignment on `out`.
+        unsafe { std::ptr::copy_nonoverlapping(v.as_ptr().cast::<u8>(), out, v.len() * 4) };
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        for (i, x) in v.iter().enumerate() {
+            let le = x.to_le_bytes();
+            unsafe { std::ptr::copy_nonoverlapping(le.as_ptr(), out.add(i * 4), 4) };
+        }
+    }
 }
 
 #[cfg(test)]

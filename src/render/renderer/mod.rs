@@ -6,11 +6,13 @@
 //! painterly filter and the final output with sharpening (a swapchain image or a readback
 //! target).
 
+#[allow(unused_imports)]
 use crate::gpu::{
     Address, Attachment, BindGroupId, Blend, BufferDesc, BufferId, BufferUsage, ColorTarget,
     Compare, Cull, DepthState, Device, Encoder, Filter, Format, Load, Memory, PassDesc, PipelineId,
     RenderPipelineDesc, Resource, Result, SamplerDesc, SamplerId, TextureDesc, TextureId,
     TextureUsage, Topology, VertexAttribute, VertexFormat, VertexLayout, f32_bytes,
+    with_le_bytes_f32,
 };
 use ganbate_shader::{Compiled, SpecValue, Stage};
 
@@ -456,6 +458,8 @@ pub struct Renderer {
     world_cache: Option<u64>,
     /// The part of the grass grid this frame draws ([`Renderer::visible_grass`]).
     grass_grid: [u32; 4],
+    /// Memoized `visible_grass` result while the view, ground window, and grass dimensions hold.
+    grass_cache: Option<(GrassKey, [u32; 4])>,
     /// The world's draws' bounds for re-shading the cached picture, as of `world_cache`.
     receivers: Option<ReceiverBounds>,
     /// The water's lamp light and shadow kept with the cached picture (`cache_water`): `None`
@@ -522,17 +526,58 @@ pub struct Renderer {
     stats: FrameStats,
 }
 
-/// Builds the `Frame` uniform block in WGSL layout.
-struct Block(Vec<f32>);
-impl Block {
-    fn m(&mut self, m: &M4) {
-        self.0.extend_from_slice(m);
+type GrassKey = ([u32; 16], [u32; 3], u32, u32, u32, u32);
+
+/// Builds the `Frame` uniform block in WGSL layout on the stack without heap allocation.
+pub(super) struct FrameBlock {
+    bytes: [u8; FRAME_BYTES as usize],
+    len: usize,
+}
+impl FrameBlock {
+    pub(super) const fn new() -> Self {
+        Self {
+            bytes: [0u8; FRAME_BYTES as usize],
+            len: 0,
+        }
     }
-    fn v(&mut self, v: V3, w: f32) {
-        self.0.extend_from_slice(&[v[0], v[1], v[2], w]);
+    #[inline]
+    pub(super) fn push_u32(&mut self, v: u32) {
+        self.bytes[self.len..self.len + 4].copy_from_slice(&v.to_le_bytes());
+        self.len += 4;
     }
-    fn f(&mut self, a: f32, b: f32, c: f32, d: f32) {
-        self.0.extend_from_slice(&[a, b, c, d]);
+    #[inline]
+    pub(super) fn push_f32(&mut self, v: f32) {
+        self.push_u32(v.to_bits());
+    }
+    #[inline]
+    pub(super) fn m(&mut self, m: &M4) {
+        #[cfg(target_endian = "little")]
+        {
+            let src = crate::gpu::as_le_bytes_f32(m);
+            self.bytes[self.len..self.len + 64].copy_from_slice(src);
+            self.len += 64;
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            for &x in m {
+                self.push_f32(x);
+            }
+        }
+    }
+    #[inline]
+    pub(super) fn v(&mut self, v: V3, w: f32) {
+        self.f(v[0], v[1], v[2], w);
+    }
+    #[inline]
+    pub(super) fn f(&mut self, a: f32, b: f32, c: f32, d: f32) {
+        self.push_f32(a);
+        self.push_f32(b);
+        self.push_f32(c);
+        self.push_f32(d);
+    }
+    #[inline]
+    pub(super) fn as_slice(&self) -> &[u8] {
+        &self.bytes[..self.len]
     }
 }
 

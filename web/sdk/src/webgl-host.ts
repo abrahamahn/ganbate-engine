@@ -321,29 +321,47 @@ export function createGlHost(
   const texture = (h: number): GlTextureRecord =>
     h >>> 0 === GL_SURFACE ? ensureSurface()! : (objects[h >>> 0] as GlTextureRecord);
 
+  const PASS_DRAW_BUFFERS: readonly number[][] = Array.from({ length: 9 }, (_, n) =>
+    n === 0 ? [gl.NONE] : Array.from({ length: n }, (_, k) => gl.COLOR_ATTACHMENT0 + k),
+  );
+  const PASS_DRAW_MASKS: readonly number[] = Array.from({ length: 9 }, (_, n) => ((1 << n) - 1) | (n << 16));
   const fbos = new Map<string, GlFramebufferWithUids>();
   const attach = (point: number, t: GlTextureRecord, mip: number, layer: number) => {
     if (t.target === gl.TEXTURE_2D_ARRAY) gl.framebufferTextureLayer(gl.FRAMEBUFFER, point, t.tex, mip, layer);
     else gl.framebufferTexture2D(gl.FRAMEBUFFER, point, gl.TEXTURE_2D, t.tex, mip);
   };
   const framebuffer = (
-    colors: { t: GlTextureRecord; mip: number; layer: number }[],
+    colors: readonly { t: GlTextureRecord; mip: number; layer: number }[],
     depth: { t: GlTextureRecord; mip: number; layer: number } | null,
+    colorCount = colors.length,
   ) => {
-    const key = [...colors, depth].map((a) => (a ? `${a.t.uid}.${a.mip}.${a.layer}` : '-')).join('|');
+    let key = '';
+    for (let i = 0; i < colorCount; i++) {
+      const a = colors[i];
+      key += `${a.t.uid}.${a.mip}.${a.layer}|`;
+    }
+    key += depth ? `${depth.t.uid}.${depth.mip}.${depth.layer}` : '-';
     let f = fbos.get(key);
     if (!f) {
       f = gl.createFramebuffer() as GlFramebufferWithUids;
       gl.bindFramebuffer(gl.FRAMEBUFFER, f);
-      colors.forEach((a, i) => attach(gl.COLOR_ATTACHMENT0 + i, a.t, a.mip, a.layer));
-      if (depth) attach(gl.DEPTH_ATTACHMENT, depth.t, depth.mip, depth.layer);
-      gl.drawBuffers(colors.length ? colors.map((_, i) => gl.COLOR_ATTACHMENT0 + i) : [gl.NONE]);
+      const uids: number[] = [];
+      for (let i = 0; i < colorCount; i++) {
+        const a = colors[i];
+        attach(gl.COLOR_ATTACHMENT0 + i, a.t, a.mip, a.layer);
+        uids.push(a.t.uid);
+      }
+      if (depth) {
+        attach(gl.DEPTH_ATTACHMENT, depth.t, depth.mip, depth.layer);
+        uids.push(depth.t.uid);
+      }
+      gl.drawBuffers(PASS_DRAW_BUFFERS[colorCount] ?? colors.slice(0, colorCount).map((_, i) => gl.COLOR_ATTACHMENT0 + i));
       const status = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
       if (status !== gl.FRAMEBUFFER_COMPLETE) {
         gl.deleteFramebuffer(f);
         throw new Error(`framebuffer incomplete (0x${status.toString(16)}) for ${key}`);
       }
-      f.uids = [...colors, depth].filter((a): a is NonNullable<typeof a> => Boolean(a)).map((a) => a.t.uid);
+      f.uids = uids;
       fbos.set(key, f);
     } else {
       gl.bindFramebuffer(gl.FRAMEBUFFER, f);
@@ -433,9 +451,9 @@ export function createGlHost(
       fixed.bias = p.bias;
       fixed.slope = p.slope;
     }
-    if (p.targets.length && fixed.drawBuffers !== p.drawBuffers) {
-      gl.drawBuffers(p.targets.map((t: { mask: number }, i: number) => (t.mask ? gl.COLOR_ATTACHMENT0 + i : gl.NONE)));
-      fixed.drawBuffers = p.drawBuffers;
+    if (p.targets.length && fixed.drawBuffers !== p.drawBuffersMask) {
+      gl.drawBuffers(p.drawBuffersList);
+      fixed.drawBuffers = p.drawBuffersMask;
     }
     if (p.indexed) {
       const x = ext.indexed!;
@@ -678,6 +696,30 @@ export function createGlHost(
     current = null;
   };
 
+  const clearColorBuf = new Float32Array(4);
+  const clearDepthBuf = new Float32Array(1);
+  const passColors: {
+    t: GlTextureRecord;
+    mip: number;
+    layer: number;
+    load: number;
+    store: number;
+    clear0: number;
+    clear1: number;
+    clear2: number;
+    clear3: number;
+  }[] = [];
+  const passDepth = {
+    t: null as unknown as GlTextureRecord,
+    mip: 0,
+    layer: 0,
+    load: 0,
+    store: 0,
+    clear: 0,
+  };
+  const passDontCare: number[] = [];
+  const passDiscard: number[] = [];
+
   const execute = (cmdPtr: number, words: number, pushPtr: number, pushLen: number) => {
     const c = u32(cmdPtr, words);
     const f = new Float32Array(memory.buffer, cmdPtr >>> 0, words >>> 0);
@@ -693,7 +735,7 @@ export function createGlHost(
       }
       gl.bufferSubData(gl.UNIFORM_BUFFER, 0, u8(pushPtr, uPushLen));
     }
-    let discard: number[] = [];
+    passDiscard.length = 0;
     let i = 0;
     while (i < c.length) {
       const op = c[i++];
@@ -702,81 +744,97 @@ export function createGlHost(
           // BEGIN_PASS
           const colors = c[i++];
           const hasDepth = c[i++];
-          const cs: {
-            t: GlTextureRecord;
-            mip: number;
-            layer: number;
-            load: number;
-            store: number;
-            clear: number[];
-          }[] = [];
           for (let k = 0; k < colors; k++) {
-            cs.push({
-              t: texture(c[i]),
-              mip: c[i + 1],
-              layer: c[i + 2],
-              load: c[i + 3],
-              store: c[i + 4],
-              clear: [f[i + 5], f[i + 6], f[i + 7], f[i + 8]],
-            });
+            let slot = passColors[k];
+            if (!slot) {
+              slot = {
+                t: texture(c[i]),
+                mip: c[i + 1],
+                layer: c[i + 2],
+                load: c[i + 3],
+                store: c[i + 4],
+                clear0: f[i + 5],
+                clear1: f[i + 6],
+                clear2: f[i + 7],
+                clear3: f[i + 8],
+              };
+              passColors[k] = slot;
+            } else {
+              slot.t = texture(c[i]);
+              slot.mip = c[i + 1];
+              slot.layer = c[i + 2];
+              slot.load = c[i + 3];
+              slot.store = c[i + 4];
+              slot.clear0 = f[i + 5];
+              slot.clear1 = f[i + 6];
+              slot.clear2 = f[i + 7];
+              slot.clear3 = f[i + 8];
+            }
             i += 9;
           }
-          let depth: {
-            t: GlTextureRecord;
-            mip: number;
-            layer: number;
-            load: number;
-            store: number;
-            clear: number;
-          } | null = null;
+          let depth: typeof passDepth | null = null;
           if (hasDepth) {
-            depth = {
-              t: texture(c[i]),
-              mip: c[i + 1],
-              layer: c[i + 2],
-              load: c[i + 3],
-              store: c[i + 4],
-              clear: f[i + 5],
-            };
+            passDepth.t = texture(c[i]);
+            passDepth.mip = c[i + 1];
+            passDepth.layer = c[i + 2];
+            passDepth.load = c[i + 3];
+            passDepth.store = c[i + 4];
+            passDepth.clear = f[i + 5];
+            depth = passDepth;
             i += 6;
           }
-          framebuffer(cs, depth);
-          gl.drawBuffers(cs.length ? cs.map((_, k) => gl.COLOR_ATTACHMENT0 + k) : [gl.NONE]);
-          fixed.drawBuffers = cs.map(() => 1).join('');
-          const a = cs[0] || depth!;
-          gl.viewport(0, 0, Math.max(1, a.t.w >> a.mip), Math.max(1, a.t.h >> a.mip));
+          framebuffer(passColors, depth, colors);
+          gl.drawBuffers(PASS_DRAW_BUFFERS[colors] ?? Array.from({ length: colors }, (_, k) => gl.COLOR_ATTACHMENT0 + k));
+          fixed.drawBuffers = PASS_DRAW_MASKS[colors] ?? (((1 << colors) - 1) | (colors << 16));
+          const a = colors > 0 ? passColors[0] : depth!;
+          const vw = Math.max(1, a.t.w >> a.mip);
+          const vh = Math.max(1, a.t.h >> a.mip);
+          gl.viewport(0, 0, vw, vh);
           passLabel = '';
           passDrew = false;
-          passSize = `${Math.max(1, a.t.w >> a.mip)}x${Math.max(1, a.t.h >> a.mip)}`;
+          if (timing.on()) passSize = `${vw}x${vh}`;
           setFlag(gl.SCISSOR_TEST, false);
-          const dontCare: number[] = [];
-          cs.forEach((x, k) => {
+          passDontCare.length = 0;
+          passDiscard.length = 0;
+          for (let k = 0; k < colors; k++) {
+            const x = passColors[k];
             if (x.load === 1) {
               if (fixed.colorMask !== 15) {
                 gl.colorMask(true, true, true, true);
                 fixed.colorMask = 15;
               }
-              gl.clearBufferfv(gl.COLOR, k, x.clear);
-            } else if (x.load === 2) dontCare.push(gl.COLOR_ATTACHMENT0 + k);
-          });
+              clearColorBuf[0] = x.clear0;
+              clearColorBuf[1] = x.clear1;
+              clearColorBuf[2] = x.clear2;
+              clearColorBuf[3] = x.clear3;
+              gl.clearBufferfv(gl.COLOR, k, clearColorBuf);
+            } else if (x.load === 2) {
+              passDontCare.push(gl.COLOR_ATTACHMENT0 + k);
+            }
+            if (!x.store) passDiscard.push(gl.COLOR_ATTACHMENT0 + k);
+          }
           if (depth) {
             if (depth.load === 1) {
               if (fixed.depthMask !== true) {
                 gl.depthMask(true);
                 fixed.depthMask = true;
               }
-              gl.clearBufferfv(gl.DEPTH, 0, [depth.clear]);
-            } else if (depth.load === 2) dontCare.push(gl.DEPTH_ATTACHMENT);
+              clearDepthBuf[0] = depth.clear;
+              gl.clearBufferfv(gl.DEPTH, 0, clearDepthBuf);
+            } else if (depth.load === 2) {
+              passDontCare.push(gl.DEPTH_ATTACHMENT);
+            }
+            if (!depth.store) passDiscard.push(gl.DEPTH_ATTACHMENT);
           }
-          if (dontCare.length) gl.invalidateFramebuffer(gl.FRAMEBUFFER, dontCare);
-          discard = cs.map((x, k) => (x.store ? null : gl.COLOR_ATTACHMENT0 + k)).filter((x): x is number => x !== null);
-          if (depth && !depth.store) discard.push(gl.DEPTH_ATTACHMENT);
+          if (passDontCare.length) gl.invalidateFramebuffer(gl.FRAMEBUFFER, passDontCare);
           break;
         }
         case 2:
           // END_PASS
-          if (discard.length) gl.invalidateFramebuffer(gl.FRAMEBUFFER, discard);
-          discard = [];
+          if (passDiscard.length) {
+            gl.invalidateFramebuffer(gl.FRAMEBUFFER, passDiscard);
+            passDiscard.length = 0;
+          }
           if (timing.on()) glMark(`${passLabel || (passDrew ? lastPipeline : 'clear')} ${passSize}`);
           break;
         case 3: {
@@ -1256,7 +1314,9 @@ export function createGlHost(
         bias: fl[6],
         slope: fl[7],
         targets,
-        drawBuffers: targets.map((t) => (t.mask ? 1 : 0)).join(''),
+        drawBuffersList: targets.map((t, idx) => (t.mask ? gl.COLOR_ATTACHMENT0 + idx : gl.NONE)),
+        drawBuffersMask:
+          targets.reduce((acc, t, idx) => acc | (t.mask ? 1 << idx : 0), 0) | (targets.length << 16),
         blend: written.length ? written[0].blend : 0,
         mask: written.length ? written[0].mask : 15,
         indexed: !uniform,

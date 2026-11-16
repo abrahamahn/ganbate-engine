@@ -1,6 +1,6 @@
 //! Prop textures, meshes, materials, custom WGSL prop shaders, instances, and dynamic game lights.
 
-use super::{bytes, floats, matrix, with, words};
+use super::{bytes, float_array, floats, matrix, with, words};
 use ganbate_engine::render::{
     GameLight, LightDesc, MaterialDesc, MeshData, PROP_SHADER_PARAMS, PropInstance, PropMaterial,
     PropMesh, PropTexture, SpotCone,
@@ -274,11 +274,9 @@ pub unsafe extern "C" fn ganbate_rt_shader_create(ptr: *const u8, len: usize) ->
 /// `ptr` must address 80 readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ganbate_rt_material_params(material: u32, ptr: *const u8) -> u32 {
-    // SAFETY: the caller passes twenty floats.
-    let v = unsafe { floats(ptr, PROP_SHADER_PARAMS) };
+    let params = (!ptr.is_null()).then(|| unsafe { float_array::<PROP_SHADER_PARAMS>(ptr) });
     with(0, |rt| {
-        let mut params = [0.0f32; PROP_SHADER_PARAMS];
-        params.copy_from_slice(&v);
+        let params = params.ok_or_else(|| "material_params: null buffer".to_string())?;
         rt.renderer
             .set_prop_material_params(PropMaterial::from_raw(material), &params)?;
         Ok(1)
@@ -328,9 +326,9 @@ pub unsafe extern "C" fn ganbate_rt_instance_create(
     material: u32,
     matrix: *const u8,
 ) -> u32 {
-    // SAFETY: the caller passes 16 floats.
-    let m = unsafe { floats(matrix, 16) };
+    let m = (!matrix.is_null()).then(|| unsafe { float_array::<16>(matrix) });
     with(0, |rt| {
+        let m = m.ok_or_else(|| "a matrix needs 16 floats".to_string())?;
         let i = rt.renderer.create_prop_instance(
             PropMesh::from_raw(mesh),
             PropMaterial::from_raw(material),
@@ -350,9 +348,9 @@ pub unsafe extern "C" fn ganbate_rt_instance_set(
     matrix: *const u8,
     visible: u32,
 ) -> u32 {
-    // SAFETY: the caller passes 16 floats.
-    let m = unsafe { floats(matrix, 16) };
+    let m = (!matrix.is_null()).then(|| unsafe { float_array::<16>(matrix) });
     with(0, |rt| {
+        let m = m.ok_or_else(|| "a matrix needs 16 floats".to_string())?;
         rt.renderer.set_prop_instance(
             PropInstance::from_raw(instance),
             &self::matrix(&m)?,
@@ -372,12 +370,12 @@ pub unsafe extern "C" fn ganbate_rt_instances_set(ptr: *const u8, count: usize) 
     // SAFETY: the caller passes `count` records.
     let raw = unsafe { bytes(ptr, count * 72) };
     with(0, |rt| {
+        let mut m = [0.0f32; 16];
         for r in raw.chunks_exact(72) {
             let word = |i: usize| u32::from_le_bytes([r[i], r[i + 1], r[i + 2], r[i + 3]]);
-            let m: Vec<f32> = r[8..]
-                .chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-                .collect();
+            for (dst, b) in m.iter_mut().zip(r[8..].chunks_exact(4)) {
+                *dst = f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            }
             rt.renderer.set_prop_instance(
                 PropInstance::from_raw(word(0)),
                 &matrix(&m)?,
@@ -457,9 +455,11 @@ fn light_desc(v: &[f32]) -> LightDesc {
 /// `ptr` must address 60 readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ganbate_rt_light_create(ptr: *const u8) -> u32 {
-    // SAFETY: the caller passes 15 floats.
-    let v = unsafe { floats(ptr, 15) };
-    with(0, |rt| Ok(rt.renderer.create_light(&light_desc(&v))?.raw()))
+    let v = (!ptr.is_null()).then(|| unsafe { float_array::<15>(ptr) });
+    with(0, |rt| {
+        let v = v.ok_or_else(|| "light_create: null buffer".to_string())?;
+        Ok(rt.renderer.create_light(&light_desc(&v))?.raw())
+    })
 }
 
 /// Moves, recolours or reshapes a game light (15 floats at `ptr`, as `ganbate_rt_light_create`).
@@ -468,9 +468,9 @@ pub unsafe extern "C" fn ganbate_rt_light_create(ptr: *const u8) -> u32 {
 /// `ptr` must address 60 readable bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn ganbate_rt_light_set(light: u32, ptr: *const u8) -> u32 {
-    // SAFETY: the caller passes 15 floats.
-    let v = unsafe { floats(ptr, 15) };
+    let v = (!ptr.is_null()).then(|| unsafe { float_array::<15>(ptr) });
     with(0, |rt| {
+        let v = v.ok_or_else(|| "light_set: null buffer".to_string())?;
         rt.renderer
             .set_light(GameLight::from_raw(light), &light_desc(&v))?;
         Ok(1)

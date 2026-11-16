@@ -103,24 +103,60 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
   };
   const text = (s: string) => encoder.encode(s);
   const f32 = (a: ArrayLike<number>) => (a instanceof Float32Array ? a : new Float32Array(a));
-  const lightFloats = (light: GanbateLight) => {
-    const v = new Float32Array(15);
-    v.set(light.position, 0);
+  let ioBuf: ArrayBufferLike | null = null;
+  let ioBase = -1;
+  let ioF32!: Float32Array;
+  let ioU32!: Uint32Array;
+  const syncIo = (base: number) => {
+    const buf = x.memory.buffer;
+    if (buf !== ioBuf || base !== ioBase) {
+      ioBuf = buf;
+      ioBase = base;
+      ioF32 = new Float32Array(buf, base, 20);
+      ioU32 = new Uint32Array(buf, base, 20);
+    }
+  };
+  const acquireIo = () => {
+    const base = reserve(80);
+    syncIo(base);
+    return base;
+  };
+  let batchBuf: ArrayBufferLike | null = null;
+  let batchPtr = -1;
+  let batchWords = 0;
+  let batchU32!: Uint32Array;
+  let batchF32!: Float32Array;
+  const writeLightIo = (light: GanbateLight): number => {
+    const base = acquireIo();
+    const v = ioF32;
+    v[0] = light.position[0];
+    v[1] = light.position[1];
+    v[2] = light.position[2];
     v[3] = light.range;
-    v.set(light.color, 4);
+    v[4] = light.color[0];
+    v[5] = light.color[1];
+    v[6] = light.color[2];
     v[7] = light.intensity;
     if (light.direction !== undefined) {
-      v.set(light.direction, 8);
+      v[8] = light.direction[0];
+      v[9] = light.direction[1];
+      v[10] = light.direction[2];
       v[11] = light.inner ?? 0;
       v[12] = light.outer ?? light.inner ?? 0;
+    } else {
+      v[8] = 0;
+      v[9] = 0;
+      v[10] = 0;
+      v[11] = 0;
+      v[12] = 0;
     }
     v[13] = light.followsLamps === true ? 1 : 0;
     v[14] = light.shadow ?? 0;
-    return v;
+    return base;
   };
-  const out = (n: number) => new Float32Array(x.memory.buffer, reserve(n * 4), n);
   const readBudget = (p: number): GanbateGovernorSnapshot => {
-    const v = new Float32Array(x.memory.buffer, p, 6);
+    syncIo(p);
+    const v = ioF32;
     return {
       resolutionScale: v[0],
       maxDynamicLights: v[1] >>> 0,
@@ -205,10 +241,10 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
   let drawn: { width: number; height: number } | null = null;
   const drawnSize = () => {
     if (!drawn) {
-      const p = reserve(8);
+      const p = acquireIo();
       ok('size', x.ganbate_rt_size(p));
-      const s = new Uint32Array(x.memory.buffer, p, 2);
-      drawn = { width: s[0], height: s[1] };
+      syncIo(p);
+      drawn = { width: ioU32[0], height: ioU32[1] };
     }
     return drawn;
   };
@@ -216,7 +252,6 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
 
   let cssBox: { width: number; height: number } | null = null;
   let observer: ResizeObserver | null = null;
-  const cssSize = () => cssBox || { width: canvas.clientWidth, height: canvas.clientHeight };
   const observedBox = (entry: ResizeObserverEntry): [number, number] => {
     const rawBox = entry.contentBoxSize as unknown as
       | readonly ResizeObserverSize[]
@@ -239,10 +274,14 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
       observer = null;
     }
   }
+  const scaleOut = { sx: 1, sy: 1 };
   const cssScale = () => {
     const s = drawnSize();
-    const css = cssSize();
-    return { sx: (css.width || s.width) / s.width, sy: (css.height || s.height) / s.height };
+    const cssW = cssBox ? cssBox.width : canvas.clientWidth;
+    const cssH = cssBox ? cssBox.height : canvas.clientHeight;
+    scaleOut.sx = (cssW || s.width) / s.width;
+    scaleOut.sy = (cssH || s.height) / s.height;
+    return scaleOut;
   };
 
   const engine: GanbateEngine = {
@@ -277,23 +316,23 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
       ok('setLook', x.ganbate_rt_set_look(p, t.length));
     },
     setView(v: GanbateView) {
-      const up = v.up || [0, 1, 0];
-      const shift = v.shift || [0, 0];
+      const up = v.up;
+      const shift = v.shift;
       const f = v.focus;
-      const p = reserve(68);
-      const dst = new Float32Array(x.memory.buffer, p, 17);
+      const p = acquireIo();
+      const dst = ioF32;
       dst[0] = v.eye[0];
       dst[1] = v.eye[1];
       dst[2] = v.eye[2];
       dst[3] = v.target[0];
       dst[4] = v.target[1];
       dst[5] = v.target[2];
-      dst[6] = up[0];
-      dst[7] = up[1];
-      dst[8] = up[2];
+      dst[6] = up ? up[0] : 0;
+      dst[7] = up ? up[1] : 1;
+      dst[8] = up ? up[2] : 0;
       dst[9] = v.fov ?? 50;
-      dst[10] = shift[0];
-      dst[11] = shift[1];
+      dst[10] = shift ? shift[0] : 0;
+      dst[11] = shift ? shift[1] : 0;
       dst[12] = v.near ?? 0.08;
       dst[13] = f ? f.distance : 0;
       dst[14] = f ? (f.depth ?? 4) : 0;
@@ -309,9 +348,10 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
     },
     frameStats() {
       if (typeof x.ganbate_rt_frame_stats !== 'function') return null;
-      const p = reserve(36);
+      const p = acquireIo();
       if (!x.ganbate_rt_frame_stats(p)) return null;
-      const w = new Uint32Array(x.memory.buffer, p, 9);
+      syncIo(p);
+      const w = ioU32;
       return {
         worldDrawsTotal: w[0],
         worldDrawsSubmitted: w[1],
@@ -326,9 +366,10 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
     },
     cacheStats() {
       if (typeof x.ganbate_rt_cache_stats !== 'function') return null;
-      const p = reserve(40);
+      const p = acquireIo();
       if (!x.ganbate_rt_cache_stats(p)) return null;
-      const w = new Uint32Array(x.memory.buffer, p, 10);
+      syncIo(p);
+      const w = ioU32;
       return {
         worldCached: w[0] !== 0,
         regions: w[1],
@@ -350,9 +391,10 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
     },
     stereoViews() {
       if (typeof x.ganbate_rt_stereo_views !== 'function') return null;
-      const p = out(16).byteOffset;
+      const p = acquireIo();
       if (!x.ganbate_rt_stereo_views(p)) return null;
-      const v = Array.from(new Float32Array(x.memory.buffer, p, 16));
+      syncIo(p);
+      const v = ioF32;
       return {
         left: { eye: [v[0], v[1], v[2]], target: [v[3], v[4], v[5]] },
         right: { eye: [v[6], v[7], v[8]], target: [v[9], v[10], v[11]] },
@@ -368,13 +410,13 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
     },
     governorRecord(dtMs: number) {
       if (typeof x.ganbate_rt_governor_record !== 'function') return null;
-      const p = out(6).byteOffset;
+      const p = acquireIo();
       if (!x.ganbate_rt_governor_record(dtMs, p)) return null;
       return readBudget(p);
     },
     governorQuery() {
       if (typeof x.ganbate_rt_governor_query !== 'function') return null;
-      const p = out(6).byteOffset;
+      const p = acquireIo();
       if (!x.ganbate_rt_governor_query(p)) return null;
       return readBudget(p);
     },
@@ -512,25 +554,38 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
       return ok('createShader', x.ganbate_rt_shader_create(p, t.length));
     },
     setMaterialParams(material: number, params: readonly number[]) {
-      const v = new Float32Array(20);
-      v.set(params.slice(0, 20));
-      const [p] = place(v);
+      const p = acquireIo();
+      const v = ioF32;
+      for (let k = 0; k < 20; k++) v[k] = k < params.length ? params[k] : 0;
       ok('setMaterialParams', x.ganbate_rt_material_params(material, p));
     },
     createInstance(mesh: number, material: number, matrix: Matrix4) {
-      const [p] = place(f32(matrix));
+      const p = acquireIo();
+      const v = ioF32;
+      for (let k = 0; k < 16; k++) v[k] = k < matrix.length ? matrix[k] : Number.NaN;
       return ok('createInstance', x.ganbate_rt_instance_create(mesh, material, p));
     },
     setInstance(instance: number, matrix: Matrix4, visible = true) {
-      const [p] = place(f32(matrix));
+      const p = acquireIo();
+      const v = ioF32;
+      for (let k = 0; k < 16; k++) v[k] = k < matrix.length ? matrix[k] : Number.NaN;
       ok('setInstance', x.ganbate_rt_instance_set(instance, p, visible ? 1 : 0));
     },
     setInstances(list: readonly { readonly instance: number; readonly matrix: Matrix4; readonly visible?: boolean }[]) {
       const n = list.length;
       if (!n) return;
+      const words = n * 18;
       const p = reserve(n * 72);
-      const u = new Uint32Array(x.memory.buffer, p, n * 18);
-      const f = new Float32Array(x.memory.buffer, p, n * 18);
+      const buf = x.memory.buffer;
+      if (buf !== batchBuf || p !== batchPtr || words > batchWords) {
+        batchBuf = buf;
+        batchPtr = p;
+        batchWords = words;
+        batchU32 = new Uint32Array(buf, p, words);
+        batchF32 = new Float32Array(buf, p, words);
+      }
+      const u = batchU32;
+      const f = batchF32;
       for (let k = 0; k < n; k++) {
         const r = list[k];
         const base = k * 18;
@@ -553,35 +608,35 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
       x.ganbate_rt_instance_destroy(instance);
     },
     createLight(light: GanbateLight) {
-      const [p] = place(lightFloats(light));
-      return ok('createLight', x.ganbate_rt_light_create(p));
+      return ok('createLight', x.ganbate_rt_light_create(writeLightIo(light)));
     },
     setLight(id: number, light: GanbateLight) {
-      const [p] = place(lightFloats(light));
-      ok('setLight', x.ganbate_rt_light_set(id, p));
+      ok('setLight', x.ganbate_rt_light_set(id, writeLightIo(light)));
     },
     destroyLight(id: number) {
       x.ganbate_rt_light_destroy(id);
     },
     project(point: Vec3) {
-      const { sx, sy } = cssScale();
-      const p = out(3).byteOffset;
+      const s = cssScale();
+      const sx = s.sx;
+      const sy = s.sy;
+      const p = acquireIo();
       if (!x.ganbate_rt_project(point[0], point[1], point[2], p)) return null;
-      const [px, py, depth] = new Float32Array(x.memory.buffer, p, 3);
-      return { x: px * sx, y: py * sy, depth };
+      syncIo(p);
+      return { x: ioF32[0] * sx, y: ioF32[1] * sy, depth: ioF32[2] };
     },
     pick(cssX: number, cssY: number, layers = 0xffffffff) {
-      const { sx, sy } = cssScale();
-      const p = out(4).byteOffset;
-      const instance = x.ganbate_rt_pick(cssX / sx, cssY / sy, layers >>> 0, p);
+      const s = cssScale();
+      const p = acquireIo();
+      const instance = x.ganbate_rt_pick(cssX / s.sx, cssY / s.sy, layers >>> 0, p);
       if (!instance) return null;
-      const [distance, px, py, pz] = new Float32Array(x.memory.buffer, p, 4);
-      return { instance, distance, point: [px, py, pz] };
+      syncIo(p);
+      return { instance, distance: ioF32[0], point: [ioF32[1], ioF32[2], ioF32[3]] };
     },
     pickRay(origin: Vec3, direction: Vec3, layers = 0xffffffff) {
       if (typeof x.ganbate_rt_pick_ray !== 'function') return null;
       if (!origin || !direction || origin.length < 3 || direction.length < 3) return null;
-      const p = out(4).byteOffset;
+      const p = acquireIo();
       const instance = x.ganbate_rt_pick_ray(
         origin[0],
         origin[1],
@@ -593,20 +648,25 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
         p,
       );
       if (!instance) return null;
-      const [distance, px, py, pz] = new Float32Array(x.memory.buffer, p, 4);
-      return { instance, distance, point: [px, py, pz] };
+      syncIo(p);
+      return { instance, distance: ioF32[0], point: [ioF32[1], ioF32[2], ioF32[3]] };
     },
     worldInstances() {
       return x.ganbate_rt_world_instances();
     },
     worldInstance(index: number) {
-      const p = out(16).byteOffset;
+      const p = acquireIo();
       const r = x.ganbate_rt_world_instance(index >>> 0, p);
       if (!r) throw fail('worldInstance');
-      return { matrix: Array.from(new Float32Array(x.memory.buffer, p, 16)), visible: r === 1 };
+      syncIo(p);
+      const matrix = new Array<number>(16);
+      for (let k = 0; k < 16; k++) matrix[k] = ioF32[k];
+      return { matrix, visible: r === 1 };
     },
     setWorldInstance(index: number, matrix: Matrix4, visible = true) {
-      const [p] = place(f32(matrix));
+      const p = acquireIo();
+      const v = ioF32;
+      for (let k = 0; k < 16; k++) v[k] = k < matrix.length ? matrix[k] : Number.NaN;
       ok('setWorldInstance', x.ganbate_rt_set_world_instance(index >>> 0, p, visible ? 1 : 0));
     },
     setWorldLight(index: number, position: Vec3) {
@@ -630,7 +690,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
       return new TextDecoder().decode(new Uint8Array(x.memory.buffer, p, len));
     },
     physicsHash() {
-      const p = out(2).byteOffset;
+      const p = acquireIo();
       if (!x.ganbate_rt_physics_hash(p)) return null;
       const b = new Uint8Array(x.memory.buffer, p, 8);
       return Array.from(b)
@@ -639,17 +699,17 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
         .join('');
     },
     pickWorld(cssX: number, cssY: number) {
-      const { sx, sy } = cssScale();
-      const p = out(4).byteOffset;
-      const hit = x.ganbate_rt_pick_world(cssX / sx, cssY / sy, p);
+      const s = cssScale();
+      const p = acquireIo();
+      const hit = x.ganbate_rt_pick_world(cssX / s.sx, cssY / s.sy, p);
       if (!hit) return null;
-      const [distance, px, py, pz] = new Float32Array(x.memory.buffer, p, 4);
-      return { instance: hit - 1, distance, point: [px, py, pz] };
+      syncIo(p);
+      return { instance: hit - 1, distance: ioF32[0], point: [ioF32[1], ioF32[2], ioF32[3]] };
     },
     pickWorldRay(origin: Vec3, direction: Vec3) {
       if (typeof x.ganbate_rt_pick_world_ray !== 'function') return null;
       if (!origin || !direction || origin.length < 3 || direction.length < 3) return null;
-      const p = out(4).byteOffset;
+      const p = acquireIo();
       const hit = x.ganbate_rt_pick_world_ray(
         origin[0],
         origin[1],
@@ -660,8 +720,8 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
         p,
       );
       if (!hit) return null;
-      const [distance, px, py, pz] = new Float32Array(x.memory.buffer, p, 4);
-      return { instance: hit - 1, distance, point: [px, py, pz] };
+      syncIo(p);
+      return { instance: hit - 1, distance: ioF32[0], point: [ioF32[1], ioF32[2], ioF32[3]] };
     },
     worldEntities(): GanbateEntityTable | null {
       const len = x.ganbate_world_entities(0, 0);
@@ -786,11 +846,15 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
       return ok('modelMaterial', x.ganbate_rt_model_material(model, index));
     },
     createModelInstance(model: number, matrix: Matrix4) {
-      const [p] = place(f32(matrix));
+      const p = acquireIo();
+      const v = ioF32;
+      for (let k = 0; k < 16; k++) v[k] = k < matrix.length ? matrix[k] : Number.NaN;
       return ok('createModelInstance', x.ganbate_rt_model_instance(model, p));
     },
     setModelInstance(instance: number, matrix: Matrix4, visible = true) {
-      const [p] = place(f32(matrix));
+      const p = acquireIo();
+      const v = ioF32;
+      for (let k = 0; k < 16; k++) v[k] = k < matrix.length ? matrix[k] : Number.NaN;
       ok('setModelInstance', x.ganbate_rt_model_instance_set(instance, p, visible ? 1 : 0));
     },
     destroyModelInstance(instance: number) {
@@ -811,9 +875,10 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
       ok('modelClip', x.ganbate_rt_model_clip(instance, clip, time, weight));
     },
     modelNode(instance: number, node: number): GanbateNodeTransform {
-      const at = out(10).byteOffset;
+      const at = acquireIo();
       ok('modelNode', x.ganbate_rt_model_node_get(instance, node, at));
-      const v = Array.from(new Float32Array(x.memory.buffer, at, 10));
+      syncIo(at);
+      const v = ioF32;
       return {
         translation: [v[0], v[1], v[2]],
         rotation: [v[3], v[4], v[5], v[6]],
@@ -821,7 +886,18 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
       };
     },
     setModelNode(instance: number, node: number, { translation, rotation, scale }: GanbateNodeTransform) {
-      const [p] = place(f32([...translation, ...rotation, ...scale]));
+      const p = acquireIo();
+      const v = ioF32;
+      v[0] = translation[0];
+      v[1] = translation[1];
+      v[2] = translation[2];
+      v[3] = rotation[0];
+      v[4] = rotation[1];
+      v[5] = rotation[2];
+      v[6] = rotation[3];
+      v[7] = scale[0];
+      v[8] = scale[1];
+      v[9] = scale[2];
       ok('setModelNode', x.ganbate_rt_model_node_set(instance, node, p));
     },
     modelMorph(instance: number, node: number, target: number, weight: number) {
@@ -831,9 +907,10 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
       ok('updateModel', x.ganbate_rt_model_update(instance));
     },
     modelNodeWorld(instance: number, node: number) {
-      const at = out(16).byteOffset;
+      const at = acquireIo();
       ok('modelNodeWorld', x.ganbate_rt_model_node_world(instance, node, at));
-      return new Float32Array(x.memory.buffer, at, 16).slice();
+      syncIo(at);
+      return ioF32.slice(0, 16);
     },
     setModelNodeVisible(instance: number, node: number, visible: boolean) {
       ok('setModelNodeVisible', x.ganbate_rt_model_node_visible(instance, node, visible ? 1 : 0));
@@ -842,10 +919,11 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
       ok('setModelTint', x.ganbate_rt_model_tint(instance, tint[0], tint[1], tint[2], tint[3] ?? 1));
     },
     modelOwner(propInstance: number) {
-      const at = reserve(4);
+      const at = acquireIo();
       const instance = x.ganbate_rt_model_owner(propInstance, at);
       if (!instance) return null;
-      return { instance, node: new Uint32Array(x.memory.buffer, at, 1)[0] };
+      syncIo(at);
+      return { instance, node: ioU32[0] };
     },
     destroy() {
       if (stopped) return;

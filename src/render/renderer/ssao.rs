@@ -108,17 +108,22 @@ pub(super) fn union_area(regions: &[Rect]) -> u32 {
 
 /// The AO's changed regions block (`AoChanged` in post.wgsl) for `regions` and active coarse
 /// grass bounds `grass_coarse` of a picture seen through `view_proj`.
-pub(super) fn ao_changed_block(
+pub(super) fn ao_changed_floats(
     regions: &[Rect],
     grass_coarse: [i32; 4],
     view_proj: &M4,
-) -> Vec<u8> {
+) -> ([f32; 12 + MAX_AO_REGIONS * 4], usize) {
     let row = |k: usize| math::length([view_proj[k], view_proj[4 + k], view_proj[8 + k]]);
-    let mut block = vec![regions.len() as f32, AO_KERNEL_REACH, 0.0, 0.0];
-    block.extend([row(0), row(1), row(3), 0.0]);
-    block.extend(grass_coarse.map(|v| v as f32));
-    block.extend(regions.iter().flat_map(|r| r.map(|v| v as f32)));
-    f32_bytes(&block)
+    let mut block = [0.0f32; 12 + MAX_AO_REGIONS * 4];
+    block[..4].copy_from_slice(&[regions.len() as f32, AO_KERNEL_REACH, 0.0, 0.0]);
+    block[4..8].copy_from_slice(&[row(0), row(1), row(3), 0.0]);
+    block[8..12].copy_from_slice(&grass_coarse.map(|v| v as f32));
+    let mut len = 12;
+    for r in regions.iter().take(MAX_AO_REGIONS) {
+        block[len..len + 4].copy_from_slice(&r.map(|v| v as f32));
+        len += 4;
+    }
+    (block, len)
 }
 
 fn scissored_post_pass(
@@ -134,16 +139,16 @@ fn scissored_post_pass(
     }
     let full = scissor == [0, 0, target_size.0, target_size.1];
     let load = if full { Load::DontCare } else { load_partial };
-    enc.begin_pass(PassDesc {
-        colors: vec![Attachment {
+    enc.begin_pass_slice(
+        &[Attachment {
             texture: target,
             mip: 0,
             layer: 0,
             load,
             store: true,
         }],
-        depth: None,
-    });
+        None,
+    );
     if !full {
         enc.set_scissor(
             scissor[0],
@@ -154,7 +159,7 @@ fn scissored_post_pass(
     }
     enc.set_pipeline(pipeline);
     enc.set_bind_group(0, group);
-    enc.push_constants(&f32_bytes(&push));
+    enc.push_f32(&push);
     enc.draw(3, 1, 0, 0);
     enc.end_pass();
 }
@@ -253,7 +258,7 @@ impl Renderer {
     pub(super) fn ao_key(&self, world_key: u64, eye: &Eye, size: (u32, u32), seed: u32) -> u64 {
         let mut key = Fnv::new();
         key.write(&world_key.to_le_bytes());
-        key.write(&f32_bytes(&eye.view_proj));
+        with_le_bytes_f32(&eye.view_proj, |b| key.write(b));
         for n in [
             size.0,
             size.1,
@@ -339,10 +344,7 @@ impl Renderer {
         let slot = &self.slots[slot_index];
         if self.quality.ao_samples == 0 {
             if !t.ao_cleared {
-                enc.begin_pass(PassDesc {
-                    colors: vec![Attachment::clear(t.ao_tex, [1.0; 4])],
-                    depth: None,
-                });
+                enc.begin_pass_slice(&[Attachment::clear(t.ao_tex, [1.0; 4])], None);
                 enc.end_pass();
             }
             return Ok(AoNextState {
@@ -594,8 +596,8 @@ impl Renderer {
                     ],
                     _ => [0, 0, -1, -1],
                 };
-                let block = ao_changed_block(&regions, grass_coarse, &inp.eye.view_proj);
-                device.write_buffer(slot.ao_changed, 0, &block)?;
+                let (block, len) = ao_changed_floats(&regions, grass_coarse, &inp.eye.view_proj);
+                device.write_buffer_f32(slot.ao_changed, 0, &block[..len])?;
                 pc[4] = 1.0;
                 pc[5] = f32::from(u8::from(grass_changed));
                 pc[6] = f32::from(u8::from(water_drawn));

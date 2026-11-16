@@ -140,7 +140,7 @@ impl Renderer {
             usage: BufferUsage::VERTEX | BufferUsage::COPY_DST,
             memory: Memory::Device,
         })?;
-        if let Err(error) = device.write_buffer(vertices, 0, &f32_bytes(&data)) {
+        if let Err(error) = device.write_buffer_f32(vertices, 0, &data) {
             device.destroy_buffer(vertices);
             return Err(error);
         }
@@ -155,7 +155,7 @@ impl Renderer {
                 return Err(error);
             }
         };
-        if let Err(error) = device.write_buffer(indices, 0, &u32_bytes(mesh.indices)) {
+        if let Err(error) = device.write_buffer_u32(indices, 0, mesh.indices) {
             device.destroy_buffer(indices);
             device.destroy_buffer(vertices);
             return Err(error);
@@ -291,7 +291,7 @@ impl Renderer {
             return Err("update_prop_mesh: the vertex count must stay the same".into());
         }
         let data = interleave(positions, normals, &m.uvs, &m.triangles);
-        device.write_buffer(m.vertices, 0, &f32_bytes(&data))?;
+        device.write_buffer_f32(m.vertices, 0, &data)?;
         m.drift += farthest_move(&m.positions, positions);
         m.positions.copy_from_slice(positions);
         (m.min, m.max) = bounds(positions);
@@ -319,51 +319,57 @@ impl Renderer {
         positions: &[V3],
         normals: &[V3],
     ) -> Result<()> {
-        let m = self
-            .props
-            .meshes
-            .get_mut(mesh.0)
-            .ok_or_else(|| format!("{mesh:?} was destroyed"))?;
-        let end = first + positions.len();
-        if end > m.positions.len() || normals.len() != positions.len() {
-            return Err(
-                "update_prop_mesh_range: the range must lie in the mesh, a normal a vertex".into(),
-            );
-        }
-        if positions.is_empty() {
-            return Ok(());
-        }
-        let mut data = vec![0.0f32; positions.len() * 8];
-        let vertices = positions.iter().zip(normals).zip(&m.uvs[first..end]);
-        for (d, ((p, n), uv)) in data.chunks_exact_mut(8).zip(vertices) {
-            d[..3].copy_from_slice(p);
-            d[3..6].copy_from_slice(n);
-            d[6..].copy_from_slice(uv);
-        }
-        device.write_buffer(m.vertices, first as u64 * 32, &f32_bytes(&data))?;
-        m.drift += farthest_move(&m.positions[first..end], positions);
-        m.positions[first..end].copy_from_slice(positions);
-        m.revision = m.revision.wrapping_add(1);
-        // What morphs of this range need, found once while it is morphed frame after frame.
-        let morph = match m.morph.take() {
-            Some(morph) if (morph.first, morph.end) == (first, end) => morph,
-            _ => {
-                let records = m.skin.map(|skin| {
-                    let at = skin.first as usize + first * 2;
-                    &self.props.skin_records[at..at + positions.len() * 2]
-                });
-                Morph::new(&m.positions, first, end, records)
+        let mut data = std::mem::take(&mut self.props.morph_scratch);
+        let result = (|| -> Result<()> {
+            let m = self
+                .props
+                .meshes
+                .get_mut(mesh.0)
+                .ok_or_else(|| format!("{mesh:?} was destroyed"))?;
+            let end = first + positions.len();
+            if end > m.positions.len() || normals.len() != positions.len() {
+                return Err(
+                    "update_prop_mesh_range: the range must lie in the mesh, a normal a vertex"
+                        .into(),
+                );
             }
-        };
-        (m.min, m.max) = morph.bounds(&m.positions, positions);
-        // Its joints' bounds only widen to hold the moved vertices (they stay bounds; a full
-        // update makes them afresh).
-        if m.skin.is_some() {
-            let changed = morph.widen(&mut m.joint_boxes, positions);
-            m.shape = m.shape.wrapping_add(changed);
-        }
-        m.morph = Some(morph);
-        Ok(())
+            if positions.is_empty() {
+                return Ok(());
+            }
+            data.resize(positions.len() * 8, 0.0);
+            let vertices = positions.iter().zip(normals).zip(&m.uvs[first..end]);
+            for (d, ((p, n), uv)) in data.chunks_exact_mut(8).zip(vertices) {
+                d[..3].copy_from_slice(p);
+                d[3..6].copy_from_slice(n);
+                d[6..].copy_from_slice(uv);
+            }
+            device.write_buffer_f32(m.vertices, first as u64 * 32, &data)?;
+            m.drift += farthest_move(&m.positions[first..end], positions);
+            m.positions[first..end].copy_from_slice(positions);
+            m.revision = m.revision.wrapping_add(1);
+            // What morphs of this range need, found once while it is morphed frame after frame.
+            let morph = match m.morph.take() {
+                Some(morph) if (morph.first, morph.end) == (first, end) => morph,
+                _ => {
+                    let records = m.skin.map(|skin| {
+                        let at = skin.first as usize + first * 2;
+                        &self.props.skin_records[at..at + positions.len() * 2]
+                    });
+                    Morph::new(&m.positions, first, end, records)
+                }
+            };
+            (m.min, m.max) = morph.bounds(&m.positions, positions);
+            // Its joints' bounds only widen to hold the moved vertices (they stay bounds; a full
+            // update makes them afresh).
+            if m.skin.is_some() {
+                let changed = morph.widen(&mut m.joint_boxes, positions);
+                m.shape = m.shape.wrapping_add(changed);
+            }
+            m.morph = Some(morph);
+            Ok(())
+        })();
+        self.props.morph_scratch = data;
+        result
     }
 
     /// Destroys a mesh and every instance of it.
@@ -683,11 +689,10 @@ impl Renderer {
         if joints.iter().flatten().any(|x| !x.is_finite()) {
             return Err("set_prop_instance_joints: values must be finite".into());
         }
-        let ids: Vec<u32> = instances.iter().map(|i| i.0).collect();
-        for &id in &ids {
-            self.props.check_joints(id, joints.len())?;
+        for &inst in instances {
+            self.props.check_joints(inst.0, joints.len())?;
         }
-        self.props.share_joints(&ids, joints)
+        self.props.share_joints(instances, joints)
     }
 
     /// Moves an instance and shows or hides it.
@@ -880,8 +885,8 @@ impl Renderer {
     /// Where a world point lands in a `size` image of `view`: pixel x and y (top-left origin)
     /// and the depth in metres from the eye, or `None` behind the eye.
     pub fn project(&self, view: &View, size: (u32, u32), point: V3) -> Option<[f32; 3]> {
-        let eye = self.eye(view, [0.0, 0.0], size);
-        let c = math::transform(&eye.view_proj, [point[0], point[1], point[2], 1.0]);
+        let view_proj = self.view_proj(view, [0.0, 0.0], size);
+        let c = math::transform(&view_proj, [point[0], point[1], point[2], 1.0]);
         if c[3] <= 1e-6 {
             return None;
         }
@@ -1002,8 +1007,7 @@ impl Renderer {
         for (n, l) in live.iter().enumerate() {
             match batches.last_mut() {
                 Some(b)
-                    if l.layer == Layer::Opaque
-                        && b.layer == Layer::Opaque
+                    if b.layer == l.layer
                         && b.settled == l.settled
                         && b.material == l.material
                         && b.mesh == l.mesh =>
@@ -1070,8 +1074,7 @@ impl Renderer {
             if let Some((buffer, _)) = self.props.skin_buffer
                 && !self.props.skin_records.is_empty()
             {
-                let flat: Vec<f32> = self.props.skin_records.iter().flatten().copied().collect();
-                device.write_buffer(buffer, 0, &f32_bytes(&flat))?;
+                device.write_buffer_f32(buffer, 0, self.props.skin_records.as_flattened())?;
             }
             self.props.skin_dirty = false;
         }
@@ -1258,7 +1261,9 @@ impl Renderer {
             return;
         };
         let p = &self.pipelines;
-        let mut bound = None;
+        let mut bound_pipe = None;
+        let mut bound_shadow_mat = None;
+        let mut bound_mesh = None;
         for b in &self.props.batches {
             let (Some(mesh), Some(mat)) = (
                 self.props.meshes.get(b.mesh),
@@ -1270,17 +1275,21 @@ impl Renderer {
                 continue;
             }
             let masked = mat.shadow_group.is_some();
-            if bound != Some(masked) {
+            if bound_pipe != Some(masked) {
                 enc.set_pipeline(if masked {
                     p.shadow_prop_masked
                 } else {
                     p.shadow_prop
                 });
                 enc.set_bind_group(0, s.shadow);
-                bound = Some(masked);
+                bound_pipe = Some(masked);
+                bound_shadow_mat = None;
             }
-            if let Some(g) = mat.shadow_group {
+            if let Some(g) = mat.shadow_group
+                && bound_shadow_mat != Some(g)
+            {
                 enc.set_bind_group(1, g);
+                bound_shadow_mat = Some(g);
             }
             let mut push = [0.0f32; 24];
             push[..16].copy_from_slice(light_vp);
@@ -1291,9 +1300,12 @@ impl Renderer {
                 0.0,
             ]);
             push[20] = b.first as f32;
-            enc.push_constants(&f32_bytes(&push));
-            enc.set_vertex_buffer(mesh.vertices, 0);
-            enc.set_index_buffer(mesh.indices, 0);
+            enc.push_f32(&push);
+            if bound_mesh != Some(b.mesh) {
+                enc.set_vertex_buffer(mesh.vertices, 0);
+                enc.set_index_buffer(mesh.indices, 0);
+                bound_mesh = Some(b.mesh);
+            }
             enc.draw_indexed(mesh.index_count, b.count, 0, 0, 0);
         }
     }
@@ -1406,19 +1418,21 @@ impl Renderer {
                     .get(b.material)
                     .is_some_and(|m| m.data.params[3] == 2.0)
             });
-        let mut groups: Vec<(crate::gpu::PipelineId, Option<bool>, bool)> = if view == 0 {
-            vec![
-                (opaque_pipeline, Some(true), false),
-                (cut_pipeline, Some(false), false),
-            ]
+        let mut groups = [(self.pipelines.scene_prop, None, false); 4];
+        let mut group_len = if view == 0 {
+            groups[0] = (opaque_pipeline, Some(true), false);
+            groups[1] = (cut_pipeline, Some(false), false);
+            2
         } else {
-            vec![(self.pipelines.scene_prop, None, false)]
+            1
         };
         if has_water {
-            groups.push((self.pipelines.water_prop_opaque, Some(true), true));
-            groups.push((self.pipelines.water_prop, Some(false), true));
+            groups[group_len] = (self.pipelines.water_prop_opaque, Some(true), true);
+            groups[group_len + 1] = (self.pipelines.water_prop, Some(false), true);
+            group_len += 2;
         }
-        for (pipeline, no_cut, water_only) in groups {
+        let mut bound_mesh = None;
+        for &(pipeline, no_cut, water_only) in &groups[..group_len] {
             enc.set_pipeline(pipeline);
             enc.set_bind_group(0, s.scene[view]);
             let mut bound = None;
@@ -1443,10 +1457,13 @@ impl Renderer {
                     enc.set_bind_group(1, mat.group);
                     bound = Some(b.material);
                 }
-                enc.set_vertex_buffer(mesh.vertices, 0);
-                enc.set_index_buffer(mesh.indices, 0);
+                if bound_mesh != Some(b.mesh) {
+                    enc.set_vertex_buffer(mesh.vertices, 0);
+                    enc.set_index_buffer(mesh.indices, 0);
+                    bound_mesh = Some(b.mesh);
+                }
                 for &(first, count) in &runs[..n] {
-                    enc.push_constants(&f32_bytes(&Self::prop_push(mat, first, false)));
+                    enc.push_f32(&Self::prop_push(mat, first, false));
                     enc.draw_indexed(mesh.index_count, count, 0, 0, 0);
                 }
             }
@@ -1454,11 +1471,18 @@ impl Renderer {
     }
 
     /// Draws this frame's blended scene props, sorted, after the opaque scene (main view).
-    pub(in crate::render) fn draw_blended_props(&self, enc: &mut crate::gpu::Encoder, slot: usize) {
+    pub(in crate::render) fn draw_blended_props(
+        &self,
+        enc: &mut crate::gpu::Encoder,
+        slot: usize,
+        within: Option<&Frustum>,
+    ) {
         let Some(Some(s)) = self.props.slots.get(slot) else {
             return;
         };
         let mut pipeline = None;
+        let mut bound_mat = None;
+        let mut bound_mesh = None;
         for b in self
             .props
             .batches
@@ -1471,6 +1495,10 @@ impl Renderer {
             ) else {
                 continue;
             };
+            let (runs, n) = Self::instance_runs(&self.props.placed, b.first, b.count, within);
+            if n == 0 {
+                continue;
+            }
             let idx = usize::from(mat.desc.blend == BlendMode::Add);
             let p = if mat.desc.shading == Shading::Water {
                 self.pipelines.water_prop_blend[idx]
@@ -1482,11 +1510,19 @@ impl Renderer {
                 enc.set_bind_group(0, s.scene[0]);
                 pipeline = Some(p);
             }
-            enc.set_bind_group(1, mat.group);
-            enc.push_constants(&f32_bytes(&Self::prop_push(mat, b.first, false)));
-            enc.set_vertex_buffer(mesh.vertices, 0);
-            enc.set_index_buffer(mesh.indices, 0);
-            enc.draw_indexed(mesh.index_count, b.count, 0, 0, 0);
+            if bound_mat != Some(b.material) {
+                enc.set_bind_group(1, mat.group);
+                bound_mat = Some(b.material);
+            }
+            if bound_mesh != Some(b.mesh) {
+                enc.set_vertex_buffer(mesh.vertices, 0);
+                enc.set_index_buffer(mesh.indices, 0);
+                bound_mesh = Some(b.mesh);
+            }
+            for &(first, count) in &runs[..n] {
+                enc.push_f32(&Self::prop_push(mat, first, false));
+                enc.draw_indexed(mesh.index_count, count, 0, 0, 0);
+            }
         }
     }
 
@@ -1497,11 +1533,14 @@ impl Renderer {
         enc: &mut crate::gpu::Encoder,
         slot: usize,
         encode_srgb: bool,
+        within: Option<&Frustum>,
     ) {
         let Some(Some(s)) = self.props.slots.get(slot) else {
             return;
         };
         let mut pipeline = None;
+        let mut bound_mat = None;
+        let mut bound_mesh = None;
         for b in self
             .props
             .batches
@@ -1514,6 +1553,10 @@ impl Renderer {
             ) else {
                 continue;
             };
+            let (runs, n) = Self::instance_runs(&self.props.placed, b.first, b.count, within);
+            if n == 0 {
+                continue;
+            }
             let (blend, depth) = (blend_index(mat.desc.blend), depth_index(&mat.desc));
             let p = match mat.desc.shader {
                 // Made in `prepare_props`; a pipeline that could not be made draws nothing.
@@ -1533,11 +1576,19 @@ impl Renderer {
                 enc.set_bind_group(0, s.overlay);
                 pipeline = Some(p);
             }
-            enc.set_bind_group(1, mat.group);
-            enc.push_constants(&f32_bytes(&Self::prop_push(mat, b.first, encode_srgb)));
-            enc.set_vertex_buffer(mesh.vertices, 0);
-            enc.set_index_buffer(mesh.indices, 0);
-            enc.draw_indexed(mesh.index_count, b.count, 0, 0, 0);
+            if bound_mat != Some(b.material) {
+                enc.set_bind_group(1, mat.group);
+                bound_mat = Some(b.material);
+            }
+            if bound_mesh != Some(b.mesh) {
+                enc.set_vertex_buffer(mesh.vertices, 0);
+                enc.set_index_buffer(mesh.indices, 0);
+                bound_mesh = Some(b.mesh);
+            }
+            for &(first, count) in &runs[..n] {
+                enc.push_f32(&Self::prop_push(mat, first, encode_srgb));
+                enc.draw_indexed(mesh.index_count, count, 0, 0, 0);
+            }
         }
     }
 
