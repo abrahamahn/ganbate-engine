@@ -182,6 +182,7 @@ export interface WebGpuDevice {
     onSubmittedWorkDone(): Promise<void>;
   };
   addEventListener(type: 'uncapturederror', listener: (event: { readonly error: { readonly message: string } }) => void): void;
+  removeEventListener?(type: 'uncapturederror', listener: (event: { readonly error: { readonly message: string } }) => void): void;
   createBuffer(descriptor: { size: number; usage: number }): WebGpuBuffer;
   createTexture(descriptor: Record<string, unknown>): WebGpuTexture;
   createSampler(descriptor: Record<string, unknown>): unknown;

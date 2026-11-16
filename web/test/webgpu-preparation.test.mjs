@@ -11,6 +11,9 @@ function fixture() {
   const completion = deferred();
   const deviceLoss = deferred();
   const calls = [];
+  const destroyed = [];
+  const errors = [];
+  let completionWaits = 0;
   const device = {
     lost: deviceLoss.promise,
     addEventListener() {},
@@ -18,13 +21,13 @@ function fixture() {
     createBindGroup: () => ({}),
     createPipelineLayout: () => ({}),
     createSampler: () => ({}),
-    createBuffer: () => ({ destroy() {} }),
+    createBuffer: () => { const buffer = { destroy() { destroyed.push(buffer); } }; return buffer; },
     createShaderModule: () => ({ getCompilationInfo: async () => ({ messages: [] }) }),
     createRenderPipeline() { throw new Error('Unexpected synchronous pipeline'); },
     createRenderPipelineAsync(descriptor) { calls.push(descriptor); return compilation.promise; },
-    queue: { onSubmittedWorkDone: () => completion.promise },
+    queue: { onSubmittedWorkDone: () => { completionWaits++; return completion.promise; } },
   };
-  const host = createHost({ api: 'webgpu', device, canvas: null, context: null }, { stagedPipelines: true });
+  const host = createHost({ api: 'webgpu', device, canvas: null, context: null }, { stagedPipelines: true, onError: (message) => errors.push(message) });
   const memory = new WebAssembly.Memory({ initial: 1 });
   host.attach({ exports: { memory } });
   const g = host.imports.ganbate;
@@ -36,7 +39,7 @@ function fixture() {
     new Uint8Array(memory.buffer, 128, bytes.length).set(bytes);
     return g.gpu_create_render_pipeline(128, bytes.length);
   };
-  return { host, g, compilation, completion, deviceLoss, calls, descriptor, create };
+  return { host, g, compilation, completion, deviceLoss, calls, descriptor, create, destroyed, errors, completionWaits: () => completionWaits };
 }
 
 test('WebGPU keeps numeric pending handles, deduplicates descriptors and waits GPU completion', async () => {
@@ -92,4 +95,41 @@ test('cancelling a preparation waiter preserves another consumer', async () => {
   await assert.rejects(cancelled, { name: 'AbortError' });
   f.compilation.resolve({}); f.completion.resolve();
   await retained;
+});
+
+test('releasing a WebGPU host rejects a pending barrier before the driver settles', { timeout: 1000 }, async () => {
+  const f = fixture();
+  f.create();
+  const pending = assert.rejects(f.host.prepare(), /host was released/);
+  f.host.release();
+  await pending;
+  assert.equal(f.host.preparationStats().pipelinesPending, 0);
+  const stats = f.host.preparationStats();
+  f.compilation.resolve({ label: 'late' });
+  f.completion.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(f.host.preparationStats(), stats, 'late pipelines cannot restore released readiness');
+  assert.equal(f.create(), 0, 'released imports cannot recreate a device resource');
+});
+
+test('WebGPU release is idempotent and suppresses late compilation errors', async () => {
+  const f = fixture();
+  f.create();
+  f.host.release();
+  const released = f.destroyed.length;
+  assert.ok(released > 0, 'host push buffer released');
+  f.host.release();
+  assert.equal(f.destroyed.length, released);
+  f.compilation.reject(new Error('driver rejected after teardown'));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.deepEqual(f.errors, []);
+});
+
+test('a pre-aborted preparation does not start a GPU completion barrier', async () => {
+  const f = fixture();
+  const controller = new AbortController();
+  controller.abort();
+  await assert.rejects(f.host.prepare({ signal: controller.signal }), { name: 'AbortError' });
+  assert.equal(f.completionWaits(), 0);
+  f.host.release();
 });

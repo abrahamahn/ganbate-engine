@@ -165,6 +165,7 @@ export async function boot(options: BootOptions): Promise<{
   fail: (text: string) => void;
   settled: boolean;
 }> {
+  options.signal?.throwIfAborted();
   const { canvas, onPhase = () => {}, onLog = () => {} } = options;
   const errors: string[] = [];
   const fail = (text: string) => {
@@ -179,6 +180,7 @@ export async function boot(options: BootOptions): Promise<{
     try {
       gpu = await createGpu(canvas);
     } catch (e) {
+      options.signal?.throwIfAborted();
       if (api === 'webgpu') throw e;
       onLog(1, `WebGPU unavailable (${e instanceof Error ? e.message : String(e)}); using WebGL 2`);
     }
@@ -191,40 +193,52 @@ export async function boot(options: BootOptions): Promise<{
     onPhase('Starting WebGL 2', 0);
     gpu = createGl(canvas);
   }
-  onLog(0, `${gpu.adapterName}; features: ${gpu.features.join(', ') || 'none'}; canvas ${gpu.format}`);
-  const settled = gpu.api === 'webgpu' && options.present === 'settled';
-  const hostOptions = {
-    onLog,
-    onStatus: options.onStatus || (() => {}),
-    onError: fail,
-    checkErrors: !!options.checkErrors,
-    settled,
-    bundles: options.bundles ?? !appleWebKit(),
-    stagedPipelines: options.stagedPipelines,
-  };
-  const host = gpu.api === 'webgl2' ? createGlHost(gpu, hostOptions) : createHost(gpu, hostOptions);
-  onPhase('Loading the engine', 0);
-  let instance: WebAssembly.Instance;
-  if (
-    options.wasm &&
-    typeof options.wasm === 'object' &&
-    'exports' in options.wasm &&
-    options.wasm.exports
-  ) {
-    instance = options.wasm as WebAssembly.Instance;
-  } else if (options.wasm instanceof ArrayBuffer || ArrayBuffer.isView(options.wasm)) {
-    ({ instance } = await WebAssembly.instantiate(options.wasm as BufferSource, host.imports));
-  } else {
-    const wasmResponse = await fetch(options.wasm as string, { signal: options.signal });
-    if (!wasmResponse.ok) throw new Error(`${options.wasm}: HTTP ${wasmResponse.status}`);
-    try {
-      ({ instance } = await WebAssembly.instantiateStreaming(wasmResponse.clone(), host.imports));
-    } catch {
-      ({ instance } = await WebAssembly.instantiate(await wasmResponse.arrayBuffer(), host.imports));
+  let host: GanbateHostRuntime | null = null;
+  try {
+    // Device creation and WASM instantiation are not abortable platform operations. Check again
+    // after each awaited boundary and release everything before allowing a retry.
+    options.signal?.throwIfAborted();
+    onLog(0, `${gpu.adapterName}; features: ${gpu.features.join(', ') || 'none'}; canvas ${gpu.format}`);
+    const settled = gpu.api === 'webgpu' && options.present === 'settled';
+    const hostOptions = {
+      onLog,
+      onStatus: options.onStatus || (() => {}),
+      onError: fail,
+      checkErrors: !!options.checkErrors,
+      settled,
+      bundles: options.bundles ?? !appleWebKit(),
+      stagedPipelines: options.stagedPipelines,
+    };
+    host = gpu.api === 'webgl2' ? createGlHost(gpu, hostOptions) : createHost(gpu, hostOptions);
+    onPhase('Loading the engine', 0);
+    let instance: WebAssembly.Instance;
+    if (
+      options.wasm &&
+      typeof options.wasm === 'object' &&
+      'exports' in options.wasm &&
+      options.wasm.exports
+    ) {
+      instance = options.wasm as WebAssembly.Instance;
+    } else if (options.wasm instanceof ArrayBuffer || ArrayBuffer.isView(options.wasm)) {
+      ({ instance } = await WebAssembly.instantiate(options.wasm as BufferSource, host.imports));
+    } else {
+      const wasmResponse = await fetch(options.wasm as string, { signal: options.signal });
+      if (!wasmResponse.ok) throw new Error(`${options.wasm}: HTTP ${wasmResponse.status}`);
+      try {
+        ({ instance } = await WebAssembly.instantiateStreaming(wasmResponse.clone(), host.imports));
+      } catch {
+        options.signal?.throwIfAborted();
+        ({ instance } = await WebAssembly.instantiate(await wasmResponse.arrayBuffer(), host.imports));
+      }
     }
+    options.signal?.throwIfAborted();
+    host.attach(instance);
+    return { gpu, host, x: instance.exports as unknown as GanbateWasmExports, errors, fail, settled };
+  } catch (error) {
+    host?.release?.();
+    if (gpu.api === 'webgpu') gpu.device.destroy?.();
+    throw error;
   }
-  host.attach(instance);
-  return { gpu, host, x: instance.exports as unknown as GanbateWasmExports, errors, fail, settled };
 }
 
 /** Reads `texture` (the canvas texture of the current frame) back as RGBA8 pixels. */

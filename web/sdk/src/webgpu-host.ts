@@ -110,15 +110,21 @@ export async function createGpu(canvas?: HTMLCanvasElement): Promise<WebGpuState
     .join(' ');
   let context: WebGpuCanvasContext | null = null;
   let format: string | null = null;
-  if (canvas) {
-    context = canvas.getContext('webgpu') as unknown as WebGpuCanvasContext;
-    format = nav.gpu.getPreferredCanvasFormat();
-    context.configure({
-      device,
-      format,
-      alphaMode: 'opaque',
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
-    });
+  try {
+    if (canvas) {
+      context = canvas.getContext('webgpu') as unknown as WebGpuCanvasContext | null;
+      if (!context) throw new Error('This canvas has no WebGPU context.');
+      format = nav.gpu.getPreferredCanvasFormat();
+      context.configure({
+        device,
+        format,
+        alphaMode: 'opaque',
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+      });
+    }
+  } catch (error) {
+    device.destroy?.();
+    throw error;
   }
   return {
     api: 'webgpu',
@@ -154,6 +160,8 @@ export function createHost(
   let released = false;
   let resolveLost!: (reason: string) => void;
   const lost = new Promise<string>((resolve) => { resolveLost = resolve; });
+  let resolveReleased!: () => void;
+  const releaseComplete = new Promise<void>((resolve) => { resolveReleased = resolve; });
   const pendingPipelines = new Set<Promise<void>>();
   const shaderChecks = new Set<Promise<void>>();
   const pipelineFailures: string[] = [];
@@ -179,10 +187,13 @@ export function createHost(
   const decoder = new TextDecoder();
 
   const report = (message: string) => {
+    if (released) return;
     errors.push(message);
     onError(message);
   };
-  device.addEventListener('uncapturederror', (e) => report(`WebGPU: ${e.error.message}`));
+  const onUncapturedError = (e: { readonly error: { readonly message: string } }) =>
+    report(`WebGPU: ${e.error.message}`);
+  device.addEventListener('uncapturederror', onUncapturedError);
   device.lost.then((i) => {
     if (released) return;
     lostReason = `WebGPU device lost (${i.reason}): ${i.message}`;
@@ -219,14 +230,16 @@ export function createHost(
     const asyncCreate = compute ? device.createComputePipelineAsync : device.createRenderPipelineAsync;
     if (staging && asyncCreate) {
       const job = asyncCreate.call(device, descriptor).then((value) => {
+        if (released) return;
         record.value = value;
         pipelinesReady++;
       }, (error: unknown) => {
+        if (released) return;
         record.error = `Pipeline preparation: ${error instanceof Error ? error.message : String(error)}`;
         pipelineFailures.push(record.error);
         report(record.error);
       }).finally(() => {
-        pipelineMs += performance.now() - started;
+        if (!released) pipelineMs += performance.now() - started;
         pendingPipelines.delete(job);
       });
       pendingPipelines.add(job);
@@ -252,6 +265,7 @@ export function createHost(
     <A extends number[]>(what: string, f: (...args: A) => number) =>
     (...args: A): number => {
       try {
+        if (released) throw new Error('WebGPU host was released');
         return f(...args);
       } catch (e) {
         lastError = `${what}: ${e instanceof Error ? e.message : String(e)}`;
@@ -909,6 +923,7 @@ export function createHost(
       const code = str(ptr, len);
       const module = device.createShaderModule({ code, label: /from '([^']+)'/.exec(code)?.[1] });
       const check = module.getCompilationInfo().then((info) => {
+        if (released) return;
         const lines = code.split('\n');
         for (const m of info.messages) {
           const where = m.lineNum ? `${m.lineNum}:${m.linePos} ${lines[m.lineNum - 1].trim()}` : '';
@@ -1030,6 +1045,7 @@ export function createHost(
     setStagedPipelines(value: boolean) { staging = value; },
     preparationStats: () => ({ pipelinesPending: pendingPipelines.size, pipelinesReady, pipelineMs }),
     async prepare({ signal }: { signal?: AbortSignal } = {}) {
+      signal?.throwIfAborted();
       const check = () => {
         if (released) throw new Error('WebGPU host was released');
         if (lostReason) throw new Error(lostReason);
@@ -1042,7 +1058,11 @@ export function createHost(
         await device.queue.onSubmittedWorkDone();
         check();
       })();
-      await preparationBoundary(Promise.race([work, lost.then((reason) => { throw new Error(reason); })]), signal);
+      await preparationBoundary(Promise.race([
+        work,
+        lost.then((reason) => { throw new Error(reason); }),
+        releaseComplete.then(() => { throw new Error('WebGPU host was released'); }),
+      ]), signal);
     },
     attach(instance: WebAssembly.Instance) {
       memory = instance.exports.memory as WebAssembly.Memory;
@@ -1093,12 +1113,25 @@ export function createHost(
       }
     },
     release() {
+      if (released) return;
       released = true;
+      resolveReleased();
+      device.removeEventListener?.('uncapturederror', onUncapturedError);
+      // Rust normally drops these first. A failed WASM boot has no runtime to do that.
+      for (let handle = 1; handle < objects.length; handle++) {
+        (imports.gpu_release as (handle: number) => void)(handle);
+      }
+      clearBundles();
       pipelineCache.clear();
+      pendingPipelines.clear();
+      shaderChecks.clear();
       ring.buffer.destroy();
       while (retired.length) retired.pop()!.destroy();
       stage?.destroy();
       stage = null;
+      surfaceTexture = null;
+      surfaceView = null;
+      source = null;
     },
     bundleStats: () => ({ cached: bundleCompiled, candidates: bundleEntries, replays: bundleReplays }),
     timing,
