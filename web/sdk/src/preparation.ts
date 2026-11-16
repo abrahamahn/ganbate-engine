@@ -1,16 +1,27 @@
 /** Await a preparation boundary without retaining aborted listeners. */
-export async function preparationBoundary<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
-  signal?.throwIfAborted();
-  if (!signal) return work;
-  let abort!: () => void;
+export async function preparationBoundary<T>(work: Promise<T>, ...signals: readonly (AbortSignal | undefined)[]): Promise<T> {
+  const active = [...new Set(signals.filter((signal): signal is AbortSignal => signal !== undefined))];
+  const reason = (signal: AbortSignal) => signal.reason ?? new DOMException('Cancelled', 'AbortError');
+  const aborted = active.find((signal) => signal.aborted);
+  if (aborted) {
+    // The caller already started this work before passing its promise. Observe a late
+    // rejection even when cancellation means we will never consume its result.
+    void work.catch(() => {});
+    throw reason(aborted);
+  }
+  if (!active.length) return work;
+  const listeners: (() => void)[] = [];
   const cancelled = new Promise<never>((_, reject) => {
-    abort = () => reject(signal.reason ?? new DOMException('Cancelled', 'AbortError'));
-    signal.addEventListener('abort', abort, { once: true });
+    for (const signal of active) {
+      const abort = () => reject(reason(signal));
+      listeners.push(abort);
+      signal.addEventListener('abort', abort, { once: true });
+    }
   });
   try {
     return await Promise.race([work, cancelled]);
   } finally {
-    signal.removeEventListener('abort', abort);
+    active.forEach((signal, index) => signal.removeEventListener('abort', listeners[index]));
   }
 }
 

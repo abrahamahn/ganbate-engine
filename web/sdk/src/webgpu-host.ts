@@ -172,8 +172,8 @@ export function createHost(
   let released = false;
   let resolveLost!: (reason: string) => void;
   const lost = new Promise<string>((resolve) => { resolveLost = resolve; });
-  let resolveReleased!: () => void;
-  const releaseComplete = new Promise<void>((resolve) => { resolveReleased = resolve; });
+  const preparationStop = new AbortController();
+  let preparationGeneration = 0;
   const pendingPipelines = new Set<Promise<void>>();
   const shaderChecks = new Set<Promise<void>>();
   const pipelineFailures: string[] = [];
@@ -201,6 +201,8 @@ export function createHost(
   const report = (message: string) => {
     if (released) return;
     errors.push(message);
+    // Wake every waiter before calling application code, which can destroy the host or throw.
+    preparationStop.abort(new Error(message));
     onError(message);
   };
   const onUncapturedError = (e: { readonly error: { readonly message: string } }) =>
@@ -210,6 +212,9 @@ export function createHost(
     if (released) return;
     resources.close();
     lostReason = `WebGPU device lost (${i.reason}): ${i.message}`;
+    pendingPipelines.clear();
+    shaderChecks.clear();
+    pipelineCache.clear();
     resolveLost(lostReason);
     report(lostReason);
   });
@@ -238,21 +243,22 @@ export function createHost(
     const key = `${compute}/${JSON.stringify(keyDescriptor)}`;
     const cached = pipelineCache.get(key);
     if (cached) return put(cached);
+    preparationGeneration++;
     const record: Pipeline = { kind: 'pipeline' };
     const started = performance.now();
     const asyncCreate = compute ? device.createComputePipelineAsync : device.createRenderPipelineAsync;
     if (staging && asyncCreate) {
       const job = asyncCreate.call(device, descriptor).then((value) => {
-        if (released) return;
+        if (released || lostReason) return;
         record.value = value;
         pipelinesReady++;
       }, (error: unknown) => {
-        if (released) return;
+        if (released || lostReason) return;
         record.error = `Pipeline preparation: ${error instanceof Error ? error.message : String(error)}`;
         pipelineFailures.push(record.error);
         report(record.error);
       }).finally(() => {
-        if (!released) pipelineMs += performance.now() - started;
+        if (!released && !lostReason) pipelineMs += performance.now() - started;
         pendingPipelines.delete(job);
       });
       pendingPipelines.add(job);
@@ -279,6 +285,7 @@ export function createHost(
     (...args: A): number => {
       try {
         if (released) throw new Error('WebGPU host was released');
+        if (lostReason) throw new Error(lostReason);
         return f(...args);
       } catch (e) {
         lastError = `${what}: ${e instanceof Error ? e.message : String(e)}`;
@@ -957,8 +964,9 @@ export function createHost(
     gpu_create_shader: guard('createShaderModule', (ptr: number, len: number) => {
       const code = str(ptr, len);
       const module = device.createShaderModule({ code, label: /from '([^']+)'/.exec(code)?.[1] });
+      preparationGeneration++;
       const check = module.getCompilationInfo().then((info) => {
-        if (released) return;
+        if (released || lostReason) return;
         const lines = code.split('\n');
         for (const m of info.messages) {
           const where = m.lineNum ? `${m.lineNum}:${m.linePos} ${lines[m.lineNum - 1].trim()}` : '';
@@ -966,7 +974,9 @@ export function createHost(
           if (m.type === 'error') report(text);
           else onLog(1, text);
         }
-      }).catch((error: unknown) => report(`WGSL validation: ${String(error)}`)).finally(() => shaderChecks.delete(check));
+      }).catch((error: unknown) => {
+        if (!released && !lostReason) report(`WGSL validation: ${String(error)}`);
+      }).finally(() => shaderChecks.delete(check));
       shaderChecks.add(check);
       return put(module);
     }),
@@ -1083,22 +1093,26 @@ export function createHost(
     async prepare({ signal }: { signal?: AbortSignal } = {}) {
       signal?.throwIfAborted();
       const check = () => {
+        signal?.throwIfAborted();
+        preparationStop.signal.throwIfAborted();
         if (released) throw new Error('WebGPU host was released');
         if (lostReason) throw new Error(lostReason);
         if (pipelineFailures.length || errors.length) throw new Error(pipelineFailures[0] || errors[0]);
       };
       check();
-      const work = (async () => {
-        while (pendingPipelines.size || shaderChecks.size) await Promise.all([...pendingPipelines, ...shaderChecks]);
+      for (;;) {
+        while (pendingPipelines.size || shaderChecks.size) {
+          await preparationBoundary(Promise.all([...pendingPipelines, ...shaderChecks]), signal, preparationStop.signal);
+          check();
+        }
         check();
-        await device.queue.onSubmittedWorkDone();
+        const generation = preparationGeneration;
+        await preparationBoundary(device.queue.onSubmittedWorkDone(), signal, preparationStop.signal);
         check();
-      })();
-      await preparationBoundary(Promise.race([
-        work,
-        lost.then((reason) => { throw new Error(reason); }),
-        releaseComplete.then(() => { throw new Error('WebGPU host was released'); }),
-      ]), signal);
+        // Another consumer may add and even finish pipeline work during this queue wait.
+        // Fence that new generation too; ordinary gameplay submissions do not extend it.
+        if (generation === preparationGeneration) return;
+      }
     },
     attach(instance: WebAssembly.Instance) {
       memory = instance.exports.memory as WebAssembly.Memory;
@@ -1151,7 +1165,7 @@ export function createHost(
     release() {
       if (released) return;
       released = true;
-      resolveReleased();
+      preparationStop.abort(new Error('WebGPU host was released'));
       device.removeEventListener?.('uncapturederror', onUncapturedError);
       // Rust normally drops these first. A failed WASM boot has no runtime to do that.
       for (let handle = 1; handle < objects.length; handle++) {

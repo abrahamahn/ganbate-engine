@@ -9,6 +9,8 @@ function setup({ parallel = true, linked = true } = {}) {
   let signaled = false;
   let lost = false;
   const calls = [];
+  const fences = [];
+  const deletedFences = new Map();
   const constants = {
     MAX_COMBINED_TEXTURE_IMAGE_UNITS: 1,
     COMPILE_STATUS: 2,
@@ -36,9 +38,18 @@ function setup({ parallel = true, linked = true } = {}) {
     useProgram: () => calls.push('use-program'),
     createShader: () => ({ id: nextId++ }),
     createProgram: () => ({ id: nextId++ }),
-    fenceSync: () => { calls.push('fence'); return {}; },
-    clientWaitSync: () => signaled ? constants.CONDITION_SATISFIED : constants.TIMEOUT_EXPIRED,
-    deleteSync: () => calls.push('delete-fence'),
+    fenceSync: () => {
+      calls.push('fence');
+      const fence = { signaled: false };
+      fences.push(fence);
+      return fence;
+    },
+    clientWaitSync: (fence) => signaled || fence.signaled
+      ? constants.CONDITION_SATISFIED : constants.TIMEOUT_EXPIRED,
+    deleteSync: (fence) => {
+      calls.push('delete-fence');
+      deletedFences.set(fence, (deletedFences.get(fence) ?? 0) + 1);
+    },
     deleteProgram: () => calls.push('delete-program'),
     deleteSampler: () => calls.push('delete-sampler'),
     deleteVertexArray: () => calls.push('delete-vao'),
@@ -66,10 +77,21 @@ function setup({ parallel = true, linked = true } = {}) {
   const metadata = new TextEncoder().encode('u texture 0');
   new Uint8Array(memory.buffer, 64, metadata.length).set(metadata);
   const create = () => host.imports.ganbate.gl_create_program(16, source.length, 16, source.length, 64, metadata.length);
-  return { host, calls, create, complete() { completed = true; }, signal() { signaled = true; }, lose() { lost = true; } };
+  return {
+    host, calls, create, fences, deletedFences,
+    complete() { completed = true; },
+    signal() { signaled = true; },
+    signalFence(index) { fences[index].signaled = true; },
+    lose() { lost = true; },
+  };
 }
 
 const tick = () => new Promise((resolve) => setTimeout(resolve, 10));
+const poll = async (t) => {
+  t.mock.timers.tick(4);
+  await Promise.resolve();
+  await Promise.resolve();
+};
 
 test('staged program returns a numeric pending handle without blocking queries or use', async () => {
   const h = setup();
@@ -162,4 +184,139 @@ test('release deletes pending programs and host helpers once after failed startu
   h.host.release();
   assert.equal(h.calls.length, releasedCalls);
   assert.equal(h.host.preparationStats().pipelinesPending, 0);
+});
+
+test('preparation includes a program created while its first fence is pending', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const h = setup();
+  let ready = false;
+  const prepared = h.host.prepare().then(() => { ready = true; });
+  try {
+    assert.equal(h.fences.length, 1);
+    h.create();
+    h.signalFence(0);
+    await poll(t);
+    assert.equal(ready, false, 'a preceding fence cannot complete a newly created program');
+    assert.equal(h.host.preparationStats().pipelinesPending, 1);
+    h.complete();
+    await poll(t);
+    assert.equal(h.host.preparationStats().pipelinesPending, 0);
+    assert.equal(h.fences.length, 2, 'new initialization needs its own completion fence');
+    assert.equal(ready, false);
+    h.signalFence(1);
+    await poll(t);
+    await prepared;
+    assert.deepEqual([...h.deletedFences.values()], [1, 1]);
+  } finally {
+    h.complete();
+    h.signal();
+    await poll(t);
+    await prepared;
+    h.host.release();
+  }
+});
+
+test('a concurrent consumer cannot hide a new program from an older preparation fence', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const h = setup();
+  let firstReady = false;
+  const first = h.host.prepare().then(() => { firstReady = true; });
+  h.create();
+  h.complete();
+  const second = h.host.prepare();
+  try {
+    assert.equal(h.host.preparationStats().pipelinesPending, 0, 'second consumer drained the program');
+    assert.equal(h.fences.length, 2);
+    h.signalFence(1);
+    await poll(t);
+    await second;
+    assert.equal(firstReady, false);
+    h.signalFence(0);
+    await poll(t);
+    assert.equal(firstReady, false, 'the generation changed even though no programs remain pending');
+    assert.equal(h.fences.length, 3);
+    h.signalFence(2);
+    await poll(t);
+    await first;
+    assert.deepEqual([...h.deletedFences.values()], [1, 1, 1]);
+  } finally {
+    h.signal();
+    await poll(t);
+    await Promise.all([first, second]);
+    h.host.release();
+  }
+});
+
+test('synchronous fallback programs also invalidate an older preparation fence', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const h = setup({ parallel: false });
+  let ready = false;
+  const prepared = h.host.prepare().then(() => { ready = true; });
+  try {
+    h.create();
+    assert.equal(h.host.preparationStats().pipelinesPending, 0);
+    h.signalFence(0);
+    await poll(t);
+    assert.equal(ready, false, 'synchronous linking still happened after the original fence');
+    assert.equal(h.fences.length, 2);
+    h.signalFence(1);
+    await poll(t);
+    await prepared;
+    assert.deepEqual([...h.deletedFences.values()], [1, 1]);
+  } finally {
+    h.signal();
+    await poll(t);
+    await prepared;
+    h.host.release();
+  }
+});
+
+test('cancelling a fence waiter leaves another consumer and its fence intact', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const h = setup();
+  const controller = new AbortController();
+  const first = h.host.prepare({ signal: controller.signal });
+  const cancelled = assert.rejects(first, { name: 'AbortError' });
+  h.create();
+  h.complete();
+  let secondReady = false;
+  const second = h.host.prepare().then(() => { secondReady = true; });
+  try {
+    controller.abort();
+    await poll(t);
+    await cancelled;
+    assert.equal(h.deletedFences.get(h.fences[0]), 1);
+    assert.equal(h.deletedFences.has(h.fences[1]), false);
+    assert.equal(secondReady, false);
+    h.signalFence(1);
+    await poll(t);
+    await second;
+    assert.deepEqual([...h.deletedFences.values()], [1, 1]);
+    assert.equal(h.host.preparationStats().pipelinesReady, 1);
+  } finally {
+    controller.abort();
+    h.signal();
+    await poll(t);
+    await Promise.all([cancelled, second]);
+    h.host.release();
+  }
+});
+
+test('ordinary frame submissions do not extend an unchanged preparation boundary', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const h = setup();
+  const prepared = h.host.prepare();
+  try {
+    assert.equal(h.host.imports.ganbate.gl_submit(0, 0, 0, 0, 0), 1);
+    h.signalFence(0);
+    await poll(t);
+    await prepared;
+    assert.equal(h.fences.length, 1);
+    assert.deepEqual([...h.deletedFences.values()], [1]);
+  } finally {
+    h.signal();
+    await poll(t);
+    await prepared;
+    h.host.release();
+  }
 });

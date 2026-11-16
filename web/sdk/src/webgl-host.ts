@@ -142,6 +142,7 @@ export function createGlHost(
   let released = false;
   let pipelineMs = 0;
   let pipelinesReady = 0;
+  let programGeneration = 0;
   let preparationError: Error | null = null;
   interface ProgramRecord {
     program: WebGLProgram;
@@ -505,6 +506,7 @@ export function createGlHost(
       if (!deferred && !gl.getProgramParameter(p, gl.LINK_STATUS)) {
         throw new Error(`link: ${gl.getProgramInfoLog(p)}`);
       }
+      programGeneration++;
       return p;
     } catch (error) {
       gl.deleteProgram(p);
@@ -1350,43 +1352,50 @@ export function createGlHost(
         if (preparationError) throw preparationError;
       };
       const yieldPoll = () => new Promise<void>((resolve) => setTimeout(resolve, 4));
-      check();
-      while (pendingPrograms.size) {
+      for (;;) {
         check();
-        for (const record of pendingPrograms) {
-          // This query is explicitly nonblocking; all other program queries wait until it succeeds.
-          if (!gl.getProgramParameter(record.program, parallel!.COMPLETION_STATUS_KHR)) continue;
-          if (!gl.getProgramParameter(record.program, gl.LINK_STATUS)) {
-            preparationError = new Error(`WebGL program ${record.name}: ${gl.getProgramInfoLog(record.program) || 'link failed'}`);
-            report(preparationError.message);
-            throw preparationError;
-          }
-          record.initialize();
-          pendingPrograms.delete(record);
-        }
-        if (pendingPrograms.size) await yieldPoll();
-      }
-      // A frame submission is not completion. Fence all preceding uploads and draws once at
-      // preparation boundaries; gameplay frames never wait on this barrier.
-      const sync = gl.fenceSync?.(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
-      if (!sync) {
-        check();
-        throw new Error('WebGL 2 could not create the preparation fence');
-      }
-      gl.flush();
-      try {
-        for (;;) {
+        while (pendingPrograms.size) {
           check();
-          const status = gl.clientWaitSync(sync, 0, 0);
-          if (status === gl.WAIT_FAILED) throw new Error('WebGL 2 preparation fence failed');
-          if (status === gl.ALREADY_SIGNALED || status === gl.CONDITION_SATISFIED) break;
-          if (status !== gl.TIMEOUT_EXPIRED) throw new Error('WebGL 2 returned an invalid preparation fence status');
-          await yieldPoll();
+          for (const record of pendingPrograms) {
+            // This query is explicitly nonblocking; all other program queries wait until it succeeds.
+            if (!gl.getProgramParameter(record.program, parallel!.COMPLETION_STATUS_KHR)) continue;
+            if (!gl.getProgramParameter(record.program, gl.LINK_STATUS)) {
+              preparationError = new Error(`WebGL program ${record.name}: ${gl.getProgramInfoLog(record.program) || 'link failed'}`);
+              report(preparationError.message);
+              throw preparationError;
+            }
+            record.initialize();
+            pendingPrograms.delete(record);
+          }
+          if (pendingPrograms.size) await yieldPoll();
         }
-      } finally {
-        gl.deleteSync(sync);
+        // A frame submission is not completion. Fence preceding uploads and draws at
+        // preparation boundaries; gameplay frames never wait on this barrier.
+        const generation = programGeneration;
+        const sync = gl.fenceSync?.(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+        if (!sync) {
+          check();
+          throw new Error('WebGL 2 could not create the preparation fence');
+        }
+        gl.flush();
+        try {
+          for (;;) {
+            check();
+            const status = gl.clientWaitSync(sync, 0, 0);
+            if (status === gl.WAIT_FAILED) throw new Error('WebGL 2 preparation fence failed');
+            if (status === gl.ALREADY_SIGNALED || status === gl.CONDITION_SATISFIED) break;
+            if (status !== gl.TIMEOUT_EXPIRED) throw new Error('WebGL 2 returned an invalid preparation fence status');
+            await yieldPoll();
+          }
+        } finally {
+          gl.deleteSync(sync);
+        }
+        check();
+        // Another consumer may have created and even initialized a program during the fence
+        // wait. Its commands need a new fence even when pendingPrograms is already empty.
+        // Ordinary frame submissions do not change this generation or extend the boundary.
+        if (generation === programGeneration) return;
       }
-      check();
     },
     release() {
       if (released) return;

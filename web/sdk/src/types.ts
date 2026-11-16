@@ -438,7 +438,9 @@ export interface GanbateEngine {
   /** Resolves on context/device loss. The owner must invalidate and recreate this session. */
   readonly lost: Promise<string>;
   /** Waits for pipeline jobs and submitted GPU work. Call after preparing and rendering target views,
-   * never every gameplay frame. Does not finish capture-quality AO or declare unseen paths ready. */
+   * never every gameplay frame. Concurrent shader/pipeline additions are drained and fenced again;
+   * finish required asset producers before calling, since arbitrary later uploads/frames are not
+   * included. Does not finish capture-quality AO or declare unseen paths ready. */
   prepare(options?: { readonly signal?: AbortSignal }): Promise<void>;
   preparationStats(): GanbatePreparationStats;
   /** Snapshot of underlying host-owned GPU buffers/textures, including helper resources.

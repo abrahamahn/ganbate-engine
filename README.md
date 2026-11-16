@@ -120,6 +120,14 @@ engine.project([0, 1, 0]);                            // 3D world point -> CSS p
 engine.pick(event.offsetX, event.offsetY);            // triangle-accurate prop picking
 ```
 
+Call `await engine.prepare({ signal })` after required asset producers finish and target views
+are rendered. It waits for shader/pipeline validation and GPU completion. A shader or pipeline
+added by another consumer during that completion wait requires a new completion boundary,
+even if another waiter already finished its compilation. Cancelling one waiter leaves shared
+jobs available to others. Driver failure, device loss and host release reject pending waiters
+without waiting for unrelated unfinished compilation. This is a startup/transition boundary;
+arbitrary later uploads and ordinary gameplay frames do not extend its work set.
+
 `engine.resourceStats()` returns snapshots for `buffers`, `textures`, and their concurrent
 `total`: `liveCount`, `peakCount`, cumulative `allocations`, `estimatedBytes`,
 `peakEstimatedBytes`, cumulative `allocatedEstimatedBytes`, `unknownSizeCount`, and
