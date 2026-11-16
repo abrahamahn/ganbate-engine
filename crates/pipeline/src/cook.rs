@@ -11,7 +11,8 @@
 //! Each entity's instances and lights form one run, recorded in the entity table with its id,
 //! name, parent and transform; the components the renderer does not draw go to the table's
 //! data as canonical JSON. The renderer groups draws by material when it loads the world, so
-//! keeping objects separate costs no draw calls.
+//! keeping objects separate costs no draw calls. Only resources reachable from the selected
+//! instances are retained; selecting a model node does not ship the model's unused geometry.
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -713,12 +714,77 @@ fn cook_resolved_internal(
         data: json::to_canonical(&Value::Object(root))?,
     };
     w.validate()?;
+    compact_resources(&mut w);
     table.validate(&w)?;
     Ok(Cooked {
         world: w,
         table,
         warnings,
     })
+}
+
+/// Remove resources the authored scene never instances, after validating their indices.
+/// This is not camera culling: every selected instance remains, including off-screen geometry
+/// needed by shadows/reflections. Stable resource order preserves deterministic cooked bytes;
+/// instance/light order and the entity table's ranges, hierarchy and identities never change.
+fn compact_resources(world: &mut World) {
+    fn retain<T>(items: &mut Vec<T>, used: &[bool]) -> Vec<u32> {
+        let mut remap = vec![0; items.len()];
+        let mut old = 0;
+        let mut next = 0;
+        items.retain(|_| {
+            let keep = used[old];
+            if keep {
+                remap[old] = next;
+                next += 1;
+            }
+            old += 1;
+            keep
+        });
+        remap
+    }
+
+    let mut meshes = vec![false; world.meshes.len()];
+    for instance in &world.instances {
+        meshes[instance.mesh as usize] = true;
+    }
+    let mesh_map = retain(&mut world.meshes, &meshes);
+    for instance in &mut world.instances {
+        instance.mesh = mesh_map[instance.mesh as usize];
+    }
+
+    let mut materials = vec![false; world.materials.len()];
+    for material in world.meshes.iter().filter_map(|mesh| mesh.material) {
+        materials[material as usize] = true;
+    }
+    let material_map = retain(&mut world.materials, &materials);
+    for mesh in &mut world.meshes {
+        mesh.material = mesh.material.map(|index| material_map[index as usize]);
+    }
+
+    let mut textures = vec![false; world.textures.len()];
+    for material in &world.materials {
+        for texture in [
+            material.base_color_texture,
+            material.normal_texture,
+            material.emissive_texture,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            textures[texture as usize] = true;
+        }
+    }
+    let texture_map = retain(&mut world.textures, &textures);
+    for material in &mut world.materials {
+        for texture in [
+            &mut material.base_color_texture,
+            &mut material.normal_texture,
+            &mut material.emissive_texture,
+        ] {
+            *texture = texture.map(|index| texture_map[index as usize]);
+        }
+    }
 }
 
 /// A file name that changes whenever the bytes do: `<stem>.<first 16 hex of sha256>.<ext>`.
@@ -1025,6 +1091,250 @@ pub(crate) mod tests {
         assert_eq!(a, b);
         let (_, table) = ganbate_assets::cooked::decode_scene(&a).unwrap();
         assert_eq!(table, cooked.table);
+    }
+
+    #[test]
+    fn selected_nodes_cook_without_the_rest_of_the_model() {
+        // Distinct materials keep all three source meshes distinct through import optimization.
+        let mesh = |material| {
+            format!(
+                r#"{{"primitives":[{{"attributes":{{"POSITION":0}},"indices":1,"material":{material}}}]}}"#
+            )
+        };
+        let glb = glb_of(&format!(
+            r#"{TRIANGLE}"materials":[{{"name":"unused-before"}},{{"name":"retained"}},{{"name":"unused-after"}}],"meshes":[{},{},{}],"nodes":[{{"name":"Before","mesh":0}},{{"name":"Selected","mesh":1}},{{"name":"After","mesh":2}}],"scenes":[{{"nodes":[0,1,2]}}],"scene":0}}"#,
+            mesh(0),
+            mesh(1),
+            mesh(2),
+        ));
+        let t = TempDir::new("selected-nodes");
+        let (mut p, model, mut ids) = project_with(&t, &glb);
+        let scene_id = ids.asset();
+        let doc = json::parse(format!(r#"{{
+            "ganbate":"scene","version":1,"id":"{scene_id}","name":"Selected objects",
+            "entities":{{
+                "0000000000000001":{{"name":"Parent","order":"1","components":{{"transform":{{"translation":[2,0,0]}}}}}},
+                "0000000000000002":{{"name":"First","parent":"0000000000000001","order":"1","components":{{"mesh":{{"model":"{model}","node":"Selected"}},"transform":{{"translation":[3,4,5]}}}}}},
+                "0000000000000003":{{"name":"Second","parent":"0000000000000001","order":"2","components":{{"mesh":{{"model":"{model}","node":"Selected"}},"transform":{{"translation":[-1,0,0]}}}}}},
+                "0000000000000004":{{"name":"Lamp","order":"2","components":{{"light":{{"follows_lamps":true,"intensity":3,"range":6}}}}}},
+                "0000000000000005":{{"name":"Dynamic","order":"3","components":{{"mesh":{{"model":"{model}","node":"After","static":false}}}}}}
+            }}
+        }}"#).as_bytes()).unwrap();
+        let reg = engine_registry();
+        assert!(scene::check(&doc, &reg).is_empty());
+        p.write_document("content/selected.scene.json", Kind::Scene, &doc)
+            .unwrap();
+        let cooked = cook_scene(&p, &reg, &scene_id, true).unwrap();
+        assert!(cooked.warnings.is_empty());
+        assert_eq!(cooked.world.meshes.len(), 1);
+        assert_eq!(cooked.world.materials.len(), 1);
+        assert_eq!(cooked.world.materials[0].name, "retained");
+        assert_eq!(cooked.world.meshes[0].material, Some(0));
+        assert_eq!(cooked.world.instances.len(), 2);
+        assert!(cooked.world.instances.iter().all(|i| i.mesh == 0));
+        let first = cooked.table.entities.iter().find(|e| e.id == 2).unwrap();
+        let second = cooked.table.entities.iter().find(|e| e.id == 3).unwrap();
+        assert_eq!(first.instances, 0..1);
+        assert_eq!(second.instances, 1..2);
+        assert_eq!(cooked.table.entities[first.parent.unwrap() as usize].id, 1);
+        assert_eq!(second.parent, first.parent);
+        assert_eq!(first.transform.0[12..15], [5., 4., 5.]);
+        assert_eq!(second.transform.0[12..15], [1., 0., 0.]);
+        assert_eq!(cooked.world.instances[0].transform, first.transform);
+        assert_eq!(cooked.world.instances[1].transform, second.transform);
+        let lamp = cooked.table.entities.iter().find(|e| e.id == 4).unwrap();
+        assert_eq!(lamp.lights, 0..1);
+        assert_eq!(cooked.world.lights[0].intensity, 3.);
+        let dynamic = cooked.table.entities.iter().find(|e| e.id == 5).unwrap();
+        assert!(dynamic.instances.is_empty());
+        let data = json::parse(cooked.table.data.as_bytes()).unwrap();
+        assert_eq!(
+            data.get("entities")
+                .unwrap()
+                .get("0000000000000005")
+                .unwrap()
+                .get("components")
+                .unwrap()
+                .get("mesh")
+                .unwrap()
+                .get("model"),
+            Some(&s(&model)),
+        );
+
+        let bytes =
+            ganbate_assets::cooked::encode_scene(&cooked.world, &cooked.table, true).unwrap();
+        let (decoded, table) = ganbate_assets::cooked::decode_scene(&bytes).unwrap();
+        assert_eq!(table, cooked.table);
+        assert_eq!(decoded.instances, cooked.world.instances);
+        assert_eq!(decoded.materials, cooked.world.materials);
+        // The cached import still holds the full model; a second scene cook must be identical.
+        let again = cook_scene(&p, &reg, &scene_id, true).unwrap();
+        assert_eq!(again.world, cooked.world);
+        assert_eq!(
+            bytes,
+            ganbate_assets::cooked::encode_scene(&again.world, &again.table, true).unwrap(),
+        );
+    }
+
+    #[test]
+    fn compaction_preserves_shared_textures_and_every_material_channel() {
+        use ganbate_core::world::{
+            AlphaMode, Emission, EncodedImage, Material, Mesh, Shading, Texture, TextureCompression,
+        };
+
+        let pixel = |v| Texture {
+            width: 1,
+            height: 1,
+            srgb: true,
+            levels: vec![vec![v, v, v, 255]],
+            encoded: None,
+        };
+        let mut encoded = pixel(1);
+        encoded.levels.clear();
+        encoded.encoded = Some(EncodedImage {
+            mime: "image/png".into(),
+            data: ganbate_assets::png::encode(1, 1, &[20, 40, 80, 255]).unwrap(),
+        });
+        let material = |name: &str| Material {
+            name: name.into(),
+            ..Material::default()
+        };
+        let mesh = |material| Mesh {
+            positions: vec![Vec3(0., 0., 0.), Vec3(1., 0., 0.), Vec3(0., 1., 0.)],
+            normals: vec![Vec3(0., 0., 1.); 3],
+            uvs: vec![[0., 0.], [1., 0.], [0., 1.]],
+            indices: vec![0, 1, 2],
+            material,
+            ..Mesh::default()
+        };
+        let mut world = World {
+            meshes: vec![
+                mesh(Some(0)),
+                mesh(Some(3)),
+                mesh(Some(2)),
+                mesh(Some(1)),
+                mesh(None),
+                mesh(Some(4)),
+            ],
+            instances: [3, 1, 3, 4]
+                .into_iter()
+                .map(|mesh| Instance {
+                    mesh,
+                    transform: Transform::IDENTITY,
+                })
+                .collect(),
+            materials: vec![
+                material("unused-first"),
+                Material {
+                    base_color_texture: Some(4),
+                    normal_texture: Some(2),
+                    emissive_texture: Some(4),
+                    shading: Shading::Foliage,
+                    emission: Emission::Lamp,
+                    alpha: AlphaMode::Mask(0.4),
+                    double_sided: true,
+                    ..material("all-channels")
+                },
+                Material {
+                    base_color_texture: Some(0),
+                    ..material("unused-middle")
+                },
+                Material {
+                    base_color_texture: Some(1),
+                    normal_texture: Some(2),
+                    ..material("shared-normal")
+                },
+                Material {
+                    emissive_texture: Some(3),
+                    ..material("unused-last")
+                },
+            ],
+            textures: vec![
+                pixel(0),
+                encoded,
+                Texture::compressed(4, 4, false, TextureCompression::Bc1, vec![vec![7; 8]]),
+                pixel(3),
+                pixel(4),
+            ],
+            lights: vec![PointLight {
+                position: Vec3(0., 3., 0.),
+                color: [1.; 3],
+                intensity: 2.,
+                range: 6.,
+            }],
+        };
+        world.validate().unwrap();
+        let before = world.clone();
+        compact_resources(&mut world);
+        world.validate().unwrap();
+        let before_bytes = ganbate_assets::cooked::encode(&before).unwrap();
+        let after_bytes = ganbate_assets::cooked::encode(&world).unwrap();
+        assert!(after_bytes.len() < before_bytes.len());
+        assert_eq!(ganbate_assets::cooked::decode(&after_bytes).unwrap(), world);
+        assert_eq!(world.meshes.len(), 3);
+        assert_eq!(world.materials.len(), 2);
+        assert_eq!(
+            world.textures,
+            [
+                before.textures[1].clone(),
+                before.textures[2].clone(),
+                before.textures[4].clone()
+            ]
+        );
+        assert_eq!(
+            world.instances.iter().map(|i| i.mesh).collect::<Vec<_>>(),
+            [1, 0, 1, 2]
+        );
+        assert_eq!(world.lights, before.lights);
+        // Compare the full graph seen by each draw, not just compacted table sizes.
+        for (old, new) in before.instances.iter().zip(&world.instances) {
+            assert_eq!(old.transform, new.transform);
+            let old_mesh = &before.meshes[old.mesh as usize];
+            let new_mesh = &world.meshes[new.mesh as usize];
+            let mut expected_mesh = old_mesh.clone();
+            expected_mesh.material = new_mesh.material;
+            assert_eq!(*new_mesh, expected_mesh);
+            if let Some(old_id) = old_mesh.material {
+                let old_material = &before.materials[old_id as usize];
+                let new_material = &world.materials[new_mesh.material.unwrap() as usize];
+                let mut expected_material = old_material.clone();
+                expected_material.base_color_texture = new_material.base_color_texture;
+                expected_material.normal_texture = new_material.normal_texture;
+                expected_material.emissive_texture = new_material.emissive_texture;
+                assert_eq!(*new_material, expected_material);
+                for (old_texture, new_texture) in [
+                    (
+                        old_material.base_color_texture,
+                        new_material.base_color_texture,
+                    ),
+                    (old_material.normal_texture, new_material.normal_texture),
+                    (old_material.emissive_texture, new_material.emissive_texture),
+                ] {
+                    assert_eq!(
+                        old_texture.map(|i| &before.textures[i as usize]),
+                        new_texture.map(|i| &world.textures[i as usize])
+                    );
+                }
+            } else {
+                assert_eq!(new_mesh.material, None);
+            }
+        }
+        let compacted = world.clone();
+        compact_resources(&mut world);
+        assert_eq!(
+            world, compacted,
+            "an already reachable world remains byte-identical"
+        );
+        world.instances.clear();
+        compact_resources(&mut world);
+        world.validate().unwrap();
+        assert!(world.meshes.is_empty());
+        assert!(world.materials.is_empty());
+        assert!(world.textures.is_empty());
+        assert_eq!(
+            world.lights, before.lights,
+            "a light-only scene keeps its lamps"
+        );
     }
 
     #[test]
