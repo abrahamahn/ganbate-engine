@@ -1,4 +1,5 @@
 import { preparationBoundary } from './preparation.ts';
+import { createResourceTracker, estimateTextureBytes, registerResourceTracker } from './resource-stats.ts';
 import type { GanbateHostRuntime, WebGpuState } from './internal-types.ts';
 import { createPassTiming, GL_IMPORTS } from './pass-timing.ts';
 import { sourceOfSize } from './texture-source.ts';
@@ -151,6 +152,17 @@ export function createHost(
   }: GanbateHostOptions = {},
 ): GanbateHostRuntime {
   const { device, canvas, context } = gpu;
+  const resources = createResourceTracker();
+  const createBuffer = (size: number, usage: number): WebGpuBuffer => {
+    const buffer = device.createBuffer({ size, usage });
+    resources.allocate('buffers', buffer, size);
+    return buffer;
+  };
+  const destroyResource = (resource: { destroy(): void } | null | undefined): void => {
+    if (!resource) return;
+    resource.destroy();
+    resources.release(resource);
+  };
   const objects: any[] = [null];
   const freeList: number[] = [];
   const errors: string[] = [];
@@ -196,6 +208,7 @@ export function createHost(
   device.addEventListener('uncapturederror', onUncapturedError);
   device.lost.then((i) => {
     if (released) return;
+    resources.close();
     lostReason = `WebGPU device lost (${i.reason}): ${i.message}`;
     resolveLost(lostReason);
     report(lostReason);
@@ -284,13 +297,17 @@ export function createHost(
       surfaceTexture = context!.getCurrentTexture();
     } else {
       if (!stage || stage.width !== canvas!.width || stage.height !== canvas!.height) {
-        if (stage) retired.push(stage);
-        stage = device.createTexture({
+        const next = device.createTexture({
           size: [canvas!.width, canvas!.height],
           format: gpu.format,
           usage:
             GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_SRC,
         });
+        resources.allocate('textures', next, estimateTextureBytes({
+          format: gpu.format || 'unknown', width: canvas!.width, height: canvas!.height,
+        }));
+        if (stage) retired.push(stage);
+        stage = next;
       }
       surfaceTexture = stage;
     }
@@ -359,17 +376,23 @@ export function createHost(
     if (ring && ring.size >= len) return;
     let size = 65536;
     while (size < len) size *= 2;
-    if (ring) {
-      ring.buffer.destroy();
-      clearBundles();
-    }
-    const buffer = device.createBuffer({ size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    const buffer = createBuffer(size, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
     const makeGroup = (layout: unknown) =>
       device.createBindGroup({
         layout,
         entries: [{ binding: 0, resource: { buffer, offset: 0, size: PUSH_SLOT } }],
       });
-    ring = { buffer, size, render: makeGroup(pushRenderLayout), compute: makeGroup(pushComputeLayout) };
+    try {
+      const next = { buffer, size, render: makeGroup(pushRenderLayout), compute: makeGroup(pushComputeLayout) };
+      if (ring) {
+        destroyResource(ring.buffer);
+        clearBundles();
+      }
+      ring = next;
+    } catch (error) {
+      destroyResource(buffer);
+      throw error;
+    }
   };
   ensureRing(1);
   const group = (h: number) => {
@@ -476,11 +499,17 @@ export function createHost(
   const stampWrites = (k: number) => {
     if (!stamps) {
       const size = STAMPED_PASSES * 16;
-      stamps = {
-        set: device.createQuerySet({ type: 'timestamp', count: STAMPED_PASSES * 2 }),
-        resolve: device.createBuffer({ size, usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC }),
-        read: device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST }),
-      };
+      const set = device.createQuerySet({ type: 'timestamp', count: STAMPED_PASSES * 2 });
+      let resolve: WebGpuBuffer | null = null;
+      try {
+        resolve = createBuffer(size, GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC);
+        const read = createBuffer(size, GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST);
+        stamps = { set, resolve, read };
+      } catch (error) {
+        destroyResource(resolve);
+        (set as { destroy?(): void }).destroy?.();
+        throw error;
+      }
     }
     return { querySet: stamps.set, beginningOfPassWriteIndex: 2 * k, endOfPassWriteIndex: 2 * k + 1 };
   };
@@ -836,26 +865,32 @@ export function createHost(
       return 1;
     },
     gpu_create_buffer: guard('createBuffer', (size: number, usage: number) =>
-      put(device.createBuffer({ size, usage })),
+      put(createBuffer(size, usage)),
     ),
     gpu_write_buffer(h: number, offset: number, ptr: number, len: number) {
       device.queue.writeBuffer(objects[h >>> 0], offset, memory.buffer, ptr >>> 0, len >>> 0);
     },
     gpu_create_texture: guard(
       'createTexture',
-      (width: number, height: number, layers: number, mips: number, format: number, usage: number) =>
-        put({
-          texture: device.createTexture({
-            size: [width, height, layers],
-            mipLevelCount: mips,
-            format: FORMATS[format],
-            usage,
-          }),
+      (width: number, height: number, layers: number, mips: number, format: number, usage: number) => {
+        const texture = device.createTexture({
+          size: [width, height, layers],
+          mipLevelCount: mips,
+          format: FORMATS[format],
+          usage,
+        });
+        resources.allocate('textures', texture, estimateTextureBytes({
+          format: FORMATS[format] || 'unknown', width, height,
+          depthOrArrayLayers: layers, mipLevelCount: mips,
+        }));
+        return put({
+          texture,
           format: FORMATS[format] || 'rgba8unorm',
           compressed: format >= 12,
           views: new Map(),
           blitGroups: new Map(),
-        }),
+        });
+      },
     ),
     gpu_write_texture(
       h: number,
@@ -1023,9 +1058,9 @@ export function createHost(
       const o = objects[uh];
       if (!o) return;
       clearBundles();
-      if (o.texture && o.texture.destroy) o.texture.destroy();
-      else if (typeof GPUBuffer !== 'undefined' && o instanceof GPUBuffer) o.destroy();
-      else if (typeof o.destroy === 'function') o.destroy();
+      if (o.texture && o.texture.destroy) destroyResource(o.texture);
+      else if (typeof GPUBuffer !== 'undefined' && o instanceof GPUBuffer) destroyResource(o);
+      else if (typeof o.destroy === 'function') destroyResource(o);
       objects[uh] = null;
       freeList.push(uh);
     },
@@ -1038,12 +1073,13 @@ export function createHost(
   };
   for (const name of GL_IMPORTS) imports[name] = unavailable;
 
-  return {
+  return registerResourceTracker({
     imports: { ganbate: imports },
     errors,
     lost,
     setStagedPipelines(value: boolean) { staging = value; },
     preparationStats: () => ({ pipelinesPending: pendingPipelines.size, pipelinesReady, pipelineMs }),
+    resourceStats: () => resources.snapshot(),
     async prepare({ signal }: { signal?: AbortSignal } = {}) {
       signal?.throwIfAborted();
       const check = () => {
@@ -1109,7 +1145,7 @@ export function createHost(
       pass.end();
       device.queue.submit([enc.finish()]);
       if (frame === stage) {
-        while (retired.length) retired.pop()!.destroy();
+        while (retired.length) destroyResource(retired.pop());
       }
     },
     release() {
@@ -1125,9 +1161,17 @@ export function createHost(
       pipelineCache.clear();
       pendingPipelines.clear();
       shaderChecks.clear();
-      ring.buffer.destroy();
-      while (retired.length) retired.pop()!.destroy();
-      stage?.destroy();
+      destroyResource(ring.buffer);
+      while (retired.length) destroyResource(retired.pop());
+      destroyResource(stage);
+      if (stamps) {
+        destroyResource(stamps.resolve);
+        destroyResource(stamps.read);
+        (stamps.set as { destroy?(): void }).destroy?.();
+        stamps = null;
+      }
+      timing.set(false);
+      resources.close();
       stage = null;
       surfaceTexture = null;
       surfaceView = null;
@@ -1158,16 +1202,18 @@ export function createHost(
       enc.resolveQuerySet(stamps!.set, 0, labels.length * 2, stamps!.resolve, 0);
       enc.copyBufferToBuffer(stamps!.resolve, 0, stamps!.read, 0, bytes);
       device.queue.submit([enc.finish()]);
-      stamps!.read.mapAsync(GPUMapMode.READ, 0, bytes).then(() => {
-        const t = new BigInt64Array(stamps!.read.getMappedRange(0, bytes));
+      const read = stamps!.read;
+      read.mapAsync(GPUMapMode.READ, 0, bytes).then(() => {
+        if (released || lostReason) return;
+        const t = new BigInt64Array(read.getMappedRange(0, bytes));
         frame.marks.forEach((m, k) => {
           m.sent = Number(t[2 * k] - t[0]) / 1e6;
           m.done = Number(t[2 * k + 1] - t[0]) / 1e6;
         });
-        stamps!.read.unmap();
+        read.unmap();
         frame.finish();
       }, frame.finish);
     },
     setXrTarget: () => false,
-  };
+  }, resources);
 }

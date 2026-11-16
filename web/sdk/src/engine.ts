@@ -256,6 +256,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
       if (stopped) throw new Error('Engine destroyed during preparation');
     },
     preparationStats: () => host.preparationStats(),
+    resourceStats: () => host.resourceStats(),
     fitCanvas(
       dpr = (typeof window !== 'undefined' ? window.devicePixelRatio : 1) || 1,
       box: { readonly width: number; readonly height: number } | null = null,

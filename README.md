@@ -120,6 +120,27 @@ engine.project([0, 1, 0]);                            // 3D world point -> CSS p
 engine.pick(event.offsetX, event.offsetY);            // triangle-accurate prop picking
 ```
 
+`engine.resourceStats()` returns snapshots for `buffers`, `textures`, and their concurrent
+`total`: `liveCount`, `peakCount`, cumulative `allocations`, `estimatedBytes`,
+`peakEstimatedBytes`, cumulative `allocatedEstimatedBytes`, `unknownSizeCount`, and
+cumulative `unknownSizeAllocations`. Compare snapshots before and after repeated scene
+bindings to detect growth; compare cumulative allocations to detect churn even when live
+counts return to a plateau. A WebGL buffer storage replacement increments allocations;
+ordinary writes and view/handle aliases do not. Call `await engine.prepare()` at a deliberate
+measurement boundary to settle submitted work; querying the counters itself does not wait
+for the GPU or add per-frame queries.
+
+The byte estimates describe logical host-owned storage, including mip levels, array layers,
+samples, compressed blocks, helper rings/surfaces, and temporary readback buffers. Unknown
+or implementation-dependent formats increment the unknown counters and contribute no bytes.
+They are **not physical GPU residency measurements**: external canvas/XR images, driver
+alignment/metadata, deferred reclamation, shader/pipeline internals, and CPU/WASM heaps are
+excluded. Counts track created objects/stores; they cannot prove that a driver accepted an
+allocation reported invalid asynchronously. Release or context/device loss clears live
+counts while preserving session peaks and cumulative totals. Recreating an engine begins a
+new session, so record session identity alongside measurements. This API supplies evidence
+for application-specific budgets; it does not impose a universal memory limit.
+
 - **Cooked Entity Access:** `engine.worldEntities()`, `setWorldInstance`, `pickWorld`, and `setWorldLight` inspect, move, hide, and pick GBEW v4 scene entities at runtime.
 - **Dynamic Lights & Shadows:** `engine.createLight` places up to 64 tiled point or spot lights; up to 2 spots cast 8-tap filtered 1024px real-time prop shadows (`shadow` factor).
 - **Skinned & Morphed Runtime Models:** `engine.loadModel(url)` loads GLBs; `createModelInstance`, `modelClip` (weighted cross-fades), `setModelNode`, `modelMorph` (gathered sparse CPU vertex morphs via `anim::gather_morphed`), `updateModel`, and `modelNodeWorld` (socket attachments) animate characters without mutating static body geometry.

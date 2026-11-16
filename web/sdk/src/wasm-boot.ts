@@ -2,6 +2,7 @@ import { mapBounded } from './preparation.ts';
 import type { AnyGpuState, GanbateHostRuntime, GanbateWasmExports } from './internal-types.ts';
 import { appleWebKit } from './pass-timing.ts';
 import { pixelsOf } from './texture-source.ts';
+import { hostResourceTracker } from './resource-stats.ts';
 import type { GanbateApi, GanbateCapturedFrame } from './types.ts';
 import { createGl, createGlHost } from './webgl-host.ts';
 import type { WebGpuNavigator, WebGpuTexture } from './webgpu-globals.ts';
@@ -260,24 +261,30 @@ export async function readPixels(
     size: bytesPerRow * height,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
   });
-  const enc = gpu.device.createCommandEncoder();
-  enc.copyTextureToBuffer({ texture: gpuTex }, { buffer, bytesPerRow }, [width, height, 1]);
-  gpu.device.queue.submit([enc.finish()]);
-  await buffer.mapAsync(GPUMapMode.READ);
-  const src = new Uint8Array(buffer.getMappedRange());
-  const rgba = new Uint8ClampedArray(width * height * 4);
-  const bgra = (gpu.format || '').startsWith('bgra');
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const s = y * bytesPerRow + x * 4;
-      const d = (y * width + x) * 4;
-      rgba[d] = src[s + (bgra ? 2 : 0)];
-      rgba[d + 1] = src[s + 1];
-      rgba[d + 2] = src[s + (bgra ? 0 : 2)];
-      rgba[d + 3] = 255;
+  const resources = hostResourceTracker(host);
+  resources?.allocate('buffers', buffer, bytesPerRow * height);
+  try {
+    const enc = gpu.device.createCommandEncoder();
+    enc.copyTextureToBuffer({ texture: gpuTex }, { buffer, bytesPerRow }, [width, height, 1]);
+    gpu.device.queue.submit([enc.finish()]);
+    await buffer.mapAsync(GPUMapMode.READ);
+    const src = new Uint8Array(buffer.getMappedRange());
+    const rgba = new Uint8ClampedArray(width * height * 4);
+    const bgra = (gpu.format || '').startsWith('bgra');
+    for (let y = 0; y < height; y++) {
+      for (let x = 0; x < width; x++) {
+        const s = y * bytesPerRow + x * 4;
+        const d = (y * width + x) * 4;
+        rgba[d] = src[s + (bgra ? 2 : 0)];
+        rgba[d + 1] = src[s + 1];
+        rgba[d + 2] = src[s + (bgra ? 0 : 2)];
+        rgba[d + 3] = 255;
+      }
     }
+    buffer.unmap();
+    return { width, height, rgba };
+  } finally {
+    buffer.destroy();
+    resources?.release(buffer);
   }
-  buffer.unmap();
-  buffer.destroy();
-  return { width, height, rgba };
 }

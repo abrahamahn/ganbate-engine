@@ -406,6 +406,27 @@ export interface GanbatePreparationStats {
   readonly pipelineMs: number;
 }
 
+/** Logical host-owned GPU allocations, not driver-reported physical memory. */
+export interface GanbateResourceTotals {
+  readonly liveCount: number;
+  readonly peakCount: number;
+  /** Cumulative underlying allocations, including resources since released. */
+  readonly allocations: number;
+  readonly estimatedBytes: number;
+  readonly peakEstimatedBytes: number;
+  readonly allocatedEstimatedBytes: number;
+  /** Live resources whose size cannot be estimated; byte totals exclude them. */
+  readonly unknownSizeCount: number;
+  readonly unknownSizeAllocations: number;
+}
+
+export interface GanbateResourceStats {
+  readonly buffers: GanbateResourceTotals;
+  readonly textures: GanbateResourceTotals;
+  /** Peaks describe concurrent totals, not the sum of per-kind peaks. */
+  readonly total: GanbateResourceTotals;
+}
+
 export interface GanbateEngine {
   readonly api: 'webgpu' | 'webgl2';
   /** How frames reach the canvas (`CreateEngineOptions.present`); WebGL 2 is always 'direct'. */
@@ -420,6 +441,12 @@ export interface GanbateEngine {
    * never every gameplay frame. Does not finish capture-quality AO or declare unseen paths ready. */
   prepare(options?: { readonly signal?: AbortSignal }): Promise<void>;
   preparationStats(): GanbatePreparationStats;
+  /** Snapshot of underlying host-owned GPU buffers/textures, including helper resources.
+   * Texture estimates include mip levels, layers, samples and compressed blocks. Views are
+   * not allocations. Excludes external canvas/XR images, driver padding/overhead, pipeline
+   * internals, and CPU/WASM heaps. Live counts clear on destroy/loss; peaks and cumulative
+   * allocations remain available for this session. No GPU query or synchronization. */
+  resourceStats(): GanbateResourceStats;
   /**
    * Sizes the canvas to its CSS box times `dpr` (default: the device pixel ratio). `box`: the CSS
    * box the page observed (a page drawing every frame), read instead of the canvas's, which

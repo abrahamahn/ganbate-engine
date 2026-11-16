@@ -6,6 +6,7 @@ import type {
 } from './internal-types.ts';
 import { createPassTiming, GPU_IMPORTS } from './pass-timing.ts';
 import { sourceOfSize } from './texture-source.ts';
+import { createResourceTracker, estimateTextureBytes } from './resource-stats.ts';
 import type { GanbateHostOptions, GanbateXrTarget } from './types.ts';
 
 const GL_SURFACE = 0xffffffff;
@@ -32,6 +33,7 @@ out vec4 color;
 void main() { color = ${array ? 'texture(src, vec3(uv, layer))' : 'texture(src, uv)'}; }`;
 
 interface GlFormatInfo {
+  readonly storageFormat: string;
   readonly internal: number;
   readonly format?: number;
   readonly type?: number;
@@ -129,6 +131,7 @@ export function createGlHost(
   { onLog = () => {}, onStatus = () => {}, onError = () => {}, checkErrors = false, stagedPipelines = false }: GanbateHostOptions = {},
 ): GanbateHostRuntime {
   const { gl, ext, canvas } = gpu;
+  const resources = createResourceTracker();
   const parallel = gl.getExtension('KHR_parallel_shader_compile') as {
     readonly COMPLETION_STATUS_KHR: number;
   } | null;
@@ -164,6 +167,7 @@ export function createGlHost(
   const onContextLost = (event?: Event) => {
     event?.preventDefault();
     contextLost = true;
+    resources.close();
     resolveLost('WebGL 2 context lost');
     report('WebGL 2 context lost');
   };
@@ -201,23 +205,23 @@ export function createGlHost(
 
   const FORMATS: (GlFormatInfo | null)[] = [
     null,
-    { internal: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, size: 4 },
-    { internal: gl.SRGB8_ALPHA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, size: 4 },
-    { internal: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, size: 4, bgra: true },
-    { internal: gl.SRGB8_ALPHA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, size: 4, bgra: true },
-    { internal: gl.RGBA16F, format: gl.RGBA, type: gl.HALF_FLOAT, size: 8, channels: 4, half: true },
-    { internal: gl.RG16F, format: gl.RG, type: gl.HALF_FLOAT, size: 4, channels: 2, half: true },
-    { internal: gl.R16F, format: gl.RED, type: gl.HALF_FLOAT, size: 2, channels: 1, half: true },
-    { internal: gl.R8, format: gl.RED, type: gl.UNSIGNED_BYTE, size: 1, channels: 1, unorm: true },
-    { internal: gl.R32F, format: gl.RED, type: gl.FLOAT, size: 4, channels: 1, float: true },
-    { internal: gl.RGBA32F, format: gl.RGBA, type: gl.FLOAT, size: 16, channels: 4, float: true },
-    { internal: gl.DEPTH_COMPONENT32F, format: gl.DEPTH_COMPONENT, type: gl.FLOAT, size: 4, depth: true },
-    { internal: 0x83f1, compressed: true },
-    { internal: 0x8c4f, compressed: true },
-    { internal: 0x8e8c, compressed: true },
-    { internal: 0x8e8d, compressed: true },
-    { internal: 0x93b0, compressed: true },
-    { internal: 0x93d0, compressed: true },
+    { storageFormat: 'rgba8unorm', internal: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, size: 4 },
+    { storageFormat: 'rgba8unorm-srgb', internal: gl.SRGB8_ALPHA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, size: 4 },
+    { storageFormat: 'bgra8unorm', internal: gl.RGBA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, size: 4, bgra: true },
+    { storageFormat: 'bgra8unorm-srgb', internal: gl.SRGB8_ALPHA8, format: gl.RGBA, type: gl.UNSIGNED_BYTE, size: 4, bgra: true },
+    { storageFormat: 'rgba16float', internal: gl.RGBA16F, format: gl.RGBA, type: gl.HALF_FLOAT, size: 8, channels: 4, half: true },
+    { storageFormat: 'rg16float', internal: gl.RG16F, format: gl.RG, type: gl.HALF_FLOAT, size: 4, channels: 2, half: true },
+    { storageFormat: 'r16float', internal: gl.R16F, format: gl.RED, type: gl.HALF_FLOAT, size: 2, channels: 1, half: true },
+    { storageFormat: 'r8unorm', internal: gl.R8, format: gl.RED, type: gl.UNSIGNED_BYTE, size: 1, channels: 1, unorm: true },
+    { storageFormat: 'r32float', internal: gl.R32F, format: gl.RED, type: gl.FLOAT, size: 4, channels: 1, float: true },
+    { storageFormat: 'rgba32float', internal: gl.RGBA32F, format: gl.RGBA, type: gl.FLOAT, size: 16, channels: 4, float: true },
+    { storageFormat: 'depth32float', internal: gl.DEPTH_COMPONENT32F, format: gl.DEPTH_COMPONENT, type: gl.FLOAT, size: 4, depth: true },
+    { storageFormat: 'bc1-rgba-unorm', internal: 0x83f1, compressed: true },
+    { storageFormat: 'bc1-rgba-unorm-srgb', internal: 0x8c4d, compressed: true },
+    { storageFormat: 'bc7-rgba-unorm', internal: 0x8e8c, compressed: true },
+    { storageFormat: 'bc7-rgba-unorm-srgb', internal: 0x8e8d, compressed: true },
+    { storageFormat: 'astc-4x4-unorm', internal: 0x93b0, compressed: true },
+    { storageFormat: 'astc-4x4-unorm-srgb', internal: 0x93d0, compressed: true },
   ];
   const COMPARES = [
     0,
@@ -268,11 +272,25 @@ export function createGlHost(
       count: mips,
       uid: ++uid,
     };
-    bindScratch(t);
-    if (array) gl.texStorage3D(target, mips, f.internal, w, h, layers);
-    else gl.texStorage2D(target, mips, f.internal, w, h);
-    textures.add(t);
-    return t;
+    if (t.tex === null) throw new Error('WebGL 2 could not create a texture');
+    try {
+      bindScratch(t);
+      if (array) gl.texStorage3D(target, mips, f.internal, w, h, layers);
+      else gl.texStorage2D(target, mips, f.internal, w, h);
+      resources.allocate('textures', t.tex, estimateTextureBytes({
+        format: f.storageFormat,
+        width: w,
+        height: h,
+        depthOrArrayLayers: array ? layers : 1,
+        mipLevelCount: mips,
+      }));
+      textures.add(t);
+      return t;
+    } catch (error) {
+      gl.deleteTexture(t.tex);
+      resources.release(t.tex);
+      throw error;
+    }
   };
 
   let surface: GlTextureRecord | null = null;
@@ -284,6 +302,7 @@ export function createGlHost(
       }
     }
     gl.deleteTexture(t.tex);
+    resources.release(t.tex);
     textures.delete(t);
   };
   const ensureSurface = (): GlTextureRecord | null => {
@@ -293,6 +312,7 @@ export function createGlHost(
     if (w === 0 || h === 0) return null;
     if (!surface || surface.w !== w || surface.h !== h) {
       if (surface) dropTexture(surface);
+      surface = null;
       surface = makeTexture(w, h, 1, 1, FORMATS[1]!, false);
     }
     return surface;
@@ -520,6 +540,7 @@ export function createGlHost(
   const emptyVao = gl.createVertexArray();
 
   const ring = gl.createBuffer();
+  resources.allocate('buffers', ring, 0);
   let ringSize = 0;
   let currentVao: WebGLVertexArrayObject | null = null;
 
@@ -662,8 +683,11 @@ export function createGlHost(
     if (uPushLen) {
       gl.bindBuffer(gl.UNIFORM_BUFFER, ring);
       if (uPushLen > ringSize) {
-        ringSize = Math.max(uPushLen, 65536);
-        gl.bufferData(gl.UNIFORM_BUFFER, ringSize, gl.DYNAMIC_DRAW);
+        const nextSize = Math.max(uPushLen, 65536);
+        gl.bufferData(gl.UNIFORM_BUFFER, nextSize, gl.DYNAMIC_DRAW);
+        ringSize = nextSize;
+        resources.release(ring);
+        resources.allocate('buffers', ring, ringSize);
       }
       gl.bufferSubData(gl.UNIFORM_BUFFER, 0, u8(pushPtr, uPushLen));
     }
@@ -1037,22 +1061,35 @@ export function createGlHost(
         tex: null,
         host: null,
       };
-      if (kinds & (BUF_DATA | BUF_INDEX)) {
-        b.gl = gl.createBuffer();
-        bindForWrite(b);
-        gl.bufferData(bufferTarget(b), size, gl.DYNAMIC_DRAW);
+      try {
+        if (kinds & (BUF_DATA | BUF_INDEX)) {
+          b.gl = gl.createBuffer();
+          if (b.gl === null) throw new Error('WebGL 2 could not create a buffer');
+          bindForWrite(b);
+          gl.bufferData(bufferTarget(b), size, gl.DYNAMIC_DRAW);
+        }
+        if (kinds & BUF_STORAGE) {
+          const rows = Math.max(1, Math.ceil(size / ROW_BYTES));
+          b.shadow = new Uint8Array(rows * ROW_BYTES);
+          b.tex = gl.createTexture();
+          if (b.tex === null) throw new Error('WebGL 2 could not create a storage texture');
+          gl.activeTexture(gl.TEXTURE0 + scratchUnit);
+          gl.bindTexture(gl.TEXTURE_2D, b.tex);
+          gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA32UI, ROW_TEXELS, rows);
+          uploadRows(b, 0, rows * ROW_BYTES);
+        }
+        if (kinds & BUF_READBACK) b.host = new Uint8Array(size);
+        resources.allocate('buffers', b.gl, size);
+        // The shadow/readback arrays are CPU-owned; only the padded RGBA32UI texture is GPU storage.
+        resources.allocate('textures', b.tex, b.shadow?.byteLength ?? 0);
+        return put(b);
+      } catch (error) {
+        if (b.gl) gl.deleteBuffer(b.gl);
+        if (b.tex) gl.deleteTexture(b.tex);
+        resources.release(b.gl);
+        resources.release(b.tex);
+        throw error;
       }
-      if (kinds & BUF_STORAGE) {
-        const rows = Math.max(1, Math.ceil(size / ROW_BYTES));
-        b.shadow = new Uint8Array(rows * ROW_BYTES);
-        b.tex = gl.createTexture();
-        gl.activeTexture(gl.TEXTURE0 + scratchUnit);
-        gl.bindTexture(gl.TEXTURE_2D, b.tex);
-        gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA32UI, ROW_TEXELS, rows);
-        uploadRows(b, 0, rows * ROW_BYTES);
-      }
-      if (kinds & BUF_READBACK) b.host = new Uint8Array(size);
-      return put(b);
     }),
     gl_write_buffer(h: number, offset: number, ptr: number, len: number) {
       writeBytes(objects[h >>> 0] as GlBufferRecord, offset, u8(ptr, len));
@@ -1268,8 +1305,14 @@ export function createGlHost(
       else if (o.mode !== undefined) {
         /* a pipeline: its program is released on its own */
       } else if ('shadow' in o) {
-        if (o.gl) gl.deleteBuffer(o.gl);
-        if (o.tex) gl.deleteTexture(o.tex);
+        if (o.gl) {
+          gl.deleteBuffer(o.gl);
+          resources.release(o.gl);
+        }
+        if (o.tex) {
+          gl.deleteTexture(o.tex);
+          resources.release(o.tex);
+        }
       } else if (typeof WebGLSampler !== 'undefined' && o instanceof WebGLSampler) {
         gl.deleteSampler(o);
       }
@@ -1297,6 +1340,7 @@ export function createGlHost(
     nextFrame() {},
     setStagedPipelines(value: boolean) { staging = value; },
     preparationStats: () => ({ pipelinesPending: pendingPrograms.size, pipelinesReady, pipelineMs }),
+    resourceStats: () => resources.snapshot(),
     async prepare({ signal }: { signal?: AbortSignal } = {}) {
       const check = () => {
         signal?.throwIfAborted();
@@ -1347,6 +1391,7 @@ export function createGlHost(
     release() {
       if (released) return;
       released = true;
+      resources.close();
       canvas?.removeEventListener?.('webglcontextlost', onContextLost);
       channel?.port1.close();
       channel?.port2.close();

@@ -148,6 +148,20 @@ function makeMockWasm(overrides = {}) {
   return { instance: { exports }, calls, memory };
 }
 
+test('public engine resourceStats retains session allocation history after destroy', async () => {
+  const { canvas } = makeRecordingWebGl2Canvas();
+  const { instance } = makeMockWasm();
+  const engine = await createEngine({ canvas, wasm: instance, api: 'webgl2' });
+  const prepared = engine.resourceStats();
+  assert.equal(prepared.buffers.liveCount, 1, 'host uniform ring is part of the engine session');
+  engine.destroy();
+  const destroyed = engine.resourceStats();
+  assert.equal(destroyed.total.liveCount, 0);
+  assert.equal(destroyed.total.estimatedBytes, 0);
+  assert.equal(destroyed.total.allocations, prepared.total.allocations);
+  assert.equal(destroyed.total.peakCount, prepared.total.peakCount);
+});
+
 test('pickRay and pickWorldRay marshal 3D rays, layer masks, and world indices cleanly', async () => {
   const { canvas } = makeRecordingWebGl2Canvas();
   const { instance, calls } = makeMockWasm();
