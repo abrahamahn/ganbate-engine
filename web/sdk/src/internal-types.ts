@@ -222,6 +222,7 @@ export interface GanbateWasmExports {
   ): number;
 
   ganbate_rt_model_parse(ptr: number, len: number): number;
+  ganbate_rt_model_discard(parsed: number): void;
   ganbate_rt_model_describe(parsed: number, out: number, cap: number): number;
   ganbate_rt_model_image(parsed: number, index: number, out: number, cap: number): number;
   ganbate_rt_model_create(parsed: number, texPtr: number, texLen: number): number;

@@ -108,6 +108,7 @@ fn pending(rt: &mut Runtime, id: u32) -> Result<&mut Model, String> {
 
 /// Parses a GLB model (`len` bytes at `ptr`, read during the call). Returns a parsed-model
 /// handle for [`ganbate_rt_model_describe`], [`ganbate_rt_model_image`] and [`ganbate_rt_model_create`].
+/// The host must create the model or discard the handle with [`ganbate_rt_model_discard`].
 ///
 /// # Safety
 /// `ptr` must address `len` readable bytes.
@@ -130,6 +131,21 @@ pub unsafe extern "C" fn ganbate_rt_model_parse(ptr: *const u8, len: usize) -> u
         };
         Ok(i as u32 + 1)
     })
+}
+
+/// Discards a parsed model that will not be uploaded. Zero, missing or empty slots, and a
+/// stopped runtime, are no-ops. The caller must relinquish the handle on create or discard:
+/// a later parse may reuse its slot, so an old token must not be discarded again after reuse.
+/// This cleanup path does not report errors or require a graphics operation.
+#[unsafe(no_mangle)]
+pub extern "C" fn ganbate_rt_model_discard(parsed: u32) {
+    super::RT.with(|cell| {
+        let mut runtime = cell.borrow_mut();
+        let Some(rt) = runtime.as_mut() else { return };
+        if let Some(slot) = rt.pending.get_mut((parsed as usize).wrapping_sub(1)) {
+            *slot = None;
+        }
+    });
 }
 
 /// Writes a parsed model's description (JSON, see `describe`) to `out` if it fits in `cap`

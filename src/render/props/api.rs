@@ -140,13 +140,26 @@ impl Renderer {
             usage: BufferUsage::VERTEX | BufferUsage::COPY_DST,
             memory: Memory::Device,
         })?;
-        device.write_buffer(vertices, 0, &f32_bytes(&data))?;
-        let indices = device.create_buffer(&BufferDesc {
+        if let Err(error) = device.write_buffer(vertices, 0, &f32_bytes(&data)) {
+            device.destroy_buffer(vertices);
+            return Err(error);
+        }
+        let indices = match device.create_buffer(&BufferDesc {
             size: mesh.indices.len() as u64 * 4,
             usage: BufferUsage::INDEX | BufferUsage::COPY_DST,
             memory: Memory::Device,
-        })?;
-        device.write_buffer(indices, 0, &u32_bytes(mesh.indices))?;
+        }) {
+            Ok(indices) => indices,
+            Err(error) => {
+                device.destroy_buffer(vertices);
+                return Err(error);
+            }
+        };
+        if let Err(error) = device.write_buffer(indices, 0, &u32_bytes(mesh.indices)) {
+            device.destroy_buffer(indices);
+            device.destroy_buffer(vertices);
+            return Err(error);
+        }
         let (min, max) = bounds(mesh.positions);
         let entry = MeshEntry {
             vertices,
@@ -168,7 +181,14 @@ impl Renderer {
             drift: 0.0,
             morph: None,
         };
-        Ok(PropMesh(self.props.meshes.insert(entry)?))
+        match self.props.meshes.insert(entry) {
+            Ok(id) => Ok(PropMesh(id)),
+            Err(error) => {
+                device.destroy_buffer(indices);
+                device.destroy_buffer(vertices);
+                Err(error)
+            }
+        }
     }
 
     /// Skins a mesh: each vertex follows up to four of an instance's joints (`joints`, indices

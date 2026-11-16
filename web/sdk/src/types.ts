@@ -620,8 +620,12 @@ export interface GanbateEngine {
     mode?: 'project' | 'reject',
   ): GanbateGraphCommit;
 
-  /** Loads a GLB; its images are decoded into textures. */
-  loadModel(source: string | ArrayBuffer | Uint8Array): Promise<{ model: number; info: GanbateModelInfo; textures: number[] }>;
+  /** Loads a GLB; its images are decoded into textures. The optional signal cancels this
+   * load only. Failure/cancellation discards partial model/texture allocations; engine
+   * destruction or device loss cancels all outstanding model loads. Missing image decode
+   * keeps the existing zero-texture fallback; callers decide whether that is acceptable.
+   * Requires SDK and WASM built together. Successful textures remain caller-owned. */
+  loadModel(source: string | ArrayBuffer | Uint8Array, options?: { readonly signal?: AbortSignal }): Promise<{ model: number; info: GanbateModelInfo; textures: number[] }>;
   /** Destroys a model and its instances; its textures stay. */
   destroyModel(model: number): void;
   /** The material made for the model's glTF material `index`. */

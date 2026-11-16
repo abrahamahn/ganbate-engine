@@ -1,4 +1,4 @@
-import { mapBounded } from './preparation.ts';
+import { mapBounded, preparationBoundary } from './preparation.ts';
 import { graphCalls, scratchFor } from './graph-solver.ts';
 import { createFrameGate } from './pass-timing.ts';
 import {
@@ -200,6 +200,8 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
 
   const gate = createFrameGate(gpu, host, settled);
   let stopped = false;
+  const modelLifetime = new AbortController();
+  void host.lost.then((reason) => modelLifetime.abort(new Error(reason)));
   let drawn: { width: number; height: number } | null = null;
   const drawnSize = () => {
     if (!drawn) {
@@ -669,59 +671,113 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
       return JSON.parse(new TextDecoder().decode(new Uint8Array(x.memory.buffer, p, len)));
     },
     ...graphCalls(x, { reserve, place }),
-    async loadModel(source: string | ArrayBuffer | Uint8Array) {
-      let bytes: Uint8Array;
-      if (typeof source === 'string') {
-        const r = await fetch(source);
-        if (!r.ok) throw new Error(`${source}: HTTP ${r.status} ${r.statusText}`);
-        bytes = new Uint8Array(await r.arrayBuffer());
-      } else {
-        bytes = source instanceof Uint8Array ? source : new Uint8Array(source);
-      }
-      const [p] = place(bytes);
-      const parsed = ok('loadModel', x.ganbate_rt_model_parse(p, bytes.length));
-      const fetchOut = (call: (at: number, cap: number) => number) => {
-        const len = call(0, 0);
-        const at = reserve(len);
-        call(at, len);
-        return new Uint8Array(x.memory.buffer, at, len).slice();
+    async loadModel(source: string | ArrayBuffer | Uint8Array, { signal }: { readonly signal?: AbortSignal } = {}) {
+      const controller = new AbortController();
+      const cancel = () => controller.abort(signal?.reason);
+      const stop = () => controller.abort(modelLifetime.signal.reason);
+      const check = () => {
+        controller.signal.throwIfAborted();
+        if (stopped) throw new Error('Cannot load a model into a destroyed engine');
       };
-      const info = JSON.parse(
-        new TextDecoder().decode(fetchOut((at, cap) => x.ganbate_rt_model_describe(parsed, at, cap))),
-      ) as GanbateModelInfo;
-      const encoded = info.images.map((im, i) => ({
-        ...im,
-        bytes: fetchOut((at, cap) => x.ganbate_rt_model_image(parsed, i, at, cap)),
-      }));
-      const textures = await mapBounded(encoded, async (im) => {
+      if (signal?.aborted) cancel();
+      if (modelLifetime.signal.aborted) stop();
+      signal?.addEventListener('abort', cancel, { once: true });
+      modelLifetime.signal.addEventListener('abort', stop, { once: true });
+      let parsed = 0, model = 0;
+      let transferred = false;
+      const ownedTextures = new Set<number>();
+      const own = (texture: number) => {
+        if (texture) ownedTextures.add(texture);
+        return texture;
+      };
+      try {
+        check();
+        if (typeof x.ganbate_rt_model_discard !== 'function') {
+          throw new Error('loadModel requires matching SDK and WASM builds with parsed-model cleanup');
+        }
+        let bytes: Uint8Array;
+        if (typeof source === 'string') {
+          const r = await preparationBoundary(fetch(source, { signal: controller.signal }), controller.signal);
+          if (!r.ok) throw new Error(`${source}: HTTP ${r.status} ${r.statusText}`);
+          bytes = new Uint8Array(await preparationBoundary(r.arrayBuffer(), controller.signal));
+        } else {
+          bytes = source instanceof Uint8Array ? source : new Uint8Array(source);
+        }
+        check();
+        const [p] = place(bytes);
+        parsed = ok('loadModel', x.ganbate_rt_model_parse(p, bytes.length));
+        const fetchOut = (call: (at: number, cap: number) => number) => {
+          const len = call(0, 0);
+          const at = reserve(len);
+          call(at, len);
+          return new Uint8Array(x.memory.buffer, at, len).slice();
+        };
+        const info = JSON.parse(
+          new TextDecoder().decode(fetchOut((at, cap) => x.ganbate_rt_model_describe(parsed, at, cap))),
+        ) as GanbateModelInfo;
+        const encoded = info.images.map((im, i) => ({
+          ...im,
+          bytes: fetchOut((at, cap) => x.ganbate_rt_model_image(parsed, i, at, cap)),
+        }));
+        const loadImage = async (im: (typeof encoded)[number]) => {
+          check();
           if (im.mime === 'image/png') {
             const [imgPtr] = place(im.bytes);
-            const t = x.ganbate_rt_texture_png(imgPtr, im.bytes.length, im.srgb ? 1 : 0);
+            const t = own(x.ganbate_rt_texture_png(imgPtr, im.bytes.length, im.srgb ? 1 : 0));
             if (!t) onLog(1, `model image ${im.name || ''} not decoded: ${lastError}`);
+            check();
             return t;
           }
+          let bitmap: ImageBitmap | undefined;
           try {
-            const bitmap = await createImageBitmap(
+            const decoding = createImageBitmap(
               new Blob([im.bytes as unknown as BlobPart], { type: im.mime }),
-              {
-                premultiplyAlpha: 'none',
-                colorSpaceConversion: 'none',
-              },
-            );
-            const t = engine.createTexture(bitmap, { srgb: im.srgb });
-            if (bitmap.close) bitmap.close();
+              { premultiplyAlpha: 'none', colorSpaceConversion: 'none' },
+            ).then((image) => {
+              // Browser decoding cannot be interrupted. A cancelled waiter settles promptly,
+              // while a late decoded image closes here without ever touching the engine.
+              try { check(); bitmap = image; return image; }
+              catch (error) { image.close(); throw error; }
+            });
+            await preparationBoundary(decoding, controller.signal);
+            check();
+            const t = own(engine.createTexture(bitmap!, { srgb: im.srgb }));
+            check();
             return t;
           } catch (e) {
+            check(); // cancellation/destruction is never an optional missing-image fallback
             onLog(
               1,
               `model image ${im.name || ''} (${im.mime}) not decoded: ${e instanceof Error ? e.message : String(e)}`,
             );
             return 0;
-          }
-        });
-      const [tp] = place(new Uint32Array(textures));
-      const model = ok('loadModel', x.ganbate_rt_model_create(parsed, tp, textures.length));
-      return { model, info, textures };
+          } finally { bitmap?.close(); }
+        };
+        const textures = await mapBounded(encoded, (im) => loadImage(im).catch((error) => {
+          // Stop sibling decoders promptly on a fatal upload/runtime failure. Their late
+          // browser results still close through the ownership path above.
+          controller.abort(error);
+          throw error;
+        }));
+        check();
+        const [tp] = place(new Uint32Array(textures));
+        const consumed = parsed;
+        parsed = 0; // model_create spends this handle on both success and failure
+        model = ok('loadModel', x.ganbate_rt_model_create(consumed, tp, textures.length));
+        check();
+        transferred = true;
+        return { model, info, textures };
+      } finally {
+        // Invalidate any browser decoder that could resolve after the transaction ends.
+        controller.abort();
+        signal?.removeEventListener('abort', cancel);
+        modelLifetime.signal.removeEventListener('abort', stop);
+        if (!transferred && !stopped) {
+          if (model) x.ganbate_rt_model_destroy(model);
+          if (parsed) x.ganbate_rt_model_discard(parsed);
+          for (const texture of ownedTextures) x.ganbate_rt_texture_destroy(texture);
+        }
+      }
     },
     destroyModel(model: number) {
       x.ganbate_rt_model_destroy(model);
@@ -794,6 +850,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
     destroy() {
       if (stopped) return;
       stopped = true;
+      modelLifetime.abort(new Error('Engine destroyed during model loading'));
       gate.stop();
       x.ganbate_rt_stop();
       host.release?.();

@@ -141,6 +141,14 @@ counts while preserving session peaks and cumulative totals. Recreating an engin
 new session, so record session identity alongside measurements. This API supplies evidence
 for application-specific budgets; it does not impose a universal memory limit.
 
+`engine.loadModel(source, { signal })` owns its parsed model and uploaded textures until it
+returns successfully. Cancelling that load, losing the device, or destroying the engine
+rejects pending work; late browser decodes close without uploading. Failed creation releases
+partial textures and the parsed model. After success, the caller owns the returned textures
+(`destroyModel` does not destroy them). A missing image still uses the existing zero-texture
+fallback; the application decides whether a particular presentation requires every image.
+Build and vendor the SDK and WASM together so parsed-model cleanup is available.
+
 - **Cooked Entity Access:** `engine.worldEntities()`, `setWorldInstance`, `pickWorld`, and `setWorldLight` inspect, move, hide, and pick GBEW v4 scene entities at runtime.
 - **Dynamic Lights & Shadows:** `engine.createLight` places up to 64 tiled point or spot lights; up to 2 spots cast 8-tap filtered 1024px real-time prop shadows (`shadow` factor).
 - **Skinned & Morphed Runtime Models:** `engine.loadModel(url)` loads GLBs; `createModelInstance`, `modelClip` (weighted cross-fades), `setModelNode`, `modelMorph` (gathered sparse CPU vertex morphs via `anim::gather_morphed`), `updateModel`, and `modelNodeWorld` (socket attachments) animate characters without mutating static body geometry.
