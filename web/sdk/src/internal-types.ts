@@ -1,4 +1,4 @@
-import type { GanbateCapturedFrame, GanbatePassTiming, GanbateXrTarget } from './types.ts';
+import type { GanbateCapturedFrame, GanbatePassTiming, GanbatePreparationStats, GanbateXrTarget } from './types.ts';
 import type { WebGpuAdapter, WebGpuCanvasContext, WebGpuDevice, WebGpuTexture } from './webgpu-globals.ts';
 
 export interface PassTimingMark {
@@ -75,6 +75,10 @@ export type AnyGpuState = WebGpuState | WebGlState;
 
 export interface GanbateHostRuntime {
   readonly imports: WebAssembly.Imports;
+  readonly lost: Promise<string>;
+  prepare(options?: { readonly signal?: AbortSignal }): Promise<void>;
+  preparationStats(): GanbatePreparationStats;
+  setStagedPipelines(value: boolean): void;
   readonly errors: string[];
   readonly timing: PassTimingTracker;
   attach(instance: WebAssembly.Instance): void;

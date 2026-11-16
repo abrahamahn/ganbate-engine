@@ -1,3 +1,4 @@
+import { mapBounded } from './preparation.ts';
 import { graphCalls, scratchFor } from './graph-solver.ts';
 import { createFrameGate } from './pass-timing.ts';
 import {
@@ -50,11 +51,13 @@ function isClearTexture(
  */
 export async function createEngine(options: CreateEngineOptions): Promise<GanbateEngine> {
   const { canvas } = options;
+  options.signal?.throwIfAborted();
   let lastError = '';
   const onLog = options.onLog || (() => {});
   let trying = false;
   const { gpu, host, x, errors, settled } = await boot({
     ...options,
+    stagedPipelines: true,
     onLog: (level, text) => {
       if (trying && level >= 2 && !text.startsWith('panic')) {
         onLog(1, `${text}; sending the pixels instead`);
@@ -128,54 +131,71 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
     };
   };
 
-  const bakedAo: Promise<ArrayBuffer | Uint8Array | null> =
-    typeof options.ao === 'string'
-      ? fetch(options.ao).then(
-          (r) => (r.ok ? r.arrayBuffer() : null),
-          () => null,
-        )
-      : Promise.resolve(options.ao ?? null);
+  let gradeOnce = false;
+  try {
+    const bakedAo: Promise<ArrayBuffer | Uint8Array | null> =
+      typeof options.ao === 'string'
+        ? fetch(options.ao, { signal: options.signal }).then(
+            (r) => (r.ok ? r.arrayBuffer() : null),
+            () => null,
+          )
+        : Promise.resolve(options.ao ?? null);
 
-  let world: { ptr: number; len: number } | null = null;
-  if (typeof options.world === 'string') {
-    world = await fetchInto(options.world, x, (p, bytes) =>
-      (options.onPhase || (() => {}))(`Downloading the world (${(bytes / 1048576).toFixed(1)} MB)`, p),
-    );
-  } else if (options.world) {
-    const bytes = options.world instanceof Uint8Array ? options.world : new Uint8Array(options.world);
-    const ptr = x.ganbate_alloc(bytes.length) >>> 0;
-    new Uint8Array(x.memory.buffer, ptr, bytes.length).set(bytes);
-    world = { ptr, len: bytes.length };
-  }
-  if (world) {
-    (options.onPhase || (() => {}))('Decoding the world', 1);
-    if (!x.ganbate_load_world(world.ptr, world.len)) throw fail('world');
-    await decodeWorldImages(x, onLog);
-  }
-  const lookText =
-    options.look == null
-      ? ''
-      : typeof options.look === 'string'
-        ? options.look
-        : JSON.stringify(options.look);
-  const lookBytes = text(lookText);
-  const [lookPtr] = place(lookBytes);
-  (options.onPhase || (() => {}))('Compiling shaders and uploading', 1);
-  ok(
-    'start',
-    x.ganbate_rt_start(0, 0, lookPtr, lookBytes.length, resolveQualityCode(options.quality, options.still)),
-  );
-  const gradeOnce =
-    resolveGradeOnce(options.gradeOnce, gpu) &&
-    typeof x.ganbate_rt_set_grade_once === 'function' &&
-    x.ganbate_rt_set_grade_once(1) === 1;
-  const ao = world ? await bakedAo : null;
-  if (ao) {
-    const bytes = ao instanceof Uint8Array ? ao : new Uint8Array(ao);
-    const [p] = place(bytes);
-    if (!x.ganbate_rt_ao_import(p, bytes.length)) {
-      onLog(1, 'The baked AO does not fit this world; baking it live');
+    let world: { ptr: number; len: number } | null = null;
+    if (typeof options.world === 'string') {
+      world = await fetchInto(options.world, x, (p, bytes) =>
+        (options.onPhase || (() => {}))(`Downloading the world (${(bytes / 1048576).toFixed(1)} MB)`, p),
+        options.signal,
+      );
+    } else if (options.world) {
+      const bytes = options.world instanceof Uint8Array ? options.world : new Uint8Array(options.world);
+      const ptr = x.ganbate_alloc(bytes.length) >>> 0;
+      new Uint8Array(x.memory.buffer, ptr, bytes.length).set(bytes);
+      world = { ptr, len: bytes.length };
     }
+    options.signal?.throwIfAborted();
+    if (world) {
+      (options.onPhase || (() => {}))('Decoding the world', 1);
+      if (!x.ganbate_load_world(world.ptr, world.len)) throw fail('world');
+      await decodeWorldImages(x, onLog, options.signal);
+    }
+    const lookText =
+      options.look == null
+        ? ''
+        : typeof options.look === 'string'
+          ? options.look
+          : JSON.stringify(options.look);
+    const lookBytes = text(lookText);
+    const [lookPtr] = place(lookBytes);
+    (options.onPhase || (() => {}))('Compiling shaders and uploading', 1);
+    ok(
+      'start',
+      x.ganbate_rt_start(0, 0, lookPtr, lookBytes.length, resolveQualityCode(options.quality, options.still)),
+    );
+    try {
+      await host.prepare({ signal: options.signal });
+    } finally {
+      host.setStagedPipelines(false);
+    }
+    gradeOnce =
+      resolveGradeOnce(options.gradeOnce, gpu) &&
+      typeof x.ganbate_rt_set_grade_once === 'function' &&
+      x.ganbate_rt_set_grade_once(1) === 1;
+    const ao = world ? await bakedAo : null;
+    if (ao) {
+      const bytes = ao instanceof Uint8Array ? ao : new Uint8Array(ao);
+      const [p] = place(bytes);
+      if (!x.ganbate_rt_ao_import(p, bytes.length)) {
+        onLog(1, 'The baked AO does not fit this world; baking it live');
+      }
+    }
+    options.signal?.throwIfAborted();
+  } catch (error) {
+    x.ganbate_rt_stop();
+    host.release?.();
+    if (gpu.api === 'webgpu') gpu.device.destroy?.();
+    freeScratch();
+    throw error;
   }
 
   const gate = createFrameGate(gpu, host, settled);
@@ -229,6 +249,13 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
     adapter: gpu.adapterName,
     gradeOnce,
     errors: () => [...errors, ...host.errors.filter((e) => !errors.includes(e))],
+    lost: host.lost,
+    async prepare({ signal } = {}) {
+      if (stopped) throw new Error('Cannot prepare a destroyed engine');
+      await host.prepare({ signal });
+      if (stopped) throw new Error('Engine destroyed during preparation');
+    },
+    preparationStats: () => host.preparationStats(),
     fitCanvas(
       dpr = (typeof window !== 'undefined' ? window.devicePixelRatio : 1) || 1,
       box: { readonly width: number; readonly height: number } | null = null,
@@ -665,8 +692,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
         ...im,
         bytes: fetchOut((at, cap) => x.ganbate_rt_model_image(parsed, i, at, cap)),
       }));
-      const textures = await Promise.all(
-        encoded.map(async (im) => {
+      const textures = await mapBounded(encoded, async (im) => {
           if (im.mime === 'image/png') {
             const [imgPtr] = place(im.bytes);
             const t = x.ganbate_rt_texture_png(imgPtr, im.bytes.length, im.srgb ? 1 : 0);
@@ -691,8 +717,7 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
             );
             return 0;
           }
-        }),
-      );
+        });
       const [tp] = place(new Uint32Array(textures));
       const model = ok('loadModel', x.ganbate_rt_model_create(parsed, tp, textures.length));
       return { model, info, textures };
@@ -770,7 +795,8 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
       stopped = true;
       gate.stop();
       x.ganbate_rt_stop();
-      if (settled) host.release?.();
+      host.release?.();
+      if (gpu.api === 'webgpu') gpu.device.destroy?.();
       observer?.disconnect();
       drawn = null;
       freeScratch();

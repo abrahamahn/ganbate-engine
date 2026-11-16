@@ -1,3 +1,4 @@
+import { preparationBoundary } from './preparation.ts';
 import type { GanbateHostRuntime, WebGpuState } from './internal-types.ts';
 import { createPassTiming, GL_IMPORTS } from './pass-timing.ts';
 import { sourceOfSize } from './texture-source.ts';
@@ -140,6 +141,7 @@ export function createHost(
     onError = () => {},
     settled = false,
     bundles = true,
+    stagedPipelines = false,
   }: GanbateHostOptions = {},
 ): GanbateHostRuntime {
   const { device, canvas, context } = gpu;
@@ -147,6 +149,27 @@ export function createHost(
   const freeList: number[] = [];
   const errors: string[] = [];
   let lastError = '';
+  let staging = stagedPipelines;
+  let lostReason = '';
+  let released = false;
+  let resolveLost!: (reason: string) => void;
+  const lost = new Promise<string>((resolve) => { resolveLost = resolve; });
+  const pendingPipelines = new Set<Promise<void>>();
+  const shaderChecks = new Set<Promise<void>>();
+  const pipelineFailures: string[] = [];
+  let pipelinesReady = 0;
+  let pipelineMs = 0;
+  interface Pipeline { readonly kind: 'pipeline'; value?: unknown; error?: string; }
+  // Host-local identities include the device generation and every descriptor field. Recycled
+  // ABI handles cannot alias a retired layout/module. The cache is bounded; live handles pin values.
+  const identities = new WeakMap<object, number>();
+  let nextIdentity = 0;
+  const identity = (value: object): number => {
+    let id = identities.get(value);
+    if (!id) { id = ++nextIdentity; identities.set(value, id); }
+    return id;
+  };
+  const pipelineCache = new Map<string, Pipeline>();
   let memory!: WebAssembly.Memory;
   let surfaceTexture: WebGpuTexture | null = null;
   let surfaceView: unknown = null;
@@ -160,12 +183,61 @@ export function createHost(
     onError(message);
   };
   device.addEventListener('uncapturederror', (e) => report(`WebGPU: ${e.error.message}`));
-  device.lost.then((i) => report(`WebGPU device lost (${i.reason}): ${i.message}`));
+  device.lost.then((i) => {
+    if (released) return;
+    lostReason = `WebGPU device lost (${i.reason}): ${i.message}`;
+    resolveLost(lostReason);
+    report(lostReason);
+  });
 
   const put = (obj: unknown): number => {
     const h = freeList.length ? freeList.pop()! : objects.length;
     objects[h] = obj;
     return h;
+  };
+  const pipeline = (handle: number): any => {
+    const p = objects[handle] as Pipeline;
+    if (p?.kind !== 'pipeline') return p;
+    if (p.error) throw new Error(p.error);
+    if (!p.value) throw new Error('WebGPU pipeline is pending; await engine.prepare() before submitting');
+    return p.value;
+  };
+  const createPipeline = (descriptor: any, compute: boolean): number => {
+    const keyDescriptor = {
+      ...descriptor,
+      layout: identity(descriptor.layout),
+      ...(compute
+        ? { compute: { ...descriptor.compute, module: identity(descriptor.compute.module) } }
+        : { vertex: { ...descriptor.vertex, module: identity(descriptor.vertex.module) },
+            ...(descriptor.fragment ? { fragment: { ...descriptor.fragment, module: identity(descriptor.fragment.module) } } : {}) }),
+    };
+    const key = `${compute}/${JSON.stringify(keyDescriptor)}`;
+    const cached = pipelineCache.get(key);
+    if (cached) return put(cached);
+    const record: Pipeline = { kind: 'pipeline' };
+    const started = performance.now();
+    const asyncCreate = compute ? device.createComputePipelineAsync : device.createRenderPipelineAsync;
+    if (staging && asyncCreate) {
+      const job = asyncCreate.call(device, descriptor).then((value) => {
+        record.value = value;
+        pipelinesReady++;
+      }, (error: unknown) => {
+        record.error = `Pipeline preparation: ${error instanceof Error ? error.message : String(error)}`;
+        pipelineFailures.push(record.error);
+        report(record.error);
+      }).finally(() => {
+        pipelineMs += performance.now() - started;
+        pendingPipelines.delete(job);
+      });
+      pendingPipelines.add(job);
+    } else {
+      record.value = compute ? device.createComputePipeline(descriptor) : device.createRenderPipeline(descriptor);
+      pipelinesReady++;
+      pipelineMs += performance.now() - started;
+    }
+    if (pipelineCache.size >= 256) pipelineCache.delete(pipelineCache.keys().next().value!);
+    pipelineCache.set(key, record);
+    return put(record);
   };
   const u8 = (ptr: number, len: number) => new Uint8Array(memory.buffer, ptr >>> 0, len >>> 0);
   const u32 = (ptr: number, n: number) => new Uint32Array(memory.buffer, ptr >>> 0, n >>> 0);
@@ -411,7 +483,7 @@ export function createHost(
       const bop = c[p++];
       switch (bop) {
         case 3:
-          rbe.setPipeline(objects[c[p++]]);
+          rbe.setPipeline(pipeline(c[p++]));
           break;
         case 4: {
           const index = c[p];
@@ -605,7 +677,7 @@ export function createHost(
           stamp = -1;
           break;
         case 3: {
-          const p = objects[c[i++]];
+          const p = pipeline(c[i++]);
           pass!.setPipeline(p);
           if (timed && !passLabel) passLabel = p.label || '';
           break;
@@ -646,7 +718,7 @@ export function createHost(
         case 11: {
           // DISPATCH
           const cp = enc.beginComputePass();
-          cp.setPipeline(objects[c[i]]);
+          cp.setPipeline(pipeline(c[i]));
           const n = c[i + 1];
           i += 2;
           for (let k = 0; k < n; k++) {
@@ -836,7 +908,7 @@ export function createHost(
     gpu_create_shader: guard('createShaderModule', (ptr: number, len: number) => {
       const code = str(ptr, len);
       const module = device.createShaderModule({ code, label: /from '([^']+)'/.exec(code)?.[1] });
-      module.getCompilationInfo().then((info) => {
+      const check = module.getCompilationInfo().then((info) => {
         const lines = code.split('\n');
         for (const m of info.messages) {
           const where = m.lineNum ? `${m.lineNum}:${m.linePos} ${lines[m.lineNum - 1].trim()}` : '';
@@ -844,7 +916,8 @@ export function createHost(
           if (m.type === 'error') report(text);
           else onLog(1, text);
         }
-      });
+      }).catch((error: unknown) => report(`WGSL validation: ${String(error)}`)).finally(() => shaderChecks.delete(check));
+      shaderChecks.add(check);
       return put(module);
     }),
     gpu_create_bind_group_layout: guard('createBindGroupLayout', (ptr: number, words: number) => {
@@ -900,13 +973,13 @@ export function createHost(
       d.vertex.module = objects[d.vertex.module];
       if (d.fragment) d.fragment.module = objects[d.fragment.module];
       d.label = (d.fragment || d.vertex).module.label;
-      return put(device.createRenderPipeline(d));
+      return createPipeline(d, false);
     }),
     gpu_create_compute_pipeline: guard('createComputePipeline', (ptr: number, len: number) => {
       const d = JSON.parse(str(ptr, len));
       d.layout = objects[d.layout];
       d.compute.module = objects[d.compute.module];
-      return put(device.createComputePipeline(d));
+      return createPipeline(d, true);
     }),
     gpu_create_bind_group: guard('createBindGroup', (layout: number, ptr: number, words: number) => {
       const w = u32(ptr, words);
@@ -926,6 +999,7 @@ export function createHost(
       return put(device.createBindGroup({ layout: objects[layout >>> 0], entries }));
     }),
     gpu_submit: guard('submit', (cmdPtr: number, words: number, pushPtr: number, pushLen: number) => {
+      if (pendingPipelines.size) throw new Error('Pipelines are pending; await engine.prepare() before submitting');
       execute(cmdPtr, words, pushPtr, pushLen);
       return 1;
     }),
@@ -952,6 +1026,24 @@ export function createHost(
   return {
     imports: { ganbate: imports },
     errors,
+    lost,
+    setStagedPipelines(value: boolean) { staging = value; },
+    preparationStats: () => ({ pipelinesPending: pendingPipelines.size, pipelinesReady, pipelineMs }),
+    async prepare({ signal }: { signal?: AbortSignal } = {}) {
+      const check = () => {
+        if (released) throw new Error('WebGPU host was released');
+        if (lostReason) throw new Error(lostReason);
+        if (pipelineFailures.length || errors.length) throw new Error(pipelineFailures[0] || errors[0]);
+      };
+      check();
+      const work = (async () => {
+        while (pendingPipelines.size || shaderChecks.size) await Promise.all([...pendingPipelines, ...shaderChecks]);
+        check();
+        await device.queue.onSubmittedWorkDone();
+        check();
+      })();
+      await preparationBoundary(Promise.race([work, lost.then((reason) => { throw new Error(reason); })]), signal);
+    },
     attach(instance: WebAssembly.Instance) {
       memory = instance.exports.memory as WebAssembly.Memory;
     },
@@ -1001,6 +1093,9 @@ export function createHost(
       }
     },
     release() {
+      released = true;
+      pipelineCache.clear();
+      ring.buffer.destroy();
       while (retired.length) retired.pop()!.destroy();
       stage?.destroy();
       stage = null;

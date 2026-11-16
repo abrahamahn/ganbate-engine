@@ -126,9 +126,29 @@ export function createGl(canvas?: HTMLCanvasElement): WebGlState {
 /** The import object for the wasm module on WebGL 2 and the host state behind it. */
 export function createGlHost(
   gpu: WebGlState,
-  { onLog = () => {}, onStatus = () => {}, onError = () => {}, checkErrors = false }: GanbateHostOptions = {},
+  { onLog = () => {}, onStatus = () => {}, onError = () => {}, checkErrors = false, stagedPipelines = false }: GanbateHostOptions = {},
 ): GanbateHostRuntime {
   const { gl, ext, canvas } = gpu;
+  const parallel = gl.getExtension('KHR_parallel_shader_compile') as {
+    readonly COMPLETION_STATUS_KHR: number;
+  } | null;
+  let staging = stagedPipelines;
+  let contextLost = false;
+  let resolveLost!: (reason: string) => void;
+  const lost = new Promise<string>((resolve) => { resolveLost = resolve; });
+  let released = false;
+  let pipelineMs = 0;
+  let pipelinesReady = 0;
+  let preparationError: Error | null = null;
+  interface ProgramRecord {
+    program: WebGLProgram;
+    hidden: { loc: WebGLUniformLocation | null; uint: boolean }[];
+    name: string;
+    ready: boolean;
+    started: number;
+    initialize(): void;
+  }
+  const pendingPrograms = new Set<ProgramRecord>();
   const objects: any[] = [null];
   const freeList: number[] = [];
   const errors: string[] = [];
@@ -141,9 +161,13 @@ export function createGlHost(
     errors.push(message);
     onError(message);
   };
-  if (canvas && canvas.addEventListener) {
-    canvas.addEventListener('webglcontextlost', () => report('WebGL 2 context lost'));
-  }
+  const onContextLost = (event?: Event) => {
+    event?.preventDefault();
+    contextLost = true;
+    resolveLost('WebGL 2 context lost');
+    report('WebGL 2 context lost');
+  };
+  canvas?.addEventListener?.('webglcontextlost', onContextLost);
   const put = (obj: unknown): number => {
     const h = freeList.length ? freeList.pop()! : objects.length;
     objects[h] = obj;
@@ -354,6 +378,7 @@ export function createGlHost(
     else set(gl.ONE, gl.ONE, gl.ONE, gl.ONE);
   };
   const applyPipeline = (p: any) => {
+    if (!p.program.ready) throw new Error('WebGL program is pending; await engine.prepare() before rendering');
     if (currentProgram !== p.program.program) {
       gl.useProgram(p.program.program);
       currentProgram = p.program.program;
@@ -429,11 +454,11 @@ export function createGlHost(
     gl.samplerParameteri(linear, w, gl.CLAMP_TO_EDGE);
   }
 
-  const compile = (type: number, srcText: string) => {
+  const compile = (type: number, srcText: string, deferred = false) => {
     const sh = gl.createShader(type)!;
     gl.shaderSource(sh, srcText);
     gl.compileShader(sh);
-    if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    if (!deferred && !gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
       const log = gl.getShaderInfoLog(sh) || '';
       gl.deleteShader(sh);
       const lines = srcText.split('\n');
@@ -447,30 +472,51 @@ export function createGlHost(
     }
     return sh;
   };
-  const link = (vs: string, fs: string) => {
+  const link = (vs: string, fs: string, deferred = false) => {
     const p = gl.createProgram()!;
-    const v = compile(gl.VERTEX_SHADER, vs);
-    const f = compile(gl.FRAGMENT_SHADER, fs);
-    gl.attachShader(p, v);
-    gl.attachShader(p, f);
-    gl.linkProgram(p);
-    gl.deleteShader(v);
-    gl.deleteShader(f);
-    if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
-      const log = gl.getProgramInfoLog(p);
+    let v: WebGLShader | null = null;
+    let f: WebGLShader | null = null;
+    try {
+      v = compile(gl.VERTEX_SHADER, vs, deferred);
+      f = compile(gl.FRAGMENT_SHADER, fs, deferred);
+      gl.attachShader(p, v);
+      gl.attachShader(p, f);
+      gl.linkProgram(p);
+      if (!deferred && !gl.getProgramParameter(p, gl.LINK_STATUS)) {
+        throw new Error(`link: ${gl.getProgramInfoLog(p)}`);
+      }
+      return p;
+    } catch (error) {
       gl.deleteProgram(p);
-      throw new Error(`link: ${log}`);
+      throw error;
+    } finally {
+      // Attached shaders remain alive until their program is deleted, including pending links.
+      if (v) gl.deleteShader(v);
+      if (f) gl.deleteShader(f);
     }
-    return p;
   };
-  const blitPrograms = [false, true].map((array) => {
-    const program = link(BLIT_VS, blitFs(array));
-    return {
-      program,
-      src: gl.getUniformLocation(program, 'src'),
-      layer: gl.getUniformLocation(program, 'layer'),
-    };
-  });
+  const blitPrograms: {
+    program: WebGLProgram;
+    src: WebGLUniformLocation | null;
+    layer: WebGLUniformLocation | null;
+  }[] = [];
+  try {
+    for (const array of [false, true]) {
+      const program = link(BLIT_VS, blitFs(array));
+      blitPrograms.push({
+        program,
+        src: gl.getUniformLocation(program, 'src'),
+        layer: gl.getUniformLocation(program, 'layer'),
+      });
+    }
+  } catch (error) {
+    for (const { program } of blitPrograms) gl.deleteProgram(program);
+    gl.deleteSampler(nearest);
+    gl.deleteSampler(linear);
+    gl.deleteFramebuffer(readFbo);
+    canvas?.removeEventListener?.('webglcontextlost', onContextLost);
+    throw error;
+  }
   const emptyVao = gl.createVertexArray();
 
   const ring = gl.createBuffer();
@@ -1114,25 +1160,38 @@ export function createGlHost(
     gl_create_program: guard(
       'createProgram',
       (vp: number, vl: number, fp: number, fl: number, mp: number, ml: number) => {
-        const program = link(str(vp, vl), str(fp, fl));
+        const started = performance.now();
+        const deferred = staging && parallel !== null;
+        const program = link(str(vp, vl), str(fp, fl), deferred);
         const entry = (srcText: string) => /from '([^']+)'/.exec(srcText)?.[1];
         const name = entry(str(fp, fl)) || entry(str(vp, vl)) || 'program';
-        const hidden: { loc: WebGLUniformLocation | null; uint: boolean }[] = [];
-        gl.useProgram(program);
-        for (const line of str(mp, ml).split('\n')) {
-          const [kind, uName, a, b] = line.split(' ');
-          if (kind === 'b') {
-            const index = gl.getUniformBlockIndex(program, uName);
-            if (index !== gl.INVALID_INDEX) gl.uniformBlockBinding(program, index, Number(a));
-          } else if (kind === 'u') {
-            const loc = gl.getUniformLocation(program, uName);
-            if (loc) gl.uniform1i(loc, Number(a));
-          } else if (kind === 'h') {
-            hidden[Number(a)] = { loc: gl.getUniformLocation(program, uName), uint: b === 'uint' };
-          }
-        }
-        gl.useProgram(currentProgram);
-        return put({ program, hidden, name });
+        // Copy metadata now: the WASM caller frees its memory when this import returns.
+        const metadata = str(mp, ml);
+        const record: ProgramRecord = {
+          program, hidden: [], name, ready: false, started,
+          initialize() {
+            gl.useProgram(program);
+            for (const line of metadata.split('\n')) {
+              const [kind, uName, a, b] = line.split(' ');
+              if (kind === 'b') {
+                const index = gl.getUniformBlockIndex(program, uName);
+                if (index !== gl.INVALID_INDEX) gl.uniformBlockBinding(program, index, Number(a));
+              } else if (kind === 'u') {
+                const loc = gl.getUniformLocation(program, uName);
+                if (loc) gl.uniform1i(loc, Number(a));
+              } else if (kind === 'h') {
+                record.hidden[Number(a)] = { loc: gl.getUniformLocation(program, uName), uint: b === 'uint' };
+              }
+            }
+            gl.useProgram(currentProgram);
+            record.ready = true;
+            pipelinesReady++;
+            pipelineMs += performance.now() - started;
+          },
+        };
+        if (deferred) pendingPrograms.add(record);
+        else record.initialize();
+        return put(record);
       },
     ),
     gl_create_pipeline: guard('createPipeline', (program: number, ptr: number, words: number) => {
@@ -1187,6 +1246,8 @@ export function createGlHost(
     gl_submit: guard(
       'submit',
       (cmdPtr: number, words: number, pushPtr: number, pushLen: number, isPresent: number) => {
+        if (pendingPrograms.size) throw new Error('WebGL programs are pending; await engine.prepare() before submitting');
+        if (preparationError) throw preparationError;
         execute(cmdPtr, words, pushPtr, pushLen);
         if (isPresent) present();
         glErrors(isPresent ? 'present' : 'submit');
@@ -1199,7 +1260,11 @@ export function createGlHost(
       if (!o) return;
       if (o.tex && o.target) dropTexture(o);
       else if (o.vao) gl.deleteVertexArray(o.vao);
-      else if (o.program && o.hidden) gl.deleteProgram(o.program);
+      else if (o.program && o.hidden) {
+        pendingPrograms.delete(o);
+        if (o.ready) pipelinesReady--;
+        gl.deleteProgram(o.program);
+      }
       else if (o.mode !== undefined) {
         /* a pipeline: its program is released on its own */
       } else if ('shadow' in o) {
@@ -1222,6 +1287,7 @@ export function createGlHost(
   return {
     imports: { ganbate: imports },
     errors,
+    lost,
     attach(instance: WebAssembly.Instance) {
       memory = instance.exports.memory as WebAssembly.Memory;
     },
@@ -1229,6 +1295,87 @@ export function createGlHost(
       source = image;
     },
     nextFrame() {},
+    setStagedPipelines(value: boolean) { staging = value; },
+    preparationStats: () => ({ pipelinesPending: pendingPrograms.size, pipelinesReady, pipelineMs }),
+    async prepare({ signal }: { signal?: AbortSignal } = {}) {
+      const check = () => {
+        signal?.throwIfAborted();
+        if (released) throw new Error('WebGL host has been released');
+        if (!contextLost && gl.isContextLost?.() === true) onContextLost();
+        if (contextLost) throw new Error('WebGL 2 context lost');
+        if (preparationError) throw preparationError;
+      };
+      const yieldPoll = () => new Promise<void>((resolve) => setTimeout(resolve, 4));
+      check();
+      while (pendingPrograms.size) {
+        check();
+        for (const record of pendingPrograms) {
+          // This query is explicitly nonblocking; all other program queries wait until it succeeds.
+          if (!gl.getProgramParameter(record.program, parallel!.COMPLETION_STATUS_KHR)) continue;
+          if (!gl.getProgramParameter(record.program, gl.LINK_STATUS)) {
+            preparationError = new Error(`WebGL program ${record.name}: ${gl.getProgramInfoLog(record.program) || 'link failed'}`);
+            report(preparationError.message);
+            throw preparationError;
+          }
+          record.initialize();
+          pendingPrograms.delete(record);
+        }
+        if (pendingPrograms.size) await yieldPoll();
+      }
+      // A frame submission is not completion. Fence all preceding uploads and draws once at
+      // preparation boundaries; gameplay frames never wait on this barrier.
+      const sync = gl.fenceSync?.(gl.SYNC_GPU_COMMANDS_COMPLETE, 0);
+      if (!sync) {
+        check();
+        throw new Error('WebGL 2 could not create the preparation fence');
+      }
+      gl.flush();
+      try {
+        for (;;) {
+          check();
+          const status = gl.clientWaitSync(sync, 0, 0);
+          if (status === gl.WAIT_FAILED) throw new Error('WebGL 2 preparation fence failed');
+          if (status === gl.ALREADY_SIGNALED || status === gl.CONDITION_SATISFIED) break;
+          if (status !== gl.TIMEOUT_EXPIRED) throw new Error('WebGL 2 returned an invalid preparation fence status');
+          await yieldPoll();
+        }
+      } finally {
+        gl.deleteSync(sync);
+      }
+      check();
+    },
+    release() {
+      if (released) return;
+      released = true;
+      canvas?.removeEventListener?.('webglcontextlost', onContextLost);
+      channel?.port1.close();
+      channel?.port2.close();
+      const unfinished = timing.take();
+      if (unfinished) waiting.push(unfinished);
+      for (const frame of waiting.splice(0)) {
+        for (const mark of frame.marks) if (mark.sync) gl.deleteSync(mark.sync);
+      }
+      // Rust normally releases its handles first. Also cover partial startup and retries.
+      gl.useProgram(null);
+      gl.bindVertexArray(null);
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      for (let handle = 1; handle < objects.length; handle++) {
+        (imports.gl_release as (handle: number) => void)(handle);
+      }
+      pendingPrograms.clear();
+      // Surface and helper objects are host-owned and have no WASM handles.
+      for (const texture of textures) dropTexture(texture);
+      surface = null;
+      for (const framebuffer of fbos.values()) gl.deleteFramebuffer(framebuffer);
+      fbos.clear();
+      for (const { program } of blitPrograms) gl.deleteProgram(program);
+      gl.deleteVertexArray(emptyVao);
+      gl.deleteFramebuffer(readFbo);
+      gl.deleteBuffer(ring);
+      gl.deleteSampler(nearest);
+      gl.deleteSampler(linear);
+      source = null;
+    },
     timing,
     endFrame() {
       const frame = timing.take();

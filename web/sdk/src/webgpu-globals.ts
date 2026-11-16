@@ -155,6 +155,7 @@ export interface WebGpuShaderModule {
 }
 
 export interface WebGpuDevice {
+  destroy?(): void;
   readonly features: ReadonlySet<string>;
   readonly limits: WebGpuAdapter['limits'];
   readonly lost: Promise<{ readonly reason: string; readonly message: string }>;
@@ -189,6 +190,8 @@ export interface WebGpuDevice {
   createPipelineLayout(descriptor: { bindGroupLayouts: unknown[] }): unknown;
   createRenderPipeline(descriptor: Record<string, unknown>): { readonly label?: string };
   createComputePipeline(descriptor: Record<string, unknown>): unknown;
+  createRenderPipelineAsync?(descriptor: Record<string, unknown>): Promise<{ readonly label?: string }>;
+  createComputePipelineAsync?(descriptor: Record<string, unknown>): Promise<unknown>;
   createBindGroup(descriptor: { layout: unknown; entries: Record<string, unknown>[] }): unknown;
   createCommandEncoder(): WebGpuCommandEncoder;
   createRenderBundleEncoder?(descriptor: Record<string, unknown>): WebGpuRenderBundleEncoder;

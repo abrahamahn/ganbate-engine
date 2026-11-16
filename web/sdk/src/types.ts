@@ -12,6 +12,8 @@ export type Matrix4 = ArrayLike<number>;
 
 export interface CreateEngineOptions {
   readonly canvas: HTMLCanvasElement;
+  /** Cancels startup preparation; no partially prepared engine is returned. */
+  readonly signal?: AbortSignal;
   /** URL, bytes, or pre-instantiated WebAssembly.Instance of ganbate_web.wasm. */
   readonly wasm: string | ArrayBuffer | ArrayBufferView | WebAssembly.Instance;
   /** WebGPU where the browser has it, otherwise WebGL 2 (`auto`, the default). */
@@ -397,6 +399,13 @@ export interface GanbateEntityTable {
   } | null;
 }
 
+export interface GanbatePreparationStats {
+  readonly pipelinesPending: number;
+  readonly pipelinesReady: number;
+  /** Accumulated pipeline preparation time, not elapsed startup time. */
+  readonly pipelineMs: number;
+}
+
 export interface GanbateEngine {
   readonly api: 'webgpu' | 'webgl2';
   /** How frames reach the canvas (`CreateEngineOptions.present`); WebGL 2 is always 'direct'. */
@@ -405,6 +414,12 @@ export interface GanbateEngine {
   /** The tone-map output grades each pixel once (`CreateEngineOptions.gradeOnce`). */
   readonly gradeOnce: boolean;
   errors(): string[];
+  /** Resolves on context/device loss. The owner must invalidate and recreate this session. */
+  readonly lost: Promise<string>;
+  /** Waits for pipeline jobs and submitted GPU work. Call after preparing and rendering target views,
+   * never every gameplay frame. Does not finish capture-quality AO or declare unseen paths ready. */
+  prepare(options?: { readonly signal?: AbortSignal }): Promise<void>;
+  preparationStats(): GanbatePreparationStats;
   /**
    * Sizes the canvas to its CSS box times `dpr` (default: the device pixel ratio). `box`: the CSS
    * box the page observed (a page drawing every frame), read instead of the canvas's, which
@@ -634,6 +649,7 @@ export interface GanbateSelfTestResult {
   readonly format: string;
   readonly pixels: GanbateCapturedFrame;
   errors(): string[];
+
 }
 
 export interface StartPlayerOptions {
@@ -658,6 +674,7 @@ export interface GanbatePlayerController {
   readonly views: readonly string[];
   readonly exports: WebAssembly.Exports & { readonly memory: WebAssembly.Memory };
   errors(): string[];
+
   frames(): number;
   key(code: number, down: boolean): void;
   stop(): void;
@@ -672,6 +689,8 @@ export interface GanbateGpuInfo {
 }
 
 export interface GanbateHostOptions {
+  /** Allocate pending numeric pipeline handles; await host.prepare before submitting them. */
+  readonly stagedPipelines?: boolean;
   readonly onLog?: (level: number, text: string) => void;
   readonly onStatus?: (text: string) => void;
   readonly onError?: (text: string) => void;

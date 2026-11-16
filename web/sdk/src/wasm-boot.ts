@@ -1,3 +1,4 @@
+import { mapBounded } from './preparation.ts';
 import type { AnyGpuState, GanbateHostRuntime, GanbateWasmExports } from './internal-types.ts';
 import { appleWebKit } from './pass-timing.ts';
 import { pixelsOf } from './texture-source.ts';
@@ -32,8 +33,9 @@ export async function fetchInto(
   url: string,
   exports: Pick<GanbateWasmExports, 'memory' | 'ganbate_alloc' | 'ganbate_free'>,
   onProgress: (progress: number, bytes: number) => void,
+  signal?: AbortSignal,
 ): Promise<{ ptr: number; len: number }> {
-  const response = await fetch(url);
+  const response = await fetch(url, { signal });
   if (!response.ok) throw new Error(`${url}: HTTP ${response.status} ${response.statusText}`);
   const encoding = response.headers.get('content-encoding');
   const announced = Number(response.headers.get('content-length')) || 0;
@@ -48,33 +50,42 @@ export async function fetchInto(
   } else {
     chunks = [];
   }
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (!chunks && offset + value.length > cap) {
-      chunks = [new Uint8Array(exports.memory.buffer, ptr, offset).slice()];
-      exports.ganbate_free(ptr, cap);
-      ptr = 0;
+  try {
+    for (;;) {
+      signal?.throwIfAborted();
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!chunks && offset + value.length > cap) {
+        chunks = [new Uint8Array(exports.memory.buffer, ptr, offset).slice()];
+        exports.ganbate_free(ptr, cap);
+        ptr = 0;
+      }
+      if (chunks) chunks.push(value);
+      else new Uint8Array(exports.memory.buffer, ptr + offset, value.length).set(value);
+      offset += value.length;
+      onProgress(announced ? Math.min(offset / announced, 1) : 0, offset);
     }
-    if (chunks) chunks.push(value);
-    else new Uint8Array(exports.memory.buffer, ptr + offset, value.length).set(value);
-    offset += value.length;
-    onProgress(announced ? Math.min(offset / announced, 1) : 0, offset);
-  }
-  if (!chunks) {
-    if (offset !== cap) {
-      exports.ganbate_free(ptr, cap);
-      throw new Error(`${url}: received ${offset} of ${cap} bytes`);
+    if (!chunks) {
+      if (offset !== cap) {
+        exports.ganbate_free(ptr, cap);
+        ptr = 0;
+        throw new Error(`${url}: received ${offset} of ${cap} bytes`);
+      }
+      return { ptr, len: cap };
     }
-    return { ptr, len: cap };
-  }
-  ptr = exports.ganbate_alloc(offset) >>> 0;
-  let at = 0;
-  for (const chunk of chunks) {
-    new Uint8Array(exports.memory.buffer, ptr + at, chunk.length).set(chunk);
-    at += chunk.length;
-  }
-  return { ptr, len: offset };
+    cap = offset;
+    ptr = exports.ganbate_alloc(offset) >>> 0;
+    let at = 0;
+    for (const chunk of chunks) {
+      new Uint8Array(exports.memory.buffer, ptr + at, chunk.length).set(chunk);
+      at += chunk.length;
+    }
+    return { ptr, len: offset };
+  } catch (error) {
+    if (ptr && cap) exports.ganbate_free(ptr, cap);
+    await reader.cancel().catch(() => {});
+    throw error;
+  } finally { reader.releaseLock(); }
 }
 
 export const nextFrame = (): Promise<void> => new Promise((r) => requestAnimationFrame(() => r()));
@@ -89,6 +100,7 @@ export async function decodeWorldImages(
     'memory' | 'ganbate_alloc' | 'ganbate_free' | 'ganbate_world_images' | 'ganbate_world_image' | 'ganbate_world_set_image'
   >,
   onLog: (level: number, text: string) => void,
+  signal?: AbortSignal,
 ): Promise<number> {
   const read = (call: (p: number, cap: number) => number) => {
     const len = call(0, 0);
@@ -104,47 +116,39 @@ export async function decodeWorldImages(
       new TextDecoder().decode(read((p, cap) => x.ganbate_world_images(p, cap))),
     ) as { readonly texture: number; readonly mime: string }[]
   ).filter((im) => im.mime !== 'image/png');
-  const decoded = await Promise.all(
-    list.map(async (im) => {
-      const bytes = read((p, cap) => x.ganbate_world_image(im.texture, p, cap));
+  await mapBounded(list, async (im) => {
+    signal?.throwIfAborted();
+    const bytes = read((p, cap) => x.ganbate_world_image(im.texture, p, cap));
+    try {
+      const bitmap = await createImageBitmap(new Blob([bytes as unknown as BlobPart], { type: im.mime }), {
+        premultiplyAlpha: 'none', colorSpaceConversion: 'none',
+      });
       try {
-        const bitmap = await createImageBitmap(
-          new Blob([bytes as unknown as BlobPart], { type: im.mime }),
-          {
-            premultiplyAlpha: 'none',
-            colorSpaceConversion: 'none',
-          },
-        );
-        const pixels = pixelsOf(bitmap);
-        if (bitmap.close) bitmap.close();
-        return { im, pixels };
-      } catch (e) {
-        onLog(
-          1,
-          `world image ${im.texture} (${im.mime}) not decoded: ${e instanceof Error ? e.message : String(e)}`,
-        );
-        return null;
-      }
-    }),
-  );
-  for (const d of decoded) {
-    if (!d) continue;
-    const { width, height, data } = d.pixels;
-    const bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-    const p = x.ganbate_alloc(bytes.length) >>> 0;
-    new Uint8Array(x.memory.buffer, p, bytes.length).set(bytes);
-    x.ganbate_world_set_image(d.im.texture, width, height, p, bytes.length);
-    x.ganbate_free(p, bytes.length);
-  }
+        signal?.throwIfAborted();
+        const { width, height, data } = pixelsOf(bitmap);
+        const pixels = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        const p = x.ganbate_alloc(pixels.length) >>> 0;
+        try {
+          new Uint8Array(x.memory.buffer, p, pixels.length).set(pixels);
+          x.ganbate_world_set_image(im.texture, width, height, p, pixels.length);
+        } finally { x.ganbate_free(p, pixels.length); }
+      } finally { bitmap.close(); }
+    } catch (e) {
+      onLog(1, `world image ${im.texture} (${im.mime}) not decoded: ${e instanceof Error ? e.message : String(e)}`);
+      throw e;
+    }
+  });
   return list.length;
 }
 
 export interface BootOptions {
+  readonly signal?: AbortSignal;
   readonly canvas: HTMLCanvasElement;
   readonly wasm: string | ArrayBuffer | ArrayBufferView | WebAssembly.Instance;
   readonly api?: GanbateApi;
   readonly present?: 'direct' | 'settled';
   readonly bundles?: boolean;
+  readonly stagedPipelines?: boolean;
   readonly checkErrors?: boolean;
   readonly onPhase?: (text: string, progress: number) => void;
   readonly onLog?: (level: number, text: string) => void;
@@ -196,6 +200,7 @@ export async function boot(options: BootOptions): Promise<{
     checkErrors: !!options.checkErrors,
     settled,
     bundles: options.bundles ?? !appleWebKit(),
+    stagedPipelines: options.stagedPipelines,
   };
   const host = gpu.api === 'webgl2' ? createGlHost(gpu, hostOptions) : createHost(gpu, hostOptions);
   onPhase('Loading the engine', 0);
@@ -210,7 +215,7 @@ export async function boot(options: BootOptions): Promise<{
   } else if (options.wasm instanceof ArrayBuffer || ArrayBuffer.isView(options.wasm)) {
     ({ instance } = await WebAssembly.instantiate(options.wasm as BufferSource, host.imports));
   } else {
-    const wasmResponse = await fetch(options.wasm as string);
+    const wasmResponse = await fetch(options.wasm as string, { signal: options.signal });
     if (!wasmResponse.ok) throw new Error(`${options.wasm}: HTTP ${wasmResponse.status}`);
     try {
       ({ instance } = await WebAssembly.instantiateStreaming(wasmResponse.clone(), host.imports));

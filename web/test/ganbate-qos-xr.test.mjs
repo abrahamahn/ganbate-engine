@@ -26,6 +26,11 @@ function makeMockCanvas(width = 128, height = 72) {
         RENDERER: 0x1F01,
         MAX_COMBINED_TEXTURE_IMAGE_UNITS: 0x8B4D,
         NO_ERROR: 0,
+        TIMEOUT_EXPIRED: 0x911B,
+        WAIT_FAILED: 0x911D,
+        ALREADY_SIGNALED: 0x911A,
+        fenceSync() { return {}; },
+        clientWaitSync() { return 0x911A; },
         getExtension() { return null; },
         getParameter(param) {
           if (param === 0x1F01) return 'MockWebGL2';

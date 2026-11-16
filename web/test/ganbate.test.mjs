@@ -41,6 +41,9 @@ function makeRecordingWebGl2Canvas(width = 640, height = 360) {
     UNSIGNED_BYTE: 0x1401,
     COMPILE_STATUS: 0x8B81,
     LINK_STATUS: 0x8B82,
+    TIMEOUT_EXPIRED: 0x911B,
+    WAIT_FAILED: 0x911D,
+    ALREADY_SIGNALED: 0x911A,
   };
   let nextId = 1;
   const base = {
@@ -73,6 +76,8 @@ function makeRecordingWebGl2Canvas(width = 640, height = 360) {
       recorded.blits.push({ sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1, mask, filter });
     },
     getError() { return 0; },
+    fenceSync() { return {}; },
+    clientWaitSync() { return constants.ALREADY_SIGNALED; },
     async makeXRCompatible() { return true; },
   };
   const gl = new Proxy(base, {
@@ -493,6 +498,7 @@ async function makeTextureEngine(api, exportOverrides = {}) {
           t.uploads.push({ src, dst, size });
         },
         submit() {},
+        onSubmittedWorkDone: async () => {},
       },
       createTexture: (desc) => ({ desc, destroy() {} }),
     }, {
@@ -776,7 +782,7 @@ test('glContext and setXrTarget support WebXR stereo eye framebuffer blits on We
   assert.equal(engine.setXrTarget(null), true);
 
   const makeMockGpuDevice = () => new Proxy(
-    { lost: new Promise(() => {}) },
+    { lost: new Promise(() => {}), queue: { onSubmittedWorkDone: async () => {} } },
     {
       get(target, prop) {
         if (prop === 'then') return undefined;
@@ -985,6 +991,7 @@ test('both hosts provide every import of the compiled ganbate_web.wasm, which ha
 /** createEngine on a mock WebGPU device whose frames draw into the canvas, with GPU completion by hand. */
 async function makePresentEngine(present) {
   const t = { log: [], done: [], rafs: [], canvasTextures: 0 };
+  let booting = true;
   const anything = () => new Proxy(function () {}, {
     get: (_, prop) => (prop === 'then' ? undefined : anything()),
     apply: () => anything(),
@@ -995,7 +1002,7 @@ async function makePresentEngine(present) {
     queue: {
       submit: () => t.log.push(`submit (${t.done.length} unfinished)`),
       writeBuffer() {},
-      onSubmittedWorkDone: () => new Promise((resolve) => t.done.push(resolve)),
+      onSubmittedWorkDone: () => booting ? Promise.resolve() : new Promise((resolve) => t.done.push(resolve)),
     },
     createTexture: ({ size }) => texture(size[0], size[1]),
   }, { get: (target, prop) => (prop === 'then' ? undefined : prop in target ? target[prop] : anything()) });
@@ -1051,6 +1058,7 @@ async function makePresentEngine(present) {
   } finally {
     WebAssembly.instantiate = instantiate;
   }
+  booting = false;
   t.canvas = canvas;
   t.run = (steps) => withGlobals(globals, steps);
   // Finishes the oldest frame on the GPU, as the queue reports it.
