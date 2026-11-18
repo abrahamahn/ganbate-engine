@@ -489,6 +489,8 @@ export interface GanbateEngine {
   /** The world's lamps `boost` times as bright as the hour lights them, glow and light alike (1: as it does). */
   setLampBoost(boost: number): void;
   setWeather(preset: string): void;
+  /** Floating cherry-blossom petal density in `[0, 1]` (`0` = none, `1` = full sakura drift). */
+  setPetals(amount: number): void;
   /** Draws and presents a frame; false when it skipped (GPU busy). */
   render(): boolean;
   frames(): number;

@@ -379,6 +379,20 @@ pub unsafe extern "C" fn ganbate_rt_set_weather(ptr: *const u8, len: usize) -> u
     })
 }
 
+/// Overrides the floating cherry-blossom petal density (`0..=1`, where `1` is the full `petals`
+/// weather preset of 3,500 drifting petals and `0` disables them) while keeping the rest of the
+/// active weather preset intact.
+#[unsafe(no_mangle)]
+pub extern "C" fn ganbate_rt_set_petals(amount: f32) -> u32 {
+    with(0, |rt| {
+        if !amount.is_finite() || amount < 0.0 {
+            return Err("set_petals: a finite amount of 0 or more".into());
+        }
+        rt.weather.petals = amount.clamp(0.0, 1.0);
+        Ok(1)
+    })
+}
+
 /// Renders and presents a frame. Returns 1 when presented, 2 when the canvas had no image to
 /// draw into (nothing to do), 0 after logging an error.
 #[unsafe(no_mangle)]

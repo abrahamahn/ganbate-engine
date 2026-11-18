@@ -444,6 +444,11 @@ export async function createEngine(options: CreateEngineOptions): Promise<Ganbat
       const [p] = place(t);
       ok('setWeather', x.ganbate_rt_set_weather(p, t.length));
     },
+    setPetals(amount: number) {
+      if (typeof x.ganbate_rt_set_petals === 'function') {
+        ok('setPetals', x.ganbate_rt_set_petals(amount));
+      }
+    },
     render() {
       if (stopped) return false;
       gate.show();

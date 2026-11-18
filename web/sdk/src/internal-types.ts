@@ -134,6 +134,7 @@ export interface GanbateWasmExports {
   ganbate_rt_set_clock(hours: number, seconds: number): number;
   ganbate_rt_set_lamp_boost(boost: number): number;
   ganbate_rt_set_weather(ptr: number, len: number): number;
+  ganbate_rt_set_petals?(amount: number): number;
   ganbate_rt_render(): number;
   ganbate_rt_frames(): number;
   ganbate_rt_step_ao?(samples: number): number;
