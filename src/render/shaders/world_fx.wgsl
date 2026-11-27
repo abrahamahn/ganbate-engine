@@ -147,7 +147,6 @@ struct ParticlePush {
   centre: vec4f,
 };
 var<push_constant> particle: ParticlePush;
-@group(0) @binding(5) var ground_sampler: sampler_comparison;
 @group(0) @binding(8) var ground_depth: texture_depth_2d;
 
 // 1 where nothing solid is above `p` (open sky), 0 under a roof (from the ground map).
@@ -156,7 +155,21 @@ fn open_sky(p: vec3f) -> f32 {
   if (g.z <= 0.0) {
     return 1.0;
   }
-  return textureSampleCompareLevel(ground_depth, ground_sampler, g.xy / frame.ground.z, g.z - 0.002);
+  // The shadow sampler performs clamped bilinear LessEqual comparisons. A vertex
+  // comparison sampler fails at draw time on some WebGL 2 drivers; use the same
+  // four depth texels and lerp their individual comparisons.
+  let texel = g.xy - vec2f(0.5);
+  let base = vec2i(floor(texel));
+  let f = fract(texel);
+  let limit = vec2i(i32(frame.ground.z) - 1);
+  let lo = clamp(base, vec2i(0), limit);
+  let hi = clamp(base + vec2i(1), vec2i(0), limit);
+  let ref_z = g.z - 0.002;
+  let a = step(ref_z, textureLoad(ground_depth, lo, 0));
+  let b = step(ref_z, textureLoad(ground_depth, vec2i(hi.x, lo.y), 0));
+  let c = step(ref_z, textureLoad(ground_depth, vec2i(lo.x, hi.y), 0));
+  let d = step(ref_z, textureLoad(ground_depth, hi, 0));
+  return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
 }
 
 struct ParticleOut {
