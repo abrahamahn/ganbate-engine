@@ -14,8 +14,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh api repos/abrahamahn/ganbate-engine/actions/artifacts/15174166605/zip > "$RUNNER_TEMP/sdk.zip"
-          echo "2e35e453ad697b0efe98a2c31b9196615c8301319340c79db8f92370ad32fc7b  $RUNNER_TEMP/sdk.zip" | sha256sum -c -
+          gh api repos/abrahamahn/ganbate-engine/actions/artifacts/15174251634/zip > "$RUNNER_TEMP/sdk.zip"
+          echo "71adc49723605cb2a003def5d3f71cb3e15d10aacc8795b84c7db1bdc0a1caba  $RUNNER_TEMP/sdk.zip" | sha256sum -c -
           echo '::group::Verified archive'
           echo BEGIN_VERIFIED_SDK_ARCHIVE
           base64 -w 512 "$RUNNER_TEMP/sdk.zip"
