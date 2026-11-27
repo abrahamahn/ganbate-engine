@@ -667,23 +667,11 @@ impl Renderer {
                     .draws
                     .iter()
                     .any(|d| d.water && main_frustum.intersects_aabb(d.bounds.0, d.bounds.1)));
-        // Mirror camera for the water reflection (skipped when no water enters the view frustum).
-        let refl_eye = self.scene.water_level.filter(|_| water_visible).map(|h| {
-            let r = reflect_y(h);
-            let base = self.eye(view, [0.0, 0.0], self.targets.refl);
-            let view_proj = mul(&base.view_proj, &r);
-            Eye {
-                view_proj,
-                inv: invert(&view_proj).unwrap_or(math::IDENTITY),
-                pos: [view.eye[0], 2.0 * h - view.eye[1], view.eye[2]],
-                near: base.near,
-            }
-        });
-        let has_reflection = refl_eye.is_some();
+        let reflection_level = self.scene.water_level.filter(|_| water_visible);
+        let has_reflection = reflection_level.is_some();
         let world_key;
         {
             let tiles_dim = self.targets.tiles;
-            let refl_size = self.targets.refl;
             let slot = &self.slots[slot_index];
             let (frame_buffers, tile_buffers, index_buffers) = (slot.frame, slot.tiles, slot.index);
             // The lamps binned to screen tiles (617 of them in the Harbor): only when the view
@@ -717,28 +705,6 @@ impl Renderer {
             key.write(&self.scene.revision.to_le_bytes());
             with_le_bytes_f32(self.game_lights.records().as_flattened(), |b| key.write(b));
             world_key = key.finish();
-            if let Some(re) = &refl_eye {
-                let tiles_key = self.tile_key(re, refl_size, tiles_dim[1], lamps_on);
-                if self.slots[slot_index].tiles_for[1] != Some(tiles_key) {
-                    let (tiles, index) = self.tile_lights(re, refl_size, tiles_dim[1], lamps_on);
-                    device.write_buffer_u32(tile_buffers[1], 0, &tiles)?;
-                    device.write_buffer_u32(index_buffers[1], 0, &index)?;
-                    self.slots[slot_index].tiles_for[1] = Some(tiles_key);
-                }
-                let block = self.frame_block(
-                    re,
-                    env,
-                    &cas,
-                    &ground,
-                    refl_size,
-                    tiles_dim[1],
-                    true,
-                    has_prop_shadows,
-                    has_reflection,
-                    seed,
-                );
-                device.write_buffer(frame_buffers[1], 0, block.as_slice())?;
-            }
         }
         // A presented view draws the world's part of the main pass, and the water's reflection,
         // only when what they show changed; otherwise the frame starts from those pictures. A
@@ -749,6 +715,43 @@ impl Renderer {
         let ao_due = self.scene.ao_revision != self.cache_ao_revision
             && (self.cache_age >= AO_CACHE_REFRESH_FRAMES || self.scene.ao.is_idle());
         let rebuild = cached && (self.world_cache != Some(world_key) || ao_due);
+        // A retained reflection samples its existing texture. Only its drawing frame needs
+        // the mirrored camera, its lamp tiles and its GPU frame block.
+        let refl_eye = reflection_level.filter(|_| !cached || rebuild).map(|h| {
+            let r = reflect_y(h);
+            let base = self.view_proj(view, [0.0, 0.0], self.targets.refl);
+            let view_proj = mul(&base, &r);
+            Eye {
+                view_proj,
+                inv: invert(&view_proj).unwrap_or(math::IDENTITY),
+                pos: [view.eye[0], 2.0 * h - view.eye[1], view.eye[2]],
+                near: eye.near,
+            }
+        });
+        if let Some(re) = &refl_eye {
+            let tiles_dim = self.targets.tiles[1];
+            let refl_size = self.targets.refl;
+            let tiles_key = self.tile_key(re, refl_size, tiles_dim, lamps_on);
+            if self.slots[slot_index].tiles_for[1] != Some(tiles_key) {
+                let (tiles, index) = self.tile_lights(re, refl_size, tiles_dim, lamps_on);
+                device.write_buffer_u32(self.slots[slot_index].tiles[1], 0, &tiles)?;
+                device.write_buffer_u32(self.slots[slot_index].index[1], 0, &index)?;
+                self.slots[slot_index].tiles_for[1] = Some(tiles_key);
+            }
+            let block = self.frame_block(
+                re,
+                env,
+                &cas,
+                &ground,
+                refl_size,
+                tiles_dim,
+                true,
+                has_prop_shadows,
+                has_reflection,
+                seed,
+            );
+            device.write_buffer(self.slots[slot_index].frame[1], 0, block.as_slice())?;
+        }
         if rebuild {
             self.world_cache = Some(world_key);
             self.cache_ao_revision = self.scene.ao_revision;
@@ -1004,7 +1007,7 @@ impl Renderer {
         let clear = [0.0, 0.0, 0.0, 0.0];
         // Water reflection (kept from the frame that last drew it while the world's picture holds;
         // the props it mirrors stand far from the water).
-        if let Some(re) = refl_eye.as_ref().filter(|_| !cached || rebuild) {
+        if let Some(re) = &refl_eye {
             stats.reflection_drawn = true;
             self.targets.refl_cleared = true;
             let (refl_hdr, refl_aux, refl_depth) = (

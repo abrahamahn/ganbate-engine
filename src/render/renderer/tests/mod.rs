@@ -790,6 +790,73 @@ fn frame_srgb(
         .collect()
 }
 
+#[test]
+fn a_cached_reflection_leaves_the_mirrored_lamp_tiles_alone() {
+    let Ok(mut device) = Device::headless() else {
+        return;
+    };
+    let mut world = World::default();
+    world.materials.push(Material {
+        name: "pond".into(),
+        shading: Shading::Water,
+        ..Material::default()
+    });
+    world.meshes.push(make_quad_mesh(0.0, 4.0));
+    world.instances.push(Instance {
+        mesh: 0,
+        transform: Transform(math::IDENTITY),
+    });
+    let size = (48, 32);
+    let look = Look::default();
+    let mut env = Environment::resolve(
+        &TimeOfDay::default(),
+        &Weather::default(),
+        &look.palette,
+        0.0,
+    );
+    let mut renderer = Renderer::new(
+        &mut device,
+        &world,
+        look,
+        Quality::hybrid_stage(),
+        size,
+        Output::Surface(Format::Rgba8Unorm),
+    )
+    .expect("renderer");
+    renderer.finish_ao(&mut device).expect("finish AO");
+    let target = canvas(&mut device, size);
+    let mut view = View {
+        eye: [0.0, 2.0, 4.2],
+        target: [0.0, 0.0, 0.0],
+        ..View::default()
+    };
+
+    // Switch eyes, then return to the first. Each view needs its own reflected projection.
+    for eye_x in [-0.032, 0.032, -0.032] {
+        view.eye[0] = eye_x;
+        view.target[0] = eye_x;
+        present(&mut device, &mut renderer, &view, &env, target);
+        assert!(renderer.last_frame_stats().reflection_drawn);
+        assert!(renderer.slots.iter().any(|s| s.tiles_for[1].is_some()));
+        // Neither frame slot has a lamp bin ready. A clock-only frame should still sample
+        // the retained reflection without binning lamps for an unused pass.
+        for slot in &mut renderer.slots {
+            slot.tiles_for[1] = None;
+        }
+        env.seconds = 0.016;
+        present(&mut device, &mut renderer, &view, &env, target);
+        assert!(!renderer.last_frame_stats().reflection_drawn);
+        assert!(renderer.slots.iter().all(|s| s.tiles_for[1].is_none()));
+        env.seconds = 0.0;
+        let kept = present(&mut device, &mut renderer, &view, &env, target);
+        renderer.forget_world_cache();
+        let fresh = present(&mut device, &mut renderer, &view, &env, target);
+        assert!(renderer.last_frame_stats().reflection_drawn);
+        assert_same_frame(&device, &kept, &fresh, "retained reflected view");
+    }
+    assert!(device.validation_errors().is_empty());
+}
+
 /// A presented frame, whose water reads its lamp light and shadow as the cached picture
 /// keeps them (`cache_water`), shows what a still (computing them) shows, to the step its
 /// own sRGB encoding rounds differently: by day and at night under a lamp and a spot light,

@@ -525,31 +525,6 @@ fn lamp_light(world: vec3f, n: vec3f, frag: vec2f, foliage: bool) -> vec3f {
   return lamp_light_inner(world, n, frag, foliage, false);
 }
 
-fn water_normal(world: vec3f, t: f32) -> vec3f {
-  let s = frame.water.z;
-  let p = world.xz * s;
-  let w = frame.wind.xy * 0.05;
-  var g = vec2f(0.0);
-  g += vec2f(cos(p.x * 1.3 + p.y * 0.4 + t * 1.1), cos(p.y * 1.7 - p.x * 0.3 + t * 0.9)) * 0.45;
-  g += vec2f(cos(p.x * 3.1 - p.y * 2.2 - t * 1.7), cos(p.y * 2.9 + p.x * 1.9 + t * 1.5)) * 0.25;
-  let q = p * 2.5 + w * t;
-  let e = 0.08;
-  let nx = fbm2(q + vec2f(e, 0.0)) - fbm2(q - vec2f(e, 0.0));
-  let nz = fbm2(q + vec2f(0.0, e)) - fbm2(q - vec2f(0.0, e));
-  g += vec2f(nx, nz) * 4.0;
-  // Rain rings.
-  let rain = frame.water.w;
-  if (rain > 0.0) {
-    let cell = floor(world.xz * 2.2);
-    let f = fract(world.xz * 2.2) - vec2f(0.5);
-    let phase = fract(t * 0.9 + hash2(cell) * 7.0);
-    let r = length(f);
-    let ring = sin((r - phase * 0.6) * 40.0) * smoothstep(0.6 * phase + 0.08, 0.6 * phase, r) * (1.0 - phase);
-    g += f / max(r, 1e-3) * (ring * rain * 1.5);
-  }
-  return normalize(vec3f(-g.x * 0.045, 1.0, -g.y * 0.045));
-}
-
 fn ground_shore_at(texel: vec2i, off: vec2i, max_c: vec2i, shore_h: f32) -> bool {
   let qd = textureLoad(ground_depth, clamp(texel + off, vec2i(0), max_c), 0);
   return qd < 1.0 && ground_height(qd) > shore_h;
@@ -668,6 +643,11 @@ fn shade_scene(
   var dpx = vec3f(0.0);
   var dpy = vec3f(0.0);
   var dp_len = 0.0;
+  var water_pixel = 0.0;
+  if (water && !only_statics) {
+    let footprint = fwidth(in.world.xz);
+    water_pixel = max(footprint.x, footprint.y);
+  }
   if (dry) {
     nrm_s = textureSampleBias(normal_tex, material_sampler, in.uv, bias * 0.5);
     emi_s = textureSampleBias(emissive_tex, material_sampler, in.uv, bias);
@@ -823,16 +803,23 @@ fn shade_scene(
     }
     let shallows = (1.0 - smoothstep(0.0, 1.4, max(below, 0.0))) * 0.45;
     let foam_k = clamp(foam, 0.0, 0.7);
-    let wn = water_normal(in.world, t);
+    let wn = water_normal(in.world, t, water_pixel, below);
     let to_cam_w = frame.camera.xyz - in.world;
     let v_w = to_cam_w / max(length(to_cam_w), 1e-4);
     let cosv = clamp(dot(wn, v_w), 0.0, 1.0);
-    let fres = 0.03 + 0.97 * pow(1.0 - cosv, 5.0);
+    let fres = 0.0204 + 0.9796 * pow(1.0 - cosv, 5.0);
     let r = reflect(-v_w, wn);
     var refl: vec3f;
     if (!reflection_pass && frame.water2.w > 0.5) {
-      let uv = frag.xy * frame.viewport.zw + wn.xz * vec2f(0.06, 0.035);
-      refl = textureSampleLevel(reflection, clamp_sampler, uv, 0.0).rgb;
+      let uv = frag.xy * frame.viewport.zw;
+      // The mirror view projects world directions with Y reflected. Project the change
+      // in reflected direction so the ripples keep their heading when the camera turns.
+      let flat = vec3f(-v_w.x, v_w.y, -v_w.z);
+      let dc = frame.view_proj * vec4f((r - flat) * vec3f(1.0, -1.0, 1.0), 0.0);
+      let bend_uv = (dc.xy - (uv * 2.0 - vec2f(1.0)) * dc.w) * 0.20;
+      let border = min(uv, vec2f(1.0) - uv);
+      let mirror_uv = uv + clamp(bend_uv, -border * 0.9, border * 0.9);
+      refl = textureSampleLevel(reflection, clamp_sampler, mirror_uv, 0.0).rgb;
     } else {
       refl = sky_color(r);
     }
@@ -843,17 +830,12 @@ fn shade_scene(
       * mix(1.0, baked_ao, frame.lamps.y * 0.35);
     let water_col = mix(frame.water_color.rgb, frame.shallow.rgb, shallows);
     let deep = water_col * (hemi + key * 0.25) + lamps * 0.05;
-    var col = mix(deep, refl, clamp(fres * 1.4 + 0.3, 0.0, 1.0) * frame.water.y);
+    var col = mix(deep, refl, mix(0.17, 1.0, fres) * clamp(frame.water.y, 0.0, 1.0));
     let rl = max(dot(r, l), 0.0);
     if (rl > 0.0 && sh > 0.0) {
-      col += key * (pow(rl, 600.0) * 6.0 * sh);
-      col += key * (pow(rl, 40.0) * 0.08 * sh);
+      col += key * ((pow(rl, 220.0) * 2.0 + pow(rl, 38.0) * 0.075) * sh);
       if (frame.water2.x > 0.0) {
-        let cell = floor(in.world.xz * 7.0);
-        let spark = step(0.92, hash2(cell + vec2f(floor(t * 5.0) * 13.0, 0.0)));
-        if (spark > 0.0) {
-          col += key * (spark * pow(rl, 90.0) * 9.0 * frame.water2.x * sh);
-        }
+        col += key * (pow(rl, 660.0) * 2.8 * frame.water2.x * sh);
       }
     }
     let foam_lit = key * (0.35 + 0.65 * sh) * 0.8 + hemi * 0.9 + lamps * 0.4;

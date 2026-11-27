@@ -405,8 +405,7 @@ impl Renderer {
         let mut frame = vec![];
         let mut tiles = vec![];
         let mut index = vec![];
-        for v in 0..2 {
-            let (tx, ty) = t.tiles[v];
+        for &(tx, ty) in &t.tiles {
             let n = u64::from(tx) * u64::from(ty);
             frame.push(upload(device, FRAME_BYTES, BufferUsage::UNIFORM)?);
             tiles.push(upload(

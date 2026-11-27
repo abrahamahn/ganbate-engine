@@ -456,8 +456,8 @@ mod tests {
             );
         }
         // Exact ULP neighborhood around every single threshold in 1..=255.
-        for k in 1..=255 {
-            let center = t.thresh[k].to_bits();
+        for (k, threshold) in t.thresh.iter().enumerate().skip(1).take(255) {
+            let center = threshold.to_bits();
             for delta in -64i32..=64 {
                 let bits = center.saturating_add_signed(delta);
                 let l = f32::from_bits(bits);
