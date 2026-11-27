@@ -1,0 +1,23 @@
+name: Transfer verified browser SDK
+on:
+  push:
+    branches: [build/sdk-artifact-transfer-20261127]
+    paths: ['.github/workflows/transfer-verified-sdk.yml']
+permissions:
+  actions: read
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Transfer CI archive after digest verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api repos/abrahamahn/ganbate-engine/actions/artifacts/15172224201/zip > "$RUNNER_TEMP/sdk.zip"
+          echo "8eef966ae39a18c59aee55f6d20721fe5f55da5341b745c57a0088d6d04a306e  $RUNNER_TEMP/sdk.zip" | sha256sum -c -
+          echo '::group::Verified archive'
+          echo BEGIN_VERIFIED_SDK_ARCHIVE
+          base64 -w 512 "$RUNNER_TEMP/sdk.zip"
+          echo END_VERIFIED_SDK_ARCHIVE
+          echo '::endgroup::'
