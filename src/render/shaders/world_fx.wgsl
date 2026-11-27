@@ -180,24 +180,50 @@ const PARTICLE_CORNERS = array<vec2f, 6>(
   let wind = vec3f(frame.wind.x, 0.0, frame.wind.y);
   var pos = r.xyz * box;
   var vel = vec3f(0.0);
+  var centre = particle.centre.xyz;
+  var swing = 0.0;
+  var tumble = 0.0;
   if (kind < 0.5) {
     vel = vec3f(0.0, -(8.0 + 4.0 * r.w), 0.0) + wind;
     pos += vel * t;
   } else {
-    let swirl = vec3f(sin(t * 0.8 + r.x * 6.28), 0.0, cos(t * 0.6 + r.y * 6.28)) * 0.7;
-    vel = vec3f(0.0, -0.55 - 0.3 * r.w, 0.0) + wind * 0.45;
-    pos += vel * t + swirl;
+    // A ground-relative fall cycle bounds wind displacement even after a long session.
+    // A new seed offset at each landing changes the next path while the petal is hidden.
+    let sink = mix(0.42, 0.86, r.w);
+    let cycle = r.y + t * (sink / box);
+    let fraction = fract(cycle);
+    let age = fraction * box / sink;
+    let spawn = fract(r.xz + floor(cycle) * vec2f(0.381966, 0.754878)) * box;
+    let axis = r.zx * 2.0 - vec2f(1.0);
+    let across = vec2f(-axis.y, axis.x);
+    let pendulum = age * mix(1.15, 2.05, r.z) + r.x * 6.2832;
+    swing = sin(pendulum);
+    let turn = age * mix(2.0, 3.7, r.x) + r.z * 6.2832 + swing * 0.65;
+    tumble = cos(turn);
+    let drift = frame.wind.xy * (age * mix(0.32, 0.54, r.z));
+    let sway = axis * (swing * mix(0.12, 0.36, r.w)) + across * (sin(turn) * 0.075);
+    let xz = spawn + drift + sway;
+    let height = (1.0 - fraction) * box + tumble * 0.035;
+    pos = vec3f(xz.x, particle.params.y + height, xz.y);
+    centre.y = particle.params.y + box * 0.5;
   }
   // Wrap into the box.
-  let centre = particle.centre.xyz;
-  let rel = (pos - centre) / box + vec3f(0.5);
-  let world_c = centre + (rel - floor(rel) - vec3f(0.5)) * box;
+  let cell = fract((pos - centre) / box + vec3f(0.5));
+  let world_c = centre + (cell - vec3f(0.5)) * box;
   // Thin out near the camera so drops never fill the lens; petals drift only near the ground.
   let d = length(world_c - cam);
   let near_fade = smoothstep(0.6, 2.2, d) * particle.params.w;
-  let height_fade = select(1.0, smoothstep(11.0, 5.0, world_c.y - particle.params.y), kind >= 0.5);
+  var petal_fade = 1.0;
+  if (kind >= 0.5) {
+    // The same world point is visible on either side of a moving camera; hide it only
+    // at a box seam, where wrapping would otherwise teleport it across the frame.
+    let edge = min(cell, vec3f(1.0) - cell) * box;
+    let height = world_c.y - particle.params.y;
+    petal_fade = smoothstep(0.0, 0.75, min(edge.x, edge.z))
+      * smoothstep(0.015, 0.20, height) * (1.0 - smoothstep(5.0, 11.0, height));
+  }
   let cw = (frame.view_proj * vec4f(world_c, 1.0)).w;
-  if (particle.tint.a <= 0.0 || near_fade <= 0.0 || height_fade <= 0.0 || cw < -1.0) {
+  if (particle.tint.a <= 0.0 || near_fade <= 0.0 || petal_fade <= 0.0 || cw < -1.0) {
     var o: ParticleOut;
     o.clip = vec4f(0.0, 0.0, -1.0, 1.0);
     return o;
@@ -214,18 +240,21 @@ const PARTICLE_CORNERS = array<vec2f, 6>(
     let open = open_sky(world_c);
     color = vec4f(particle.tint.rgb * (frame.amb_sky.rgb * 1.5 + frame.key_color.rgb * frame.key_dir.w * 0.3 + vec3f(0.08)), particle.tint.a * open);
   } else {
-    let spin = t * (1.5 + r.w * 2.0) + r.x * 6.28;
+    // Bank into the lateral swing; tilt through edge-on instead of spinning a flat disk.
+    let bank = (r.y - 0.5) * 3.4 + swing * 0.8 + tumble * 0.22;
     let right = normalize(cross(vec3f(0.0, 1.0, 0.0), to_cam) + vec3f(1e-5, 0.0, 0.0));
     let up = cross(to_cam, right);
-    let a = vec2f(cos(spin), sin(spin));
-    let q = vec2f(c.x * a.x - c.y * a.y, c.x * a.y + c.y * a.x) * vec2f(0.022, 0.015);
-    world += right * q.x + up * q.y;
+    let a = vec2f(cos(bank), sin(bank));
+    let size = mix(0.017, 0.028, r.y);
+    let q = c * vec2f(size * mix(0.19, 0.82, abs(tumble)), size);
+    world += right * (q.x * a.x - q.y * a.y) + up * (q.x * a.y + q.y * a.x);
     let lit = frame.amb_sky.rgb * 0.8 + frame.key_color.rgb * (frame.key_dir.w * 0.28) + vec3f(1.0, 0.6, 0.3) * (frame.amb_sky.w * 0.18);
-    color = vec4f(particle.tint.rgb * lit * (0.75 + 0.5 * r.y), particle.tint.a);
+    let facing = mix(0.90, 1.04, abs(tumble));
+    color = vec4f(particle.tint.rgb * lit * ((0.75 + 0.5 * r.y) * facing), particle.tint.a);
   }
   color.a *= near_fade;
   if (kind >= 0.5) {
-    color.a *= height_fade;
+    color.a *= petal_fade;
   }
   var o: ParticleOut;
   o.clip = frame.view_proj * vec4f(world, 1.0);
@@ -243,8 +272,11 @@ const PARTICLE_CORNERS = array<vec2f, 6>(
   if (particle.params.x < 0.5) {
     a *= (1.0 - abs(in.uv.x)) * smoothstep(1.0, 0.2, abs(in.uv.y));
   } else {
-    let d = length(in.uv);
-    a *= smoothstep(1.0, 0.75, d);
+    // A narrowed base and shallow notch separate the lobes of a cupped petal.
+    let x = (in.uv.x - 0.08 * (1.0 - in.uv.y * in.uv.y)) / (0.81 + 0.31 * in.uv.y);
+    let notch = max(0.0, 1.0 - abs(x) * 4.0) * max(0.0, in.uv.y - 0.45) * 0.5;
+    let p = vec2f(x, in.uv.y + notch);
+    a *= 1.0 - smoothstep(0.58, 1.0, dot(p, p));
   }
   var out: FsOut;
   out.color = vec4f(in.color.rgb, a);
