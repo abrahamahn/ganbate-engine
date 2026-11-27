@@ -1010,8 +1010,8 @@ mod tests {
             Vec3::new(0.5, 0.2, 2.0),
         );
         let p = m * m.inverse().unwrap();
-        for i in 0..3 {
-            assert!(close_v(p.cols[i], Mat3::IDENTITY.cols[i], 1e-5));
+        for (actual, expected) in p.cols.into_iter().zip(Mat3::IDENTITY.cols) {
+            assert!(close_v(actual, expected, 1e-5));
         }
         assert!(Mat3::ZERO.inverse().is_none());
         let q = Quat::from_axis_angle(Vec3::Z, 0.9);
