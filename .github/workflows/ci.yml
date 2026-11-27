@@ -50,3 +50,16 @@ jobs:
           npm --prefix web ci
           ./scripts/build-web.sh web/dist
           npm --prefix web run check
+
+      - name: Keep the verified Web SDK for browser integration
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ganbate-web-sdk
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            web/dist/ganbate_web.wasm
+            web/dist/ganbate.js
+            web/dist/ganbate.d.ts
+            web/dist/graph-session.mjs
+            web/dist/graph-session.d.mts
