@@ -203,7 +203,7 @@ const PARTICLE_CORNERS = array<vec2f, 6>(
     let drift = frame.wind.xy * (age * mix(0.32, 0.54, r.z));
     let sway = axis * (swing * mix(0.12, 0.36, r.w)) + across * (sin(turn) * 0.075);
     let xz = spawn + drift + sway;
-    let height = (1.0 - fraction) * box + tumble * 0.035;
+    let height = (1.0 - fraction) * (box + tumble * 0.14 * fraction);
     pos = vec3f(xz.x, particle.params.y + height, xz.y);
     centre.y = particle.params.y + box * 0.5;
   }
