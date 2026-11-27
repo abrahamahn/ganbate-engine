@@ -525,46 +525,6 @@ fn lamp_light(world: vec3f, n: vec3f, frag: vec2f, foliage: bool) -> vec3f {
   return lamp_light_inner(world, n, frag, foliage, false);
 }
 
-// Wind waves in metres. The normal is the analytic slope of a single height field.
-// Shorter waves travel more slowly and fade when a pixel covers their crests.
-fn water_normal(world: vec3f, t: f32, pixel: f32, depth: f32) -> vec3f {
-  let scale = max(frame.water.z, 0.0);
-  let wind = frame.wind.xy;
-  let along = normalize(wind + vec2f(0.0008, 0.0006));
-  let across = vec2f(-along.y, along.x);
-  let p = vec2f(dot(world.xz, along), dot(world.xz, across)) * scale;
-  let clock = t * sqrt(scale);
-  let kx = vec4f(1.36, 2.34, 5.88, 9.42);
-  let kz = vec4f(0.26, -1.86, 2.41, -5.33);
-  let bend = vec4f(0.0, 0.34, 0.64, -0.73);
-  let group = dot(p, vec2f(0.24, 0.39)) - clock * 0.41;
-  let phase = kx * p.x + kz * p.y + vec4f(0.0, 1.63, -0.84, 2.56)
-    + bend * sin(group) - vec4f(3.69, 5.42, 7.90, 10.30) * clock;
-  let footprint = pixel * scale * vec4f(1.39, 2.99, 6.36, 10.83);
-  let resolved = vec4f(1.0) - smoothstep(vec4f(0.85), vec4f(2.7), footprint);
-  let shelter = mix(0.54, 1.0, smoothstep(0.0, 1.3, depth));
-  let amplitude = vec4f(0.028 * shelter, 0.011 * shelter, 0.0040, 0.0015);
-  let slope = amplitude * cos(phase) * resolved;
-  let warp = dot(slope, bend) * cos(group);
-  let energy = clamp(0.58 + 0.26 * length(wind), 0.58, 1.70);
-  var g = (along * (dot(slope, kx) + 0.24 * warp)
-    + across * (dot(slope, kz) + 0.39 * warp)) * (scale * energy);
-  // Each impact fades in and dies inside its own footprint before its clock wraps.
-  let rain = frame.water.w;
-  if (rain > 0.0) {
-    let cell = floor(world.xz * 2.2);
-    let seed = hash2(cell);
-    let f = fract(world.xz * 2.2) - vec2f(0.5)
-      - (vec2f(seed, fract(seed * 15.37)) - vec2f(0.5)) * 0.24;
-    let age = fract(t * 0.9 + seed * 7.0);
-    let r = length(f);
-    let edge = r - age * 0.31;
-    let ring = sin(edge * 64.0) * (1.0 - smoothstep(0.018, 0.058, abs(edge)));
-    g += f / max(r, 0.001) * (ring * rain * age * (1.0 - age) * 0.23 * resolved.w);
-  }
-  return normalize(vec3f(-g.x, 1.0, -g.y));
-}
-
 fn ground_shore_at(texel: vec2i, off: vec2i, max_c: vec2i, shore_h: f32) -> bool {
   let qd = textureLoad(ground_depth, clamp(texel + off, vec2i(0), max_c), 0);
   return qd < 1.0 && ground_height(qd) > shore_h;
